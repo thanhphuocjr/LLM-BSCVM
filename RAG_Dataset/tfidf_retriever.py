@@ -474,63 +474,13 @@ def print_result(result: RetrievalResult, show_snippet: bool = True):
 # ══════════════════════════════════════════════════════════════════
 # DEMO — chạy trực tiếp để kiểm tra
 # ══════════════════════════════════════════════════════════════════
-# Test cases: 1 Safe, 1 Vulnerable điển hình trong Solidity
+# Test cases demo (dict format: name + code)
 TEST_CASES = [
     {
-        "name": "Reentrancy Vulnerability (điển hình)",
+        "name": "OverflowExample (potential integer overflow/underflow)",
         "code": """
-function withdraw(uint256 amount) public {
-    require(balances[msg.sender] >= amount, "Insufficient balance");
-    // BUG: gửi ETH TRƯỚC khi cập nhật state → Reentrancy!
-    (bool success, ) = msg.sender.call{value: amount}("");
-    require(success, "Transfer failed");
-    balances[msg.sender] -= amount;
-}
-        """,
-    },
-    {
-        "name": "Integer Overflow (Solidity <0.8)",
-        "code": """
-pragma solidity ^0.4.24;
-contract Token {
-    mapping(address => uint256) public balances;
-
-    function transfer(address _to, uint256 _value) public returns (bool) {
-        // BUG: không kiểm tra overflow → _value rất lớn wrap về 0
-        require(balances[msg.sender] - _value >= 0);
-        balances[msg.sender] -= _value;
-        balances[_to] += _value;
-        return true;
-    }
-}
-        """,
-    },
-    {
-        "name": "Safe ERC20 Transfer (chuẩn OpenZeppelin)",
-        "code": """
-function transfer(address to, uint256 amount)
-    public
-    virtual
-    override
-    returns (bool)
-{
-    address owner = _msgSender();
-    _transfer(owner, to, amount);
-    return true;
-}
-
-function _transfer(address from, address to, uint256 amount) internal virtual {
-    require(from != address(0), "ERC20: transfer from the zero address");
-    require(to   != address(0), "ERC20: transfer to the zero address");
-    uint256 fromBalance = _balances[from];
-    require(fromBalance >= amount, "ERC20: transfer amount exceeds balance");
-    unchecked {
-        _balances[from] = fromBalance - amount;
-        _balances[to]  += amount;
-    }
-    emit Transfer(from, to, amount);
-}
-        """,
+The function FuseTokenAdapterV1 from the contract wrap \n```Solidiy\nfunction wrap( uint256 amount, address recipient ) external onlyAlchemist returns (uint256) { SafeERC20.safeTransferFrom(underlyingToken, msg.sender, address(this), amount); SafeERC20.safeApprove(underlyingToken, token, amount); uint256 startingBalance = IERC20(token).balanceOf(address(this)); uint256 error; if ((error = ICERC20(token).mint(amount)) != NO_ERROR) { revert FuseError(error); } uint256 endingBalance = IERC20(token).balanceOf(address(this)); uint256 mintedAmount = endingBalance - startingBalance; SafeERC20.safeTransfer(token, recipient, mintedAmount); return mintedAmount; }\n```\n### As a Caller:\nFuseTokenAdapterV1 calls these functions:\n```\nSafeERC20.safeTransferFrom\nFuseTokenAdapterV1.address\nSafeERC20.safeApprove\nFuseTokenAdapterV1.IERC20\nFuseTokenAdapterV1.ICERC20\nFuseTokenAdapterV1.FuseError\nSafeERC20.safeTransfer\nmodifier onlyAlchemist() { if (msg.sender != alchemist) { revert Unauthorized(\"Not alchemist\"); } _; }\n
+""",
     },
 ]
 

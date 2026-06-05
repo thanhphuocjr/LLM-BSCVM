@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -170,12 +171,17 @@ class KnowledgeBaseRetriever:
         self.device = resolve_device(device_arg)
         self.max_seq_length = max_seq_length
         self.max_input_chars = max_input_chars
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        os.environ.setdefault("DISABLE_SAFETENSORS_CONVERSION", "1")
         self.vectors = self._load_vectors()
         self.metadata = self._load_metadata()
         self.model = SentenceTransformer(
             model_name,
             device=self.device,
             trust_remote_code=True,
+            local_files_only=True,
         )
         self.model.max_seq_length = max_seq_length
 
@@ -186,10 +192,12 @@ class KnowledgeBaseRetriever:
                 f"Embedding vectors not found: {vectors_path}. "
                 "Run build_knowledge_store.py first."
             )
-        vectors = np.load(vectors_path).astype(np.float32)
+        vectors = np.load(vectors_path, mmap_mode="r")
+        if vectors.dtype != np.float32:
+            vectors = vectors.astype(np.float32)
         if vectors.ndim != 2:
             raise ValueError(f"Invalid vectors shape: {vectors.shape}")
-        return l2_normalize_rows(vectors)
+        return vectors
 
     def _load_metadata(self) -> List[Dict]:
         metadata_path = self.knowledge_dir / "sample_metadata.json"
@@ -210,48 +218,10 @@ class KnowledgeBaseRetriever:
         return self.search_many([query], code, top_k=top_k)[0]
 
     def search_many(self, queries: List[str], code: str, top_k: int = TOP_K) -> List[Dict]:
-        input_texts = [
-            build_input_text(query, code, self.max_input_chars)
+        return [
+            self.search_single_old(query=query, code=code, top_k=top_k)
             for query in queries
         ]
-        if not input_texts:
-            return []
-
-        query_vecs = self.model.encode(
-            input_texts,
-            batch_size=min(16, max(1, len(input_texts))),
-            show_progress_bar=False,
-            convert_to_numpy=True,
-            normalize_embeddings=False,
-        ).astype(np.float32)
-        query_vecs = l2_normalize_rows(query_vecs)
-
-        semantic_matrix = query_vecs @ self.vectors.T
-        outputs = []
-        for row_idx, query in enumerate(queries):
-            input_text = input_texts[row_idx]
-            semantic_scores = semantic_matrix[row_idx]
-            boosts = np.array(
-                [lexical_boost(input_text, record) for record in self.metadata],
-                dtype=np.float32,
-            )
-            scores = semantic_scores + boosts
-
-            resolved_top_k = max(1, min(top_k, len(scores)))
-            top_indices = np.argpartition(scores, -resolved_top_k)[-resolved_top_k:]
-            top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
-
-            results = [
-                map_result(
-                    self.metadata[idx],
-                    float(scores[idx]),
-                    float(semantic_scores[idx]),
-                    float(boosts[idx]),
-                )
-                for idx in top_indices
-            ]
-            outputs.append({"query": query, "top_k": resolved_top_k, "results": results})
-        return outputs
 
     def search_single_old(self, query: str, code: str, top_k: int = TOP_K) -> Dict:
         input_text = build_input_text(query, code, self.max_input_chars)

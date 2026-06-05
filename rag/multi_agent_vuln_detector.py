@@ -16,6 +16,8 @@ try:
         KnowledgeBaseRetriever,
     )
 except ImportError:
+    if __package__:
+        raise
     from retrieve_best_vuln import (
         CODE,
         DEVICE,

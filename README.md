@@ -53,3 +53,4 @@ Rebuild TF-IDF store:
 ```bash
 python3 rag/build_tfidf_corpus.py
 ```
+Link Demo: https://drive.google.com/file/d/1l1RCZ1RqAwCsNHVRsutYDUeycCbhCs2V/view?usp=drive_link

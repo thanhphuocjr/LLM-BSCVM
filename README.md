@@ -64,28 +64,41 @@ python3 rag/build_tfidf_corpus.py
 ```
 Link Demo: https://drive.google.com/file/d/1l1RCZ1RqAwCsNHVRsutYDUeycCbhCs2V/view?usp=drive_link
 
-## Phase 2 — Repair Suggestion (Advisor)
+## Cấu hình LLM backend (cho các agent phase 2/3)
 
-Cần cấu hình Gemini trong `.env` (đã có sẵn):
+Chọn backend qua `.env` bằng biến `LLM_BACKEND`:
 
 ```
+# Chọn 1 trong 2: ollama (local Qwen) | gemini (API)
+LLM_BACKEND=ollama
+
+# --- Ollama (chạy local, không tốn quota) ---
+OLLAMA_MODEL=qwen2.5-coder:7b
+# OLLAMA_HOST=http://localhost:11434
+# OLLAMA_TEMPERATURE=0.2
+
+# --- Gemini (API) ---
 GEMINI_API_KEY=...
 GEMINI_GENERATION_MODEL=gemini-2.5-flash
 GEMINI_TEMPERATURE=0.2
 ```
 
-Cài SDK (một lần): `pip install google-genai`
-
-Chạy detection + repair suggestion trong một lệnh (static-only cho nhanh):
+Cài đặt:
 
 ```bash
-python3 phase2_repair_suggestion.py --code-file path/to/Contract.sol --run-detection --fast-detection
+pip install google-genai ollama          # client libs
+ollama pull qwen2.5-coder:7b             # tải model về local (chỉ cần 1 lần)
 ```
 
-Chạy đầy đủ (bật CodeBERT + RAG ở phase 1):
+Đảm bảo Ollama server đang chạy (`ollama serve`). Có thể ghi đè backend cho từng lần chạy
+bằng `--backend ollama` / `--backend gemini` (mặc định `auto` = đọc từ `.env`).
+
+Chạy giống phase 1 — không cần tham số, dùng `CODE_TO_TEST` mặc định:
 
 ```bash
-python3 phase2_repair_suggestion.py --code-file path/to/Contract.sol --run-detection
+python3 phase2_repair_suggestion.py                    # full pipeline (như phase 1)
+python3 phase2_repair_suggestion.py --fast-detection   # static-only detection (nhanh)
+python3 phase2_repair_suggestion.py --code-file Contract.sol
 ```
 
 Tái sử dụng kết quả detection đã lưu (không chạy lại phase 1):
@@ -97,3 +110,28 @@ python3 phase2_repair_suggestion.py --code-file Contract.sol --detection-file de
 
 Backend LLM mặc định là Gemini nhưng có thể thay (Ollama/CodeLlama) qua `agents/llm_client.py`
 mà không phải sửa Advisor.
+
+## Phase 3 — Risk Assessment (Assessor)
+
+Đánh giá rủi ro từng lỗ hổng theo chuẩn **CVSS v3.1** và hệ 4 mức (Critical/High/Medium/Low),
+sinh ra phân bố rủi ro + thứ tự ưu tiên sửa (repair priority). Đầu vào là output của phase 2.
+
+Chuỗi đầy đủ: `Detection (phase 1) -> Advisor (phase 2) -> Assessor (phase 3)`.
+
+```bash
+python3 phase3_risk_assessment.py                    # full pipeline trên CODE_TO_TEST
+python3 phase3_risk_assessment.py --fast-detection   # static-only detection (nhanh)
+python3 phase3_risk_assessment.py --code-file Contract.sol
+```
+
+Tái sử dụng output đã lưu để chỉ chạy lại Assessor:
+
+```bash
+python3 phase2_repair_suggestion.py --output repair.json
+python3 phase3_risk_assessment.py --repair-file repair.json --output risk.json
+```
+
+> Lưu ý quota: Gemini free tier giới hạn ~20 request/ngày cho `gemini-2.5-flash`.
+> Mỗi lỗ hổng tốn 1 request ở mỗi agent (Advisor, Assessor), nên một hợp đồng nhiều
+> lỗ hổng có thể chạm giới hạn. Dùng `--fast-detection`, `--repair-file` để tiết kiệm,
+> hoặc nâng cấp billing / đổi model. Client đã tự động backoff theo `retryDelay` của API.

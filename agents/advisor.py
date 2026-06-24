@@ -168,7 +168,7 @@ class AdvisorAgent:
         llm: GeminiClient | None = None,
         knowledge_base: RepairKnowledgeBase | None = None,
         knowledge_dir: str | Path = DEFAULT_KNOWLEDGE_DIR,
-        backend: str = "gemini",
+        backend: str = "auto",
     ) -> None:
         self.llm = llm or build_llm_client(backend)
         self.knowledge_base = knowledge_base or RepairKnowledgeBase(knowledge_dir)
@@ -343,7 +343,7 @@ def run_advisor(
     code: str,
     detection_result: Dict[str, Any],
     knowledge_dir: str | Path = DEFAULT_KNOWLEDGE_DIR,
-    backend: str = "gemini",
+    backend: str = "auto",
 ) -> Dict[str, Any]:
     agent = AdvisorAgent(knowledge_dir=knowledge_dir, backend=backend)
     return agent.advise(code, detection_result)

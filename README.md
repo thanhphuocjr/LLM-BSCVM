@@ -135,3 +135,31 @@ python3 phase3_risk_assessment.py --repair-file repair.json --output risk.json
 > Mỗi lỗ hổng tốn 1 request ở mỗi agent (Advisor, Assessor), nên một hợp đồng nhiều
 > lỗ hổng có thể chạm giới hạn. Dùng `--fast-detection`, `--repair-file` để tiết kiệm,
 > hoặc nâng cấp billing / đổi model. Client đã tự động backoff theo `retryDelay` của API.
+> (Dùng `LLM_BACKEND=ollama` để chạy local, không dính quota.)
+
+## Phase 4 — Vulnerability Repair (Fixer)
+
+Sắp xếp lỗ hổng theo **repair priority** (từ phase 3), rồi sinh ra **toàn bộ contract đã
+được sửa** trong một lần (holistic), kèm **unified diff** (Original vs Fixed). Đầu vào là
+output của phase 2 (Advisor) + phase 3 (Assessor).
+
+Chuỗi đầy đủ: `Detection (1) -> Advisor (2) -> Assessor (3) -> Fixer (4)`.
+
+```bash
+python3 phase4_vulnerability_repair.py                      # full chain trên CODE_TO_TEST
+python3 phase4_vulnerability_repair.py --fast-detection     # detection static-only
+python3 phase4_vulnerability_repair.py --no-assessor        # bỏ phase 3, ưu tiên theo severity
+python3 phase4_vulnerability_repair.py --code-file C.sol --fixed-output Fixed.sol
+```
+
+Tái sử dụng output đã lưu (Fixer chỉ tốn 1 request LLM):
+
+```bash
+python3 phase3_risk_assessment.py --include-repair --output risk.json
+python3 phase4_vulnerability_repair.py \
+    --repair-file risk.json --risk-file risk.json --fixed-output Fixed.sol
+```
+
+Output gồm: `fixed_code` (contract hoàn chỉnh), `diff`, và `changes[]` (mỗi lỗ hổng:
+priority, risk, tóm tắt thay đổi, đã xử lý chưa). Khác với Advisor (chỉ gợi ý từng đoạn),
+Fixer tạo MỘT contract sửa hoàn chỉnh nên các finding trùng chỗ gộp thành một bản vá đúng.

@@ -11,10 +11,67 @@ Project được chia thành các khu vực chính:
 ## Pipeline theo paper LLM-BSCVM
 
 - **Phase 1 — Detection (Detector):** `phase1_integrated_detector.py` — fusion 3 thành phần
-  (static analysis + RAG + CodeBERT LoRA) ra verdict + danh sách lỗ hổng.
+  (static analysis + RAG + fine-tuned detector; mặc định dùng CodeLlama QLoRA) ra verdict + danh sách lỗ hổng.
 - **Phase 2 — Repair Suggestion (Advisor):** `phase2_repair_suggestion.py` — nhận kết quả
   detection, retrieve remediation knowledge theo SWC, rồi sinh repair suggestion 5 phần
   (root cause, impact, repair steps, fixed code, prevention) bằng LLM.
+
+## CodeLlama detector output từ Kaggle
+
+Output huấn luyện CodeLlama được đặt mặc định tại:
+
+```bash
+models/codellama-vuln-detector
+```
+
+Tải output Kaggle và cập nhật `.env`:
+
+```bash
+python3 scripts/setup_codellama_output.py --slug ntpuet/codellama
+```
+
+Lệnh tương đương nếu muốn chạy thủ công:
+
+```bash
+mkdir -p models/codellama-vuln-detector
+kaggle kernels output ntpuet/codellama -p models/codellama-vuln-detector
+```
+
+`.env` đã có các biến phase 1:
+
+```bash
+DETECTOR_ADAPTER_PATH=models/codellama-vuln-detector
+DETECTOR_BASE_MODEL=auto
+DETECTOR_INPUT_MODE=auto
+DETECTOR_LOAD_IN_4BIT=auto
+```
+
+`auto` sẽ đọc `threshold_config.json` hoặc `training_config.json` trong output Kaggle để lấy
+base model, input mode và threshold tốt nhất. Nếu file config Kaggle còn trỏ tới `/kaggle/input/...`,
+pipeline sẽ tự fallback sang `hf_model`, ví dụ `codellama/CodeLlama-7b-hf`.
+
+Chạy end-to-end phase 1 -> 6:
+
+```bash
+python3 scripts/run_e2e_codellama.py \
+  --code-file Contract.sol \
+  --allow-model-download
+```
+
+Kết quả mặc định nằm trong `E2E/phase1_detection.json`, `E2E/audit_report.md`,
+và `E2E/audit_report.json`.
+
+Lưu ý: output Kaggle CodeLlama của notebook hiện là detector phân loại
+`Safe`/`Vulnerable` cho phase 1. Các agent phase 2-6 vẫn cần một generative LLM
+để sinh repair/risk/report. Mặc định repo đang dùng Gemini qua `.env`; nếu muốn dùng
+CodeLlama local cho các agent này:
+
+```bash
+ollama pull codellama:7b-instruct
+# sau đó đổi trong .env:
+LLM_BACKEND=ollama
+OLLAMA_MODEL=codellama:7b-instruct
+```
 
 ## Dataset
 
@@ -131,7 +188,7 @@ python3 phase2_repair_suggestion.py --output repair.json
 python3 phase3_risk_assessment.py --repair-file repair.json --output risk.json
 ```
 
-> Lưu ý quota: Gemini free tier giới hạn ~20 request/ngày cho `gemini-2.5-flash`.
+> Lưu ý quota: Gemini free tier có giới hạn request cho `gemini-2.5-flash`.
 > Mỗi lỗ hổng tốn 1 request ở mỗi agent (Advisor, Assessor), nên một hợp đồng nhiều
 > lỗ hổng có thể chạm giới hạn. Dùng `--fast-detection`, `--repair-file` để tiết kiệm,
 > hoặc nâng cấp billing / đổi model. Client đã tự động backoff theo `retryDelay` của API.

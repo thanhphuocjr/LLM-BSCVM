@@ -7,7 +7,7 @@ project:
 
 1. Static analysis: deterministic security signals
 2. RAG retrieval-based detection: similar historical/code evidence
-3. CodeBERT LoRA model-based detection: probabilistic model signal
+3. Fine-tuned detector model signal (CodeLlama QLoRA by default)
 
 Example:
     python3 phase1_integrated_detector.py --code-file path/to/Contract.sol
@@ -32,8 +32,41 @@ from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_CODEBERT_ADAPTER = PROJECT_ROOT / "Codebert" / "codebert-vuln-lora-final"
-DEFAULT_CODEBERT_BASE_MODEL = "microsoft/codebert-base"
+
+
+def load_env_file(path: Path = PROJECT_ROOT / ".env") -> None:
+    """Populate os.environ from .env without adding a dependency."""
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_env_file()
+
+
+def project_relative_path(value: str | Path) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+DEFAULT_CODELLAMA_ADAPTER = PROJECT_ROOT / "models" / "codellama-vuln-detector"
+DEFAULT_DETECTOR_ADAPTER = project_relative_path(
+    os.environ.get(
+        "DETECTOR_ADAPTER_PATH",
+        os.environ.get("CODELLAMA_ADAPTER_PATH", str(DEFAULT_CODELLAMA_ADAPTER)),
+    )
+)
+DEFAULT_DETECTOR_BASE_MODEL = os.environ.get("DETECTOR_BASE_MODEL", "auto")
+DEFAULT_DETECTOR_INPUT_MODE = os.environ.get("DETECTOR_INPUT_MODE", "auto")
+DEFAULT_DETECTOR_LOAD_IN_4BIT = os.environ.get("DETECTOR_LOAD_IN_4BIT", "auto")
 DEFAULT_RAG_KNOWLEDGE_DIR = PROJECT_ROOT / "rag" / "knowledge_store"
 DEFAULT_TFIDF_DIR = PROJECT_ROOT / "rag" / "tfidf_store"
 DEFAULT_RAG_MODEL_NAME = "BAAI/bge-m3"
@@ -187,20 +220,30 @@ def configure_transformers_runtime(local_files_only: bool) -> None:
 class CodeBertVulnerabilityDetector:
     def __init__(
         self,
-        adapter_path: str | Path = DEFAULT_CODEBERT_ADAPTER,
-        base_model: str = DEFAULT_CODEBERT_BASE_MODEL,
+        adapter_path: str | Path = DEFAULT_DETECTOR_ADAPTER,
+        base_model: str = DEFAULT_DETECTOR_BASE_MODEL,
         device: str = "auto",
-        max_tokens: int = 512,
+        max_tokens: int | None = None,
         local_files_only: bool = True,
+        input_mode: str = DEFAULT_DETECTOR_INPUT_MODE,
+        load_in_4bit: str = DEFAULT_DETECTOR_LOAD_IN_4BIT,
     ) -> None:
         self.adapter_path = Path(adapter_path)
-        self.base_model = base_model
+        self.detector_config = self._load_detector_config(self.adapter_path)
+        self.base_model = self._resolve_base_model(base_model, self.detector_config)
         self.device_name = resolve_torch_device(device)
-        self.max_tokens = max_tokens
+        self.max_tokens = max_tokens or int(
+            self.detector_config.get("max_len")
+            or self.detector_config.get("max_tokens")
+            or 512
+        )
         self.local_files_only = local_files_only
+        self.input_mode = self._resolve_input_mode(input_mode, self.base_model, self.adapter_path, self.detector_config)
+        self.default_threshold = self._resolve_threshold(self.detector_config)
+        self.load_in_4bit = self._resolve_load_in_4bit(load_in_4bit)
 
         if not self.adapter_path.exists():
-            raise FileNotFoundError(f"CodeBERT LoRA adapter not found: {self.adapter_path}")
+            raise FileNotFoundError(f"Fine-tuned detector adapter not found: {self.adapter_path}")
 
         configure_transformers_runtime(local_files_only)
 
@@ -217,30 +260,131 @@ class CodeBertVulnerabilityDetector:
         self.tokenizer = AutoTokenizer.from_pretrained(
             str(self.adapter_path),
             local_files_only=True,
+            use_fast=True,
         )
-        base = AutoModelForSequenceClassification.from_pretrained(
-            self.base_model,
+        if self.tokenizer.pad_token is None and self.tokenizer.eos_token is not None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "right"
+
+        model_kwargs: dict[str, Any] = dict(
             num_labels=2,
             id2label=ID2LABEL,
             label2id=LABEL2ID,
             trust_remote_code=True,
             local_files_only=self.local_files_only,
-            use_safetensors=False,
         )
+        quantized = self.load_in_4bit and self.device_name == "cuda"
+        if quantized:
+            from transformers import BitsAndBytesConfig
+
+            model_kwargs.update(
+                {
+                    "quantization_config": BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_compute_dtype=torch.float16,
+                    ),
+                    "device_map": {"": 0},
+                    "torch_dtype": torch.float16,
+                }
+            )
+
+        base = AutoModelForSequenceClassification.from_pretrained(
+            self.base_model,
+            **model_kwargs,
+        )
+        base.config.pad_token_id = self.tokenizer.pad_token_id
         self.model = PeftModel.from_pretrained(base, str(self.adapter_path))
-        self.model.to(self.device_name)
+        if not quantized:
+            self.model.to(self.device_name)
         self.model.eval()
 
-    def predict_proba_single(self, code: str, variant_idx: int) -> float:
-        prompt_text = build_prompt_text(code, variant_idx)
-        encoding = self.tokenizer(
-            prompt_text,
-            code,
+    @staticmethod
+    def _load_detector_config(adapter_path: Path) -> dict[str, Any]:
+        for filename in ("threshold_config.json", "training_config.json"):
+            path = adapter_path / filename
+            if path.exists():
+                return json.loads(path.read_text(encoding="utf-8"))
+        return {}
+
+    @staticmethod
+    def _resolve_base_model(base_model: str | None, detector_config: dict[str, Any]) -> str:
+        if base_model and base_model not in {"auto", "config", "default"}:
+            return base_model
+
+        configured = str(detector_config.get("base_model") or "").strip()
+        hf_model = str(detector_config.get("hf_model") or "").strip()
+        if configured and (not configured.startswith("/kaggle/") or Path(configured).exists()):
+            return configured
+        if hf_model:
+            return hf_model
+        return "codellama/CodeLlama-7b-hf"
+
+    @staticmethod
+    def _resolve_input_mode(
+        input_mode: str,
+        base_model: str,
+        adapter_path: Path,
+        detector_config: dict[str, Any],
+    ) -> str:
+        normalized = (input_mode or "auto").strip().lower()
+        if normalized not in {"auto", "pair", "code", "function_tag"}:
+            raise ValueError("--detector-input-mode must be auto, pair, code, or function_tag.")
+        if normalized != "auto":
+            return normalized
+
+        train_mode = str(detector_config.get("train_mode") or "").lower()
+        model_hint = f"{base_model} {adapter_path} {train_mode}".lower()
+        if detector_config.get("use_context_input") is True:
+            return "function_tag"
+        if "llama" in model_hint:
+            return "code"
+        return "pair"
+
+    @staticmethod
+    def _resolve_threshold(detector_config: dict[str, Any]) -> float | None:
+        for key in ("best_threshold", "threshold"):
+            if key in detector_config:
+                try:
+                    return float(detector_config[key])
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    @staticmethod
+    def _resolve_load_in_4bit(value: str) -> bool:
+        normalized = str(value or "auto").strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        return True
+
+    def _encode(self, code: str, variant_idx: int) -> Any:
+        if self.input_mode == "pair":
+            return self.tokenizer(
+                build_prompt_text(code, variant_idx),
+                code,
+                max_length=self.max_tokens,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            ).to(self.device_name)
+        text = code
+        if self.input_mode == "function_tag":
+            text = f"[FUNCTION]\n{code}"
+        return self.tokenizer(
+            text,
             max_length=self.max_tokens,
             padding="max_length",
             truncation=True,
+            add_special_tokens=True,
             return_tensors="pt",
         ).to(self.device_name)
+
+    def predict_proba_single(self, code: str, variant_idx: int) -> float:
+        encoding = self._encode(code, variant_idx)
 
         with self.torch.no_grad():
             outputs = self.model(**encoding)
@@ -248,17 +392,19 @@ class CodeBertVulnerabilityDetector:
         probabilities = self.functional.softmax(outputs.logits, dim=-1)
         return float(probabilities[0][LABEL2ID["Vulnerable"]].item())
 
-    def analyze(self, code: str, threshold: float = DEFAULT_LLM_THRESHOLD) -> dict[str, Any]:
+    def analyze(self, code: str, threshold: float | None = None) -> dict[str, Any]:
+        threshold = threshold if threshold is not None else (self.default_threshold or DEFAULT_LLM_THRESHOLD)
+        prompt_count = len(PROMPT_VARIANTS) if self.input_mode == "pair" else 1
         prompt_probabilities = [
             self.predict_proba_single(code, index)
-            for index in range(len(PROMPT_VARIANTS))
+            for index in range(prompt_count)
         ]
         probability = sum(prompt_probabilities) / len(prompt_probabilities)
         hard_votes = ["Vulnerable" if value >= threshold else "Safe" for value in prompt_probabilities]
 
         return {
             "status": "ok",
-            "component": "LLM / CodeBERT model-based detection",
+            "component": "LLM / fine-tuned model-based detection",
             "score": round(probability, 6),
             "verdict": "Vulnerable" if probability >= threshold else "Safe",
             "threshold": threshold,
@@ -270,20 +416,24 @@ class CodeBertVulnerabilityDetector:
             "safe_votes": hard_votes.count("Safe"),
             "adapter_path": str(self.adapter_path),
             "base_model": self.base_model,
+            "input_mode": self.input_mode,
             "device": self.device_name,
             "local_files_only": self.local_files_only,
+            "load_in_4bit": self.load_in_4bit,
         }
 
 
 def run_llm_component(args: argparse.Namespace, code: str) -> dict[str, Any]:
     if args.skip_llm:
-        return skipped_component("LLM / CodeBERT model-based detection")
+        return skipped_component("LLM / fine-tuned model-based detection")
     detector = CodeBertVulnerabilityDetector(
-        adapter_path=args.codebert_adapter,
-        base_model=args.codebert_base_model,
+        adapter_path=args.detector_adapter,
+        base_model=args.detector_base_model,
         device=args.device,
         max_tokens=args.max_tokens,
         local_files_only=not args.allow_model_download,
+        input_mode=args.detector_input_mode,
+        load_in_4bit=args.detector_load_in_4bit,
     )
     return detector.analyze(code, threshold=args.llm_threshold)
 
@@ -820,7 +970,7 @@ def write_or_print_output(output: dict[str, Any], output_path: str | None) -> No
 def run_component_only(args: argparse.Namespace, code: str) -> dict[str, Any]:
     if args.component_only == "llm":
         return run_component(
-            "LLM / CodeBERT model-based detection",
+            "LLM / fine-tuned model-based detection",
             run_llm_component,
             args,
             code,
@@ -857,16 +1007,20 @@ def component_command(component: str, args: argparse.Namespace, code_file: Path)
     if component == "llm":
         command.extend(
             [
-                "--llm-threshold",
-                str(args.llm_threshold),
-                "--codebert-adapter",
-                str(args.codebert_adapter),
-                "--codebert-base-model",
-                str(args.codebert_base_model),
-                "--max-tokens",
-                str(args.max_tokens),
+                "--detector-adapter",
+                str(args.detector_adapter),
+                "--detector-base-model",
+                str(args.detector_base_model),
+                "--detector-input-mode",
+                str(args.detector_input_mode),
+                "--detector-load-in-4bit",
+                str(args.detector_load_in_4bit),
             ]
         )
+        if args.llm_threshold is not None:
+            command.extend(["--llm-threshold", str(args.llm_threshold)])
+        if args.max_tokens is not None:
+            command.extend(["--max-tokens", str(args.max_tokens)])
         if args.allow_model_download:
             command.append("--allow-model-download")
     elif component == "rag":
@@ -968,7 +1122,7 @@ def should_isolate(args: argparse.Namespace, component: str) -> bool:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Combine CodeBERT, RAG, and static analysis into one phase-1 verdict."
+        description="Combine a fine-tuned detector model, RAG, and static analysis into one phase-1 verdict."
     )
     parser.add_argument("--code-file", default=None, help="Path to a Solidity source file. Highest priority.")
     parser.add_argument("--code", default=None, help="Raw Solidity code string. Overrides CODE_TO_TEST.")
@@ -979,16 +1133,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rag-weight", type=float, default=DEFAULT_WEIGHTS["rag"])
     parser.add_argument("--static-weight", type=float, default=DEFAULT_WEIGHTS["static_analysis"])
     parser.add_argument("--final-threshold", type=float, default=DEFAULT_FINAL_THRESHOLD)
-    parser.add_argument("--llm-threshold", type=float, default=DEFAULT_LLM_THRESHOLD)
+    parser.add_argument(
+        "--llm-threshold",
+        type=float,
+        default=None,
+        help="Detector threshold. Defaults to best_threshold/threshold in Kaggle config, then 0.40.",
+    )
 
-    parser.add_argument("--codebert-adapter", default=str(DEFAULT_CODEBERT_ADAPTER))
-    parser.add_argument("--codebert-base-model", default=DEFAULT_CODEBERT_BASE_MODEL)
-    parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument(
+        "--detector-adapter",
+        "--codebert-adapter",
+        dest="detector_adapter",
+        default=str(DEFAULT_DETECTOR_ADAPTER),
+        help="Fine-tuned PEFT adapter path. Defaults to DETECTOR_ADAPTER_PATH or models/codellama-vuln-detector.",
+    )
+    parser.add_argument(
+        "--detector-base-model",
+        "--codebert-base-model",
+        dest="detector_base_model",
+        default=DEFAULT_DETECTOR_BASE_MODEL,
+        help="Base model id/path, or auto to read threshold_config/training_config from the adapter.",
+    )
+    parser.add_argument("--max-tokens", type=int, default=None)
+    parser.add_argument(
+        "--detector-input-mode",
+        choices=["auto", "pair", "code", "function_tag"],
+        default=DEFAULT_DETECTOR_INPUT_MODE,
+        help="auto reads training metadata; CodeLlama usually uses code/function_tag, CodeBERT uses pair.",
+    )
+    parser.add_argument(
+        "--detector-load-in-4bit",
+        default=DEFAULT_DETECTOR_LOAD_IN_4BIT,
+        help="auto/true/false. Uses bitsandbytes 4-bit only on CUDA.",
+    )
     parser.add_argument("--device", default="cpu", help="auto, cpu, cuda, or mps.")
     parser.add_argument(
         "--allow-model-download",
         action="store_true",
-        help="Allow Hugging Face downloads for the CodeBERT base model.",
+        help="Allow Hugging Face downloads for the detector base model.",
     )
 
     parser.add_argument("--rag-knowledge-dir", default=str(DEFAULT_RAG_KNOWLEDGE_DIR))
@@ -1013,10 +1195,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-isolate-heavy-components",
         action="store_true",
-        help="Run CodeBERT/RAG inside the main Python process instead of separate subprocesses.",
+        help="Run detector/RAG inside the main Python process instead of separate subprocesses.",
     )
 
-    parser.add_argument("--skip-llm", action="store_true", help="Debug only: skip CodeBERT.")
+    parser.add_argument("--skip-llm", action="store_true", help="Debug only: skip the fine-tuned detector.")
     parser.add_argument("--skip-rag", action="store_true", help="Debug only: skip RAG.")
     parser.add_argument("--skip-static", action="store_true", help="Debug only: skip static analysis.")
     parser.add_argument(
@@ -1072,7 +1254,7 @@ def main() -> None:
     try:
         llm_result = run_pipeline_component(
             "llm",
-            "LLM / CodeBERT model-based detection",
+            "LLM / fine-tuned model-based detection",
             run_llm_component,
             args,
             code,

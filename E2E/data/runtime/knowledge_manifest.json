@@ -1,0 +1,15 @@
+{
+  "built_at": "2026-07-28T14:56:16+00:00",
+  "record_count": 37,
+  "matrix_shape": [
+    37,
+    29119
+  ],
+  "source_dir": "data/source/swc-registry",
+  "artifacts": [
+    "swc_registry.json",
+    "swc_vectorizer.joblib",
+    "swc_matrix.npz"
+  ],
+  "warning": "SWC Registry is no longer actively maintained. Findings must be cross-checked with current compiler behavior and manual review."
+}

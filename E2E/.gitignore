@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+runs/*
+!runs/.gitkeep
+kaggle-kernel-build/
+kaggle-output/
+
+!*.json
+!*.md
+!*.txt
+!*.sol
+!*.joblib
+!*.npz
+
+# Large reproducibility assets remain physically inside E2E but should be
+# published as Kaggle Models/Datasets or archived outside regular Git.
+models/**/adapter_model.safetensors
+models/**/training_args.bin
+data/source/rag/rag_knowledge.jsonl
+data/source/solodit/solodit.json
+data/source/raw/**
+data/training/detect_v4_functionlevel.jsonl

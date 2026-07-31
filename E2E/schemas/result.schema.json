@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.e2e.audit/schemas/result.schema.json",
+  "title": "CodeLlama E2E Kaggle Result",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "source_sha256",
+    "status",
+    "phases",
+    "models",
+    "timings"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "run_id": {"type": "string", "minLength": 1},
+    "source_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "status": {"enum": ["ok", "partial", "error"]},
+    "phases": {
+      "type": "object",
+      "properties": {
+        "detector": {"type": "object"},
+        "advisor": {"type": "object"},
+        "assessor": {"type": "object"},
+        "fixer": {"type": "object"},
+        "verifier": {"type": "object"},
+        "reporter": {"type": "object"}
+      }
+    },
+    "models": {"type": "object"},
+    "timings": {"type": "object"},
+    "errors": {"type": "array"}
+  }
+}

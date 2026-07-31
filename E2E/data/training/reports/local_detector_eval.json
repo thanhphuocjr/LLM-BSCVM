@@ -1,0 +1,76 @@
+{
+  "created_at": "2026-07-28T14:56:21+00:00",
+  "dataset": "data/training/detect_v4_functionlevel.jsonl",
+  "split": "test",
+  "rows": 355,
+  "elapsed_seconds": 1.649,
+  "overall": {
+    "static": {
+      "tp": 89,
+      "fp": 77,
+      "tn": 83,
+      "fn": 106,
+      "precision": 0.536145,
+      "recall": 0.45641,
+      "f1": 0.493075,
+      "accuracy": 0.484507
+    },
+    "rag": {
+      "tp": 32,
+      "fp": 20,
+      "tn": 140,
+      "fn": 163,
+      "precision": 0.615385,
+      "recall": 0.164103,
+      "f1": 0.259109,
+      "accuracy": 0.484507
+    }
+  },
+  "by_source": {
+    "static": {
+      "solodit": {
+        "tp": 51,
+        "fp": 47,
+        "tn": 48,
+        "fn": 69,
+        "precision": 0.520408,
+        "recall": 0.425,
+        "f1": 0.46789,
+        "accuracy": 0.460465
+      },
+      "dappscan": {
+        "tp": 38,
+        "fp": 30,
+        "tn": 35,
+        "fn": 37,
+        "precision": 0.558824,
+        "recall": 0.506667,
+        "f1": 0.531469,
+        "accuracy": 0.521429
+      }
+    },
+    "rag": {
+      "solodit": {
+        "tp": 23,
+        "fp": 16,
+        "tn": 76,
+        "fn": 100,
+        "precision": 0.589744,
+        "recall": 0.186992,
+        "f1": 0.283951,
+        "accuracy": 0.460465
+      },
+      "dappscan": {
+        "tp": 9,
+        "fp": 4,
+        "tn": 64,
+        "fn": 63,
+        "precision": 0.692308,
+        "recall": 0.125,
+        "f1": 0.211765,
+        "accuracy": 0.521429
+      }
+    }
+  },
+  "interpretation": "Static and local RAG are supporting evidence channels. They are not replacements for the fine-tuned CodeLlama classifier or manual review."
+}

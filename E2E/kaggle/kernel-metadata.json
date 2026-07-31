@@ -1,0 +1,20 @@
+{
+  "id": "thanhphuocjr/codellama-e2e-smart-contract-audit",
+  "title": "CodeLlama E2E Smart Contract Audit",
+  "code_file": "codellama_e2e.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": [
+    "ntpuet/codellama"
+  ],
+  "model_sources": [
+    "metaresearch/codellama/PyTorch/7b-hf/1",
+    "metaresearch/codellama/PyTorch/7b-instruct-hf/1"
+  ]
+}

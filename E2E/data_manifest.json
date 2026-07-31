@@ -1,0 +1,342 @@
+{
+  "created_at": "2026-07-28T14:56:28+00:00",
+  "root": ".",
+  "file_count": 23363,
+  "total_bytes": 1401078097,
+  "files": [
+    {
+      "path": "data/runtime/knowledge_manifest.json",
+      "bytes": 396,
+      "sha256": "065096e9c94c947afc1bd3420a7c3a21eeaf57fc05d220246af8bec5dac24250"
+    },
+    {
+      "path": "data/runtime/swc_matrix.npz",
+      "bytes": 301895,
+      "sha256": "cfbd7560d3fdb7be5ac7378ab7f6dd3098c9220dc999c5d033a8aa1b7ea81e6b"
+    },
+    {
+      "path": "data/runtime/swc_registry.json",
+      "bytes": 191870,
+      "sha256": "9b101f3b4bfaf87a19da8dc9e85f05bcc251e7722927f53ad774e491ca575ff0"
+    },
+    {
+      "path": "data/runtime/swc_vectorizer.joblib",
+      "bytes": 997871,
+      "sha256": "19b0a3f66098e6faa5e92bda6162b34dd23580eb4bd46c0ff8d310ba69d1fd82"
+    },
+    {
+      "path": "data/source/knowledge-base-docs/consensys-best-practices/README.md",
+      "bytes": 1856,
+      "sha256": "c92aabc13280005bade5bd5be1074c80951ad470c9b2eeb59fa5750d0f2a47c7"
+    },
+    {
+      "path": "data/source/knowledge-base-docs/consensys-best-practices/index.html",
+      "bytes": 615,
+      "sha256": "5f59c2ef4ccbca985af051cbb80916bba51b14f229741dafe9a247e3cd6b7138"
+    },
+    {
+      "path": "data/source/knowledge-base-docs/smart-contract-best-practices_yos.io.html",
+      "bytes": 63284,
+      "sha256": "29f2bdc14908f3b9053c4f499a27aeaacfc3a1180a48c49868b96eb088ef1407"
+    },
+    {
+      "path": "data/source/rag/rag_knowledge.jsonl",
+      "bytes": 64596241,
+      "sha256": "fb609c1d7bb6962dbd119eb1337101006dc6c2975d35dd6b101c867a87f0e3ab"
+    },
+    {
+      "path": "data/source/solodit/solodit.json",
+      "bytes": 8236642,
+      "sha256": "b074f1ccd86493217fe91e82e9fc58a608cb0eebf1e2792c7bda900942d5ab35"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-100.md",
+      "bytes": 3591,
+      "sha256": "b46cee9434cab1f814fdfce3211f4ad66a965f046b568694b80a566490d5b0d9"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-101.md",
+      "bytes": 18751,
+      "sha256": "b3e92ad316f18dbf66dcff84c95e1f4098b9af6f58e266cb976eb6f1441020c3"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-102.md",
+      "bytes": 2920,
+      "sha256": "1aa990c30eacce2ec150bb21f5439718b81f006c2d5c581b050399985381bf24"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-103.md",
+      "bytes": 3506,
+      "sha256": "e3204a86483d80524e6e942a257752896b46907aa943d34cbd395fc3035d5d97"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-104.md",
+      "bytes": 2153,
+      "sha256": "e72eb0b426f152f7385b4e6fb5e79d14c0dbe47ea604502fbd416482a786ce4b"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-105.md",
+      "bytes": 15538,
+      "sha256": "772c668d496594cc8cd0d2e426e84cf54e0c87a236bc25295c0b1a6ea8af8fd1"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-106.md",
+      "bytes": 16969,
+      "sha256": "ca414593328cfce559b27c04407f061778f2aa28da800fc7b4e3381a1eed4b3d"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-107.md",
+      "bytes": 5239,
+      "sha256": "f4f28ab0c63e31f7281c26455f75d45675f5cde32d0d00ec008309695d70fdcf"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-108.md",
+      "bytes": 2619,
+      "sha256": "99377c6d6a02e0f2089dd65175bfbfc4549713f57177b077e56f68b19aea9149"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-109.md",
+      "bytes": 5050,
+      "sha256": "3d4923dbee597841bbe6702c963a4f46cd1a1b6d5e1659142fd8c42d4e8e7b4e"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-110.md",
+      "bytes": 13317,
+      "sha256": "52e96eeb31ffed5fd003f0e72b2962ab7b161b780783e6526b98f729bd0a5cdc"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-111.md",
+      "bytes": 3835,
+      "sha256": "ae80d6fbad9bb55b61735ef352780a64ac3cb0c493008e0fb16a9059db424699"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-112.md",
+      "bytes": 4010,
+      "sha256": "75541a2275a65b94994271d19260bd8bc00811874e4bd4ef635231866b697c71"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-113.md",
+      "bytes": 2918,
+      "sha256": "936a158b0557b0553709def66e290ef411a0acea0c22b0630fd8630ff4fc5fed"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-114.md",
+      "bytes": 9101,
+      "sha256": "a98c362c30735c6a7b2aba5c12438d23d026c9404cabe3ac8206263e53a6a129"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-115.md",
+      "bytes": 3308,
+      "sha256": "f574eb58b903a60289e5a8795649be6212e922b5118cba620580c210d3b91d91"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-116.md",
+      "bytes": 5118,
+      "sha256": "a4b5bf54f960298d0ceb3f333fedbc0f8b9ae5cee724c1560b30906ed41dffde"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-117.md",
+      "bytes": 6654,
+      "sha256": "fdc7c5786ec1d2dbffec6e6c17b6eff517f920241b51ace4be1062b1e82d9704"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-118.md",
+      "bytes": 4783,
+      "sha256": "1db61bd9111d76be77dad0e9a3d4ec440cf87ac80a23a3b8eb403e34488e65db"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-119.md",
+      "bytes": 3888,
+      "sha256": "2f2b832721e5a60fd17fdaee286b66f892463c4ae44f2855f36bf7fd381ffa0a"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-120.md",
+      "bytes": 8547,
+      "sha256": "00b58f968d294d3122a430dd0ee760e6e4cfafd199f794e244d23cb93effbf4f"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-121.md",
+      "bytes": 2444,
+      "sha256": "f6e11dfcb16596978186e6ab310dbcf47959345c54e52b8e577bff6db40d4776"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-122.md",
+      "bytes": 2470,
+      "sha256": "dd75e8248cafd74cc1465727393a862e2ec06e9b409bcd1ddb44f8537ecb64cc"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-123.md",
+      "bytes": 2897,
+      "sha256": "b7595ac07e08ce73db431050f33b9415e24da22b2ec4fef086e6334227872d4d"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-124.md",
+      "bytes": 4220,
+      "sha256": "52c3e9be214b95b13eb1b5e159e46d765dec5bdfff5a720e5067eecb9e505934"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-125.md",
+      "bytes": 20262,
+      "sha256": "f95d2bb72ad93ca4c79bd6368460f2fe62087e7952b6ff16132dad263db2e11b"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-126.md",
+      "bytes": 4519,
+      "sha256": "33238674556524bdd3d77398ee85194efcff674df093f58409163c5213ee73cb"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-127.md",
+      "bytes": 3349,
+      "sha256": "2b25fce044ff8dab6c064706bb660d8985e7354553ec117a67f28b2c7e1f19e2"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-128.md",
+      "bytes": 4795,
+      "sha256": "d125315bc7ca32cffd650f03a657687dc07d12578ca129ca049110c17fc7cd7b"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-129.md",
+      "bytes": 4822,
+      "sha256": "80becaaa86d0c139035e52bd79a109523bb80230d9f6a21699611ade79740aec"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-130.md",
+      "bytes": 3997,
+      "sha256": "d5ae85f3a5522cae28ed477f385d949cd009b450e6c8bd530393307de96105aa"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-131.md",
+      "bytes": 4261,
+      "sha256": "d6eb0537f3d620ee47f5d6b239b433164b6612df6f4e26fad67e0d6955319d7f"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-132.md",
+      "bytes": 7632,
+      "sha256": "f298168769a6088ca2faea7cc601a3c75172f58d2769f6b7bc5e8310daee069a"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-133.md",
+      "bytes": 5413,
+      "sha256": "10be1f38104061706f2ce8d8ccb10330c60d1a6f171810d727faf40fe9af11c1"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-134.md",
+      "bytes": 2990,
+      "sha256": "bebc2bcfe169175912806bff11e4bd265949d74bc2d0aeb250debd9a20939eba"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-135.md",
+      "bytes": 4463,
+      "sha256": "d7d9882d41648704cf1f1cc03640d87e873e507324a229d45a51865c7e0302f5"
+    },
+    {
+      "path": "data/source/swc-registry/SWC-136.md",
+      "bytes": 6763,
+      "sha256": "8dcadd5d652ccd57dd78d2d3e10b5c812c7341fdf1d4aaeef7d6432f753eee3f"
+    },
+    {
+      "path": "data/training/dappscan_safe_pool.jsonl",
+      "bytes": 6454161,
+      "sha256": "27fc27b74fe7e6e80b3d8d68468ba00da2e04567a0d06cd3a9a4032af1e6e360"
+    },
+    {
+      "path": "data/training/dappscan_vuln_functions.jsonl",
+      "bytes": 2363557,
+      "sha256": "e0ffe616a628bc03b73b37387c74c4c58e3cc5044fcc175dd483fd7e4e0780b8"
+    },
+    {
+      "path": "data/training/detect_v4_functionlevel.csv",
+      "bytes": 3109022,
+      "sha256": "3982e06efe9b804eaa693c1e9acf348950e9119d5295bf403876ab333547f81d"
+    },
+    {
+      "path": "data/training/detect_v4_functionlevel.jsonl",
+      "bytes": 3670879,
+      "sha256": "75d8edce865cf8cb07ced598f1c97074b40a7b10e92bff8bced4da68e9d1d488"
+    },
+    {
+      "path": "data/training/detect_v4_preview.csv",
+      "bytes": 673975,
+      "sha256": "cf5a92899eb1737b7f5dfe9eb84c2976e17bbeefd8ae9f923633ba797c0164bc"
+    },
+    {
+      "path": "data/training/iaudit_solodit.jsonl",
+      "bytes": 2605463,
+      "sha256": "fdda41f7695e003f11f148e4980bc32cf3a188571c1d5d0abc9b2ba73649ea3c"
+    },
+    {
+      "path": "data/training/reports/DATASET_REPORT.md",
+      "bytes": 7813,
+      "sha256": "009e2e7ffc6a98f9ab1a16a92ebc4d3b9669130ea34a6dbb79077a7ded07dafe"
+    },
+    {
+      "path": "data/training/reports/README.md",
+      "bytes": 3587,
+      "sha256": "c8ca4c16f6a616e4d97983c0c352d1b809a80e67b44015805236300d5743636f"
+    },
+    {
+      "path": "data/training/reports/local_detector_eval.json",
+      "bytes": 1636,
+      "sha256": "9a4093c4190cda1862fb22a7bd4b32e44fe08148031d1b04c650e755c7d01d3e"
+    },
+    {
+      "path": "models/codellama-vuln-detector/README.md",
+      "bytes": 5099,
+      "sha256": "ea7e4ab6ef224fd584b3cd976cb1c904d35430a539374b2dfd24a0cbf0c67948"
+    },
+    {
+      "path": "models/codellama-vuln-detector/adapter_config.json",
+      "bytes": 770,
+      "sha256": "55aab28e3329bebfd7d5e79344e59986f7444b05a37285e7daeb4540737b3cc9"
+    },
+    {
+      "path": "models/codellama-vuln-detector/adapter_model.safetensors",
+      "bytes": 160000752,
+      "sha256": "bc5a3ec77d842d4f75e2c1c76f5927b2e3c6e1b94feb4132576f50cf4b1f1221"
+    },
+    {
+      "path": "models/codellama-vuln-detector/special_tokens_map.json",
+      "bytes": 538,
+      "sha256": "8f32ca2dd65336aceb9e359886f34f214330137c9e801e8f41cf542287fc2630"
+    },
+    {
+      "path": "models/codellama-vuln-detector/threshold_config.json",
+      "bytes": 847,
+      "sha256": "077b1d763341918fca6c286e1b78bceb18db7dce95405a9784f0a050ef8cfbe9"
+    },
+    {
+      "path": "models/codellama-vuln-detector/tokenizer.json",
+      "bytes": 3620731,
+      "sha256": "2206073a6598893988ad5f1d96aa193d274fd6ad2a8d8c7ab8f56b29b6d4d0aa"
+    },
+    {
+      "path": "models/codellama-vuln-detector/tokenizer.model",
+      "bytes": 500058,
+      "sha256": "45ccb9c8b6b561889acea59191d66986d314e7cbd6a78abc6e49b139ca91c1e6"
+    },
+    {
+      "path": "models/codellama-vuln-detector/tokenizer_config.json",
+      "bytes": 1839,
+      "sha256": "b47b50fe8c4f4ffc9369c4c6bca4626641e70fa724ea4915be02467541810944"
+    },
+    {
+      "path": "models/codellama-vuln-detector/training_args.bin",
+      "bytes": 5713,
+      "sha256": "d64b5085abb6fa3d1da28a7daabb4b3ac576b0178090ea6e30491a9942f55ed1"
+    }
+  ],
+  "trees": [
+    {
+      "path": "data/source/raw/DAppSCAN",
+      "file_count": 23257,
+      "bytes": 1044934945,
+      "tree_sha256": "8d9979fb66f66933db4234481cc5bbbc60c152242c6ad52ee8dc796a4eebc147"
+    },
+    {
+      "path": "data/source/raw/iAudit-TrustLLM",
+      "file_count": 42,
+      "bytes": 98498930,
+      "tree_sha256": "07baae188a9b60555a84f95c54b0a23d213007f41f295902104c674b4c91f466"
+    }
+  ]
+}

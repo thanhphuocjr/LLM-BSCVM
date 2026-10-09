@@ -111,14 +111,9 @@ python3 rag/retrieve_best_vuln.py --single-query --query "Check reentrancy" --co
 Rebuild knowledge store:
 
 ```bash
-python3 rag/build_knowledge_store.py
+.venv/bin/python -m E2E.rag.build_store
 ```
 
-Rebuild TF-IDF store:
-
-```bash
-python3 rag/build_tfidf_corpus.py
-```
 Link Demo: https://drive.google.com/file/d/1l1RCZ1RqAwCsNHVRsutYDUeycCbhCs2V/view?usp=drive_link
 
 ## Cấu hình LLM backend (cho các agent phase 2/3)

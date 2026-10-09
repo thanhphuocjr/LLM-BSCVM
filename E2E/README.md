@@ -4,7 +4,7 @@ Kho này tự chứa toàn bộ runtime cần cho khóa luận: static analysis 
 phục, RAG local, adapter CodeLlama detector, dữ liệu nguồn, notebook Kaggle,
 orchestrator sáu phase và bộ sinh báo cáo audit.
 
-## Quick Start Local
+## Quick Start Kaggle
 
 Chạy từ thư mục gốc `/Users/phuocthanh/Documents/RAG`:
 
@@ -14,9 +14,10 @@ Chạy từ thư mục gốc `/Users/phuocthanh/Documents/RAG`:
 .venv/bin/python -m E2E.run E2E/examples/VulnerableBank.sol
 ```
 
-Lệnh trên luôn chạy parser, static, RAG, compile/Slither nếu có, và xuất báo
-cáo local. Khi chưa có kết quả CodeLlama từ Kaggle, contract không có finding
-sẽ là `Inconclusive`, không bị ghi nhầm thành `Safe`.
+Lệnh trên tạo request local, submit notebook private lên Kaggle, tải
+`result.json`, rồi hoàn tất verification/report ở local. Nếu chỉ muốn debug
+offline không submit Kaggle, chạy thêm `--backend local_fast` hoặc
+`--backend local`.
 
 ## Full E2E Through Kaggle
 
@@ -38,18 +39,38 @@ Metadata kernel đã đặt:
 Sau khi chấp nhận license Code Llama trên Kaggle, chạy một lệnh:
 
 ```bash
-.venv/bin/python -m E2E.run path/to/Contract.sol --submit-kaggle
+.venv/bin/python -m E2E.run path/to/Contract.sol
 ```
 
 Orchestrator sẽ tạo request, nhúng request vào notebook private, push kernel,
-poll trạng thái, tải `result.json`, chạy lại static/RAG trên fixed code, compile,
-Slither và xuất báo cáo cuối.
+poll trạng thái và tải `result.json`. Sau mỗi patch, local chạy lại Static/RAG
+và kết hợp với CodeLlama detector trên fixed code. Nếu một trong ba kênh còn
+`Vulnerable`, bằng chứng Static/RAG cùng lý do từ LLM verifier được gửi lại cho
+Fixer ở attempt kế tiếp. Vòng lặp dừng ngay khi cả ba kênh `Safe` và không bao
+giờ vượt quá 3 attempts; kết quả attempt cuối vẫn được compile, chạy SmartBugs
+9-tool matrix và đưa vào báo cáo dù patch pass hay fail.
+
+Artifact từng attempt nằm trong
+`E2E/runs/<run_id>/repair_attempts/attempt-<n>/`. Chế độ `--remote-result` thủ
+công xử lý đúng một kết quả; vòng lặp tự động ba lượt được điều phối bởi
+backend mặc định `kaggle`. Cờ `--submit-kaggle` vẫn còn để tương thích.
+
+Mặc định Kaggle run đã bật các tối ưu tốc độ không bỏ detector/fixer chính:
+skip generator khi cả local evidence và CodeLlama detector đều `Safe`, bỏ lượt
+LLM reporter, bỏ lượt LLM explanation phụ, giảm generation budget còn 900 token
+và poll Kaggle mỗi 8 giây. Khi cần bản narrative đầy đủ hơn, dùng thêm
+`--llm-reporter` hoặc `--llm-detector-explanation`. Khi muốn nhanh hơn nữa cho
+debug patch, dùng `--fast-agents` để advisor/assessor lấy fallback tất định và
+chỉ giữ CodeLlama generation cho fixer/verifier.
+
+Phase 5 mặc định chạy đủ SmartBugs 9-tool matrix cho Kaggle/full runs. Nếu cần
+chạy nhanh kiểu Slither-only để debug, truyền rõ `--tools slither`.
 
 Chế độ tách rời khi muốn thao tác Kaggle thủ công:
 
 ```bash
 # 1. Tạo request local
-.venv/bin/python -m E2E.run path/to/Contract.sol --run-id thesis-demo
+.venv/bin/python -m E2E.run path/to/Contract.sol --run-id thesis-demo --backend local_fast
 
 # 2. Submit request đã tạo
 .venv/bin/python -m E2E.kaggle_job E2E/runs/thesis-demo/request.json
@@ -64,14 +85,15 @@ Chế độ tách rời khi muốn thao tác Kaggle thủ công:
 
 Mỗi phase có JSON riêng trong `E2E/runs/<run_id>/`. Báo cáo cuối có cùng khung
 7 phần với mẫu đã cung cấp, đồng thời thêm bảng trạng thái phase, source hash,
-compiler/Slither evidence và limitations.
+compiler/security-tool evidence và limitations.
 
 1. Static detector: pattern + context checks, chạy local.
 2. RAG detector: TF-IDF trên 37 tài liệu SWC + signal gating, chạy local.
 3. CodeLlama detector: adapter sequence classification theo function, chạy Kaggle.
 4. Advisor/Assessor/Fixer: CodeLlama Instruct sinh JSON có kiểm tra hình dạng.
-5. Verifier: model review + detector lại fixed code + static/RAG + compiler +
-   Slither + kiểm tra bảo toàn hành vi quan sát được.
+5. Verifier: model review có lý do khi `Vulnerable` + detector lại fixed code +
+   static/RAG + feedback loop tối đa 3 attempts + compiler + SmartBugs 9-tool
+   matrix + kiểm tra bảo toàn hành vi quan sát được.
 6. Reporter: CodeLlama tạo narrative; local renderer quyết định cấu trúc và số liệu.
 
 Kết quả chạy thật, số đo và negative control v5/v6 được ghi tại
@@ -83,9 +105,7 @@ Tài nguyên runtime đều nằm trong `E2E/`:
 
 - `models/codellama-vuln-detector/`: adapter cuối và threshold `0.25`.
 - `data/training/detect_v4_functionlevel.jsonl`: 3,558 function, cân bằng nhãn.
-- `data/source/swc-registry/`: 37 tài liệu SWC.
-- `data/source/solodit/`: dữ liệu Solodit sạch.
-- `data/source/rag/`: corpus RAG nguồn.
+- `data/source/vulnerability-knowledge/`: 13,628 mẫu tri thức lỗ hổng thực tế có mã nguồn và bản vá (nguồn tri thức duy nhất).
 - `data/source/raw/`: DAppSCAN và iAudit/TrustLLM nguyên liệu, kèm provenance.
 - `data/runtime/`: registry chuẩn hóa và TF-IDF artifacts.
 - `data_pipeline/dataset_build/`: pipeline tái tạo dataset function-level.

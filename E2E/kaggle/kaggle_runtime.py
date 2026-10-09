@@ -48,6 +48,11 @@ def write_result(value: dict[str, Any]) -> None:
     )
 
 
+def log_step(msg: str) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] [KaggleRuntime] {msg}", flush=True)
+
+
 def ensure_runtime_dependencies() -> None:
     from importlib.metadata import PackageNotFoundError, version
 
@@ -56,26 +61,31 @@ def ensure_runtime_dependencies() -> None:
     except (PackageNotFoundError, ValueError):
         installed = (0, 0, 0)
     if installed >= (0, 46, 1):
+        log_step(f"Dependency check: bitsandbytes version {installed} satisfies requirement >=0.46.1")
         return
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--quiet",
-            "--disable-pip-version-check",
-            "bitsandbytes>=0.46.1",
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "Unable to install bitsandbytes>=0.46.1. "
-            f"pip stderr: {completed.stderr[-2000:]}"
+    log_step("Installing bitsandbytes>=0.46.1 with 90s timeout...")
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--quiet",
+                "--disable-pip-version-check",
+                "bitsandbytes>=0.46.1",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=90,
+            check=False,
         )
+        if completed.returncode != 0:
+            log_step(f"Warning: bitsandbytes install returned code {completed.returncode}. Continuing with default version.")
+        else:
+            log_step("bitsandbytes>=0.46.1 installed successfully.")
+    except subprocess.TimeoutExpired:
+        log_step("Warning: bitsandbytes install timed out after 90s. Continuing with existing environment.")
 
 
 def load_request() -> dict[str, Any]:
@@ -137,6 +147,23 @@ def find_base_model(*, instruct: bool, adapter_path: Path | None = None) -> Path
             return path
         raise FileNotFoundError(f"Configured model path does not exist: {path}")
 
+    target_size = "13b"
+    if adapter_path and not instruct:
+        for cfg_name in ("threshold_config.json", "adapter_config.json"):
+            cfg_p = adapter_path / cfg_name
+            if cfg_p.exists():
+                try:
+                    cfg_data = json.loads(cfg_p.read_text(encoding="utf-8"))
+                    bm = str(cfg_data.get("base_model") or cfg_data.get("base_model_name_or_path") or "").lower()
+                    if "7b" in bm:
+                        target_size = "7b"
+                    elif "13b" in bm:
+                        target_size = "13b"
+                    elif "34b" in bm:
+                        target_size = "34b"
+                except Exception:
+                    pass
+
     candidates = []
     for path in candidate_model_dirs():
         text = str(path).lower()
@@ -150,12 +177,15 @@ def find_base_model(*, instruct: bool, adapter_path: Path | None = None) -> Path
             continue
         score = 0
         score += 8 if "codellama" in text or "code-llama" in text else 0
-        score += 4 if "7b" in text else 0
+        if not instruct:
+            score += 6 if target_size in text else (2 if ("7b" in text or "13b" in text) else 0)
+        else:
+            score += 4 if ("7b" in text or "13b" in text) else 0
         score += 3 if instruct and "instruct" in text else 0
         score += 2 if not instruct and text.endswith(("-hf", "/hf")) else 0
         candidates.append((score, path))
     if not candidates:
-        expected = "CodeLlama-7b-Instruct-hf" if instruct else "CodeLlama-7b-hf"
+        expected = f"CodeLlama-{target_size}-hf" if not instruct else "CodeLlama-7b-Instruct-hf / 13b-Instruct-hf"
         raise FileNotFoundError(
             f"{expected} weights were not found under /kaggle/input. Attach the model and rerun."
         )
@@ -220,8 +250,10 @@ def load_detector(adapter_path: Path, base_path: Path):
     return tokenizer, model, base
 
 
-def detector_input(code: str) -> str:
-    return f"[FUNCTION]\n{code.strip()}"
+def detector_input(code: str, use_function_tag: bool = False) -> str:
+    if use_function_tag:
+        return f"[FUNCTION]\n{code.strip()}"
+    return code.strip()
 
 
 def detect_units(
@@ -229,20 +261,38 @@ def detect_units(
     adapter_path: Path,
     base_path: Path,
     threshold: float,
-) -> dict[str, Any]:
+    *,
+    detector_handle: tuple | None = None,
+    keep_loaded: bool = False,
+) -> tuple[dict[str, Any], tuple | None]:
     import torch
 
     started = now_ms()
     tokenizer = model = base = None
+    should_cleanup = not keep_loaded
+    cfg_file = adapter_path / "threshold_config.json"
+    max_len = 1024
+    use_function_tag = False
+    if cfg_file.exists():
+        try:
+            cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
+            max_len = int(cfg.get("max_len") or 1024)
+            use_function_tag = bool(cfg.get("use_context_input"))
+        except Exception:
+            pass
     try:
-        tokenizer, model, base = load_detector(adapter_path, base_path)
+        if detector_handle is not None:
+            tokenizer, model, base = detector_handle
+            should_cleanup = False
+        else:
+            tokenizer, model, base = load_detector(adapter_path, base_path)
         outputs = []
         for unit in code_units:
             encoded = tokenizer(
-                detector_input(unit["code"]),
+                detector_input(unit["code"], use_function_tag=use_function_tag),
                 return_tensors="pt",
                 truncation=True,
-                max_length=512,
+                max_length=max_len,
                 padding=False,
             )
             device = model.get_input_embeddings().weight.device
@@ -260,18 +310,20 @@ def detect_units(
                 }
             )
         score = max((item["vulnerability_probability"] for item in outputs), default=0.0)
-        return {
+        res = {
             "component": "llm_detector",
             "status": "ok",
             "threshold": threshold,
             "score": round(score, 6),
             "verdict": "Vulnerable" if score >= threshold else "Safe",
             "unit_results": outputs,
-            "input_format": "[FUNCTION]\\n{code}",
+            "input_format": "[FUNCTION]\\n{code}" if use_function_tag else "{code}",
             "elapsed_ms": now_ms() - started,
         }
+        return res, ((tokenizer, model, base) if keep_loaded else None)
     finally:
-        cleanup_model(model, base, tokenizer)
+        if should_cleanup:
+            cleanup_model(model, base, tokenizer)
 
 
 def load_generator(model_path: Path):
@@ -688,11 +740,27 @@ def generate_function_patch(
     llm: JSONGenerator,
     unit: dict[str, Any],
     finding: dict[str, Any],
+    repair_feedback: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     errors = []
     original = str(unit.get("code") or "").strip()
     original_header = normalized_declaration_header(original)
     correction = ""
+    compiler_error = (
+        (repair_feedback.get("compiler_error") or repair_feedback.get("compile", {}).get("stderr") or "")
+        if repair_feedback
+        else ""
+    )
+    compiler_prompt_note = ""
+    if compiler_error:
+        compiler_prompt_note = (
+            f"\n\n[CRITICAL: PREVIOUS PATCH FAILED COMPILATION]\n"
+            f"Compiler error message:\n{compiler_error}\n"
+            "Your replacement patch MUST fix this compiler error. Ensure all built-in function calls "
+            "(e.g., ecrecover requires 4 arguments: ecrecover(bytes32 hash, uint8 v, bytes32 r, bytes32 s)), "
+            "variable types, and syntax are 100% valid Solidity."
+        )
+
     for attempt in range(llm.max_retries + 1):
         prompt = llm._format_prompt(
             (
@@ -708,6 +776,7 @@ def generate_function_patch(
                 "the interaction. Do not return JSON, markdown, a contract wrapper, or explanation.\n"
                 f"Finding: {compact_json(compact_findings([finding]))}\n"
                 f"Original declaration:\n{original}"
+                + compiler_prompt_note
                 + correction
             ),
         )
@@ -745,9 +814,47 @@ def compact_json(value: Any, max_chars: int = 24000) -> str:
 
 
 def combined_findings(request: dict[str, Any], detector: dict[str, Any] | None) -> list[dict[str, Any]]:
+    repair_feedback = request.get("repair_feedback") or {}
     findings = list(request["local_phase1"]["provisional_fusion"].get("findings", []))
-    if findings:
-        return findings
+    if not repair_feedback:
+        if findings:
+            return findings
+    else:
+        feedback_findings: dict[tuple[str, str], dict[str, Any]] = {
+            (str(f.get("swc") or "UNMAPPED"), str(f.get("unit_id") or "source")): dict(f)
+            for f in findings
+        }
+        feedback_components = repair_feedback.get("components", {})
+        for source, component in feedback_components.items():
+            evidence_items = (
+                component.get("residual_target_findings")
+                or component.get("introduced_findings")
+                or component.get("findings")
+                or []
+            )
+            for item in evidence_items:
+                swc = str(item.get("swc") or "UNMAPPED")
+                unit_id = str(item.get("unit_id") or "source")
+                key = (swc, unit_id)
+                current = feedback_findings.setdefault(
+                    key,
+                    {
+                        **item,
+                        "finding_id": str(item.get("finding_id") or f"{swc}:{unit_id}"),
+                        "swc": swc,
+                        "unit_id": unit_id,
+                        "title": item.get("title") or item.get("name") or item.get("category") or "Tool matrix finding",
+                        "description": item.get("description") or item.get("message") or component.get("reason") or "",
+                        "sources": [],
+                    },
+                )
+                for field, value in item.items():
+                    if value and not current.get(field):
+                        current[field] = value
+                if source not in current["sources"]:
+                    current["sources"].append(source)
+        if feedback_findings:
+            return list(feedback_findings.values())
     if detector and detector.get("verdict") == "Vulnerable":
         vulnerable_units = [
             item
@@ -844,6 +951,8 @@ def no_patch_verifier(
         return {
             "status": "ok",
             "verifications": [],
+            "verdict": "Safe",
+            "vulnerability_reason": "",
             "overall_verdict": "No findings required repair.",
             "deterministic_guard": True,
         }
@@ -856,6 +965,8 @@ def no_patch_verifier(
         reason = "Patch verification was blocked."
     return {
         "status": "error",
+        "verdict": "Vulnerable",
+        "vulnerability_reason": reason,
         "verifications": [
             {
                 "finding_id": str(finding.get("finding_id") or ""),
@@ -885,6 +996,8 @@ def inconclusive_verifier_fallback(
     }
     return {
         "status": "ok",
+        "verdict": "Inconclusive",
+        "vulnerability_reason": "The generative verifier could not determine whether the patch removed the vulnerability.",
         "verifications": [
             {
                 "finding_id": str(finding.get("finding_id") or ""),
@@ -892,7 +1005,7 @@ def inconclusive_verifier_fallback(
                 "unit_id": str(finding.get("unit_id") or ""),
                 "status": "Inconclusive",
                 "evidence": (
-                    "A patch was applied; deterministic redetection, compilation, and Slither "
+                    "A patch was applied; deterministic compilation, behavior checks, and the security tool matrix "
                     "must decide acceptance."
                     if str(finding.get("unit_id") or "") in applied_units
                     else "No patch outcome was mapped to this finding."
@@ -908,6 +1021,72 @@ def inconclusive_verifier_fallback(
     }
 
 
+def reporter_fallback(
+    findings: list[dict[str, Any]],
+    assessor: dict[str, Any],
+    verifier: dict[str, Any],
+    *,
+    reason: str = "skipped_llm_reporter",
+) -> dict[str, Any]:
+    finding_count = len(findings)
+    verdict = verifier.get("overall_verdict") or verifier.get("verdict") or "Pending deterministic verification"
+    return {
+        "status": "ok",
+        "executive_summary": (
+            f"The audit identified {finding_count} finding(s). Verification status: {verdict}. "
+            "The deterministic local report renderer provides the final evidence tables and patch decision."
+        ),
+        "recommendations": [
+            "Review every generated patch before deployment.",
+            "Run compilation, Slither, and the configured security tool matrix after patching.",
+            "Execute the project test suite for behavior-specific coverage.",
+        ],
+        "generation_mode": "deterministic_fallback",
+        "reason": reason,
+        "assessor_status": assessor.get("status"),
+    }
+
+
+def no_finding_agent_phases(run_id: str, source_code: str) -> dict[str, Any]:
+    return {
+        "advisor": {
+            "status": "ok",
+            "suggestions": [],
+            "recommendations": [],
+            "generation_mode": "skipped_no_findings",
+        },
+        "assessor": {
+            "status": "ok",
+            "assessments": [],
+            "generation_mode": "skipped_no_findings",
+        },
+        "fixer": {
+            "status": "ok",
+            "fixed_code": source_code,
+            "patch_outcomes": [],
+            "patches": [],
+            "generation_mode": "skipped_no_findings",
+        },
+        "verifier": {
+            "status": "ok",
+            "verdict": "Safe",
+            "vulnerability_reason": "",
+            "verifications": [],
+            "overall_verdict": "No patch required: all detector inputs were Safe.",
+            "generation_mode": "skipped_no_findings",
+        },
+        "reporter": {
+            "status": "ok",
+            "executive_summary": f"Audit completed for run {run_id}. No confirmed findings were identified.",
+            "recommendations": [
+                "Continue to run compiler, Slither, and project tests before deployment.",
+                "Repeat the audit after security-sensitive code changes.",
+            ],
+            "generation_mode": "skipped_no_findings",
+        },
+    }
+
+
 def source_for_prompt(request: dict[str, Any], limit: int = 30000) -> str:
     return request["source"]["code"][:limit]
 
@@ -916,19 +1095,31 @@ def run_agents(
     request: dict[str, Any],
     detector: dict[str, Any] | None,
     generator_path: Path,
-) -> tuple[dict[str, Any], str]:
+    *,
+    generator_handle: tuple | None = None,
+    keep_loaded: bool = False,
+) -> tuple[dict[str, Any], str, tuple | None]:
     tokenizer = model = None
+    should_cleanup = not keep_loaded
     phases: dict[str, Any] = {}
     source = request["source"]["code"]
     findings = combined_findings(request, detector)
     agent_findings = compact_findings(findings)
     generation = request.get("execution", {}).get("generation", {})
+    repair_feedback = request.get("repair_feedback") or {}
+    deterministic_advisor_assessor = bool(generation.get("deterministic_advisor_assessor"))
+    skip_reporter_llm = bool(generation.get("skip_reporter_llm", True))
     try:
-        tokenizer, model = load_generator(generator_path)
+        if generator_handle is not None:
+            tokenizer, model = generator_handle
+            should_cleanup = False
+        else:
+            tokenizer, model = load_generator(generator_path)
         llm = JSONGenerator(tokenizer, model, generation)
         context = {
             "findings": agent_findings,
             "retrieved_swc_context": request["local_phase1"]["rag"].get("retrieved_context", []),
+            "previous_verification_feedback": repair_feedback,
             "code_units": [
                 {
                     "unit_id": item["unit_id"],
@@ -939,74 +1130,102 @@ def run_agents(
                 for item in request["code_units"]
             ],
         }
-        phases["advisor"] = llm.ask(
-            phase="advisor",
-            system=(
-                "You are a Solidity security repair advisor. Ground every suggestion in the supplied "
-                "finding and SWC context. Do not invent a vulnerability. Preserve contract behavior."
-            ),
-            user=(
-                "Prepare one repair suggestion per finding. Each item must contain finding_id, swc, "
-                "unit_id, title, root_cause, impact, repair_steps (array), and secure_pattern.\n"
-                'JSON shape: {"suggestions": [...]}\n'
-                f"Context: {compact_json(context)}"
-            ),
-            required={"suggestions": list},
-            retry_limit=0,
-            item_requirements=(
-                "suggestions",
-                {
-                    "finding_id": str,
-                    "swc": str,
-                    "unit_id": str,
-                    "title": str,
-                    "root_cause": str,
-                    "impact": str,
-                    "repair_steps": list,
-                    "secure_pattern": str,
-                },
-            ),
-        )
-        if findings and not phases["advisor"].get("suggestions"):
+        if deterministic_advisor_assessor:
             phases["advisor"] = grounded_advisor_fallback(
                 findings,
-                phases["advisor"],
+                {"status": "skipped", "errors": ["deterministic_advisor_assessor enabled"]},
             )
-        phases["assessor"] = llm.ask(
-            phase="assessor",
-            system=(
-                "You are a conservative smart-contract risk assessor. Use CVSS-like scores from 0 to 10. "
-                "Do not raise severity without a concrete exploit path."
-            ),
-            user=(
-                "Assess each supplied finding. Each assessment must contain finding_id, swc, unit_id, "
-                "severity, cvss_score, impact, likelihood, repair_priority, and rationale.\n"
-                'JSON shape: {"assessments": [...]}\n'
-                f"Findings: {compact_json(agent_findings)}\n"
-                f"Advisor: {compact_json(phases['advisor'])}"
-            ),
-            required={"assessments": list},
-            retry_limit=0,
-            item_requirements=(
-                "assessments",
-                {
-                    "finding_id": str,
-                    "swc": str,
-                    "unit_id": str,
-                    "severity": str,
-                    "cvss_score": (int, float),
-                    "impact": str,
-                    "likelihood": str,
-                    "repair_priority": str,
-                    "rationale": str,
-                },
-            ),
-        )
-        if findings and not phases["assessor"].get("assessments"):
+        else:
+            phases["advisor"] = llm.ask(
+                phase="advisor",
+                system=(
+                    "You are a Solidity security repair advisor. Ground every suggestion in the supplied "
+                    "finding and SWC context. Do not invent a vulnerability. Preserve contract behavior."
+                ),
+                user=(
+                    "Prepare one repair suggestion per finding. Each item must contain finding_id, swc, "
+                    "unit_id, title, root_cause, impact, repair_steps (array), and secure_pattern.\n"
+                    'JSON shape: {"suggestions": [...]}\n'
+                    f"Context: {compact_json(context)}"
+                ),
+                required={"suggestions": list},
+                retry_limit=0,
+                item_requirements=(
+                    "suggestions",
+                    {
+                        "finding_id": str,
+                        "swc": str,
+                        "unit_id": str,
+                        "title": str,
+                        "root_cause": str,
+                        "impact": str,
+                        "repair_steps": list,
+                        "secure_pattern": str,
+                    },
+                ),
+            )
+            if findings and not phases["advisor"].get("suggestions"):
+                phases["advisor"] = grounded_advisor_fallback(
+                    findings,
+                    phases["advisor"],
+                )
+        if deterministic_advisor_assessor:
             phases["assessor"] = grounded_assessor_fallback(
                 findings,
-                phases["assessor"],
+                {"status": "skipped", "errors": ["deterministic_advisor_assessor enabled"]},
             )
+        else:
+            phases["assessor"] = llm.ask(
+                phase="assessor",
+                system=(
+                    "You are a conservative smart-contract risk assessor. Use CVSS-like scores from 0 to 10. "
+                    "Do not raise severity without a concrete exploit path."
+                ),
+                user=(
+                    "Assess each supplied finding. Each assessment must contain finding_id, swc, unit_id, "
+                    "severity, cvss_score, impact, likelihood, repair_priority, and rationale.\n"
+                    'JSON shape: {"assessments": [...]}\n'
+                    f"Findings: {compact_json(agent_findings)}\n"
+                    f"Advisor: {compact_json(phases['advisor'])}"
+                ),
+                required={"assessments": list},
+                retry_limit=0,
+                item_requirements=(
+                    "assessments",
+                    {
+                        "finding_id": str,
+                        "swc": str,
+                        "unit_id": str,
+                        "severity": str,
+                        "cvss_score": (int, float),
+                        "impact": str,
+                        "likelihood": str,
+                        "repair_priority": str,
+                        "rationale": str,
+                    },
+                ),
+            )
+            if findings and not phases["assessor"].get("assessments"):
+                phases["assessor"] = grounded_assessor_fallback(
+                    findings,
+                    phases["assessor"],
+                )
+        compiler_error_feedback = (
+            repair_feedback.get("compiler_error")
+            or repair_feedback.get("compile", {}).get("stderr")
+            or repair_feedback.get("compile", {}).get("error")
+            or ""
+        )
+        compiler_fix_instruction = ""
+        if compiler_error_feedback:
+            compiler_fix_instruction = (
+                f"\n\n[CRITICAL: PREVIOUS PATCH FAILED COMPILATION]\n"
+                f"Compiler error message:\n{compiler_error_feedback}\n"
+                "You MUST fix this compiler error. Ensure all built-in function calls "
+                "(e.g., ecrecover requires 4 arguments: ecrecover(bytes32 hash, uint8 v, bytes32 r, bytes32 s)), "
+                "variable types, and syntax strictly compile under Solidity.\n"
+            )
+
         phases["fixer"] = llm.ask(
             phase="fixer",
             system=(
@@ -1021,6 +1240,11 @@ def run_agents(
                 'Example: {"patches": [{"unit_id": "Contract.withdraw", '
                 '"replacement": "function withdraw() external { ... }", '
                 '"summary": "Apply checks-effects-interactions"}], "notes": []}\n'
+                "Previous verification feedback (empty on the first attempt): "
+                f"{compact_json(repair_feedback, 12000)}\n"
+                + compiler_fix_instruction
+                + "When feedback is present, address every failed verification/tool item in this "
+                "new patch. Do not repeat a patch that left the reported root cause in place.\n"
                 f"Source:\n{source_for_prompt(request)}\n"
                 f"Advisor: {compact_json(phases['advisor'])}\n"
                 f"Risk: {compact_json(phases['assessor'])}"
@@ -1050,6 +1274,7 @@ def run_agents(
                     llm,
                     unit_map[unit_id],
                     finding,
+                    repair_feedback=repair_feedback,
                 )
                 text_errors.extend(f"{unit_id}: {error}" for error in errors)
                 if patch:
@@ -1079,12 +1304,21 @@ def run_agents(
                 user=(
                     "Verify every finding and patch. Each verification must contain finding_id, swc, unit_id, "
                     "status (Fixed/Not Fixed/Inconclusive), evidence, behavioral_regression, and residual_risk. "
-                    'Also return overall_verdict. JSON shape: {"verifications": [...], "overall_verdict": "..."}\n'
+                    "Also classify the fixed code with verdict (Safe/Vulnerable/Inconclusive) and return "
+                    "vulnerability_reason. If verdict is Vulnerable, vulnerability_reason must identify the "
+                    "remaining unsafe behavior, its unit, and why the patch did not remove it. "
+                    'JSON shape: {"verdict": "...", "vulnerability_reason": "...", '
+                    '"verifications": [...], "overall_verdict": "..."}\n'
                     f"Original findings: {compact_json(agent_findings)}\n"
                     f"Patch outcomes: {compact_json(outcomes)}\n"
                     f"Fixed code:\n{fixed_code[:30000]}"
                 ),
-                required={"verifications": list, "overall_verdict": str},
+                required={
+                    "verdict": str,
+                    "vulnerability_reason": str,
+                    "verifications": list,
+                    "overall_verdict": str,
+                },
                 item_requirements=(
                     "verifications",
                     {
@@ -1110,25 +1344,115 @@ def run_agents(
                 outcomes,
                 source_changed=fixed_code != source,
             )
-        phases["reporter"] = llm.ask(
-            phase="reporter",
+        if skip_reporter_llm:
+            phases["reporter"] = reporter_fallback(
+                findings,
+                phases["assessor"],
+                phases["verifier"],
+            )
+        else:
+            phases["reporter"] = llm.ask(
+                phase="reporter",
+                system=(
+                    "You write concise evidence-based smart-contract audit summaries. Do not claim safety when "
+                    "verification is incomplete."
+                ),
+                user=(
+                    "Write an executive_summary and 3-7 recommendations for the deterministic final report. "
+                    "Every recommendation must be a plain JSON string, not an object. "
+                    'JSON shape: {"executive_summary": "...", "recommendations": [...]}\n'
+                    f"Findings: {compact_json(agent_findings)}\n"
+                    f"Risk: {compact_json(phases['assessor'])}\n"
+                    f"Verification: {compact_json(phases['verifier'])}"
+                ),
+                required={"executive_summary": str, "recommendations": list},
+            )
+        return phases, fixed_code, ((tokenizer, model) if keep_loaded else None)
+    finally:
+        if should_cleanup:
+            cleanup_model(model, tokenizer)
+
+
+def explain_vulnerable_detection(
+    fixed_code: str,
+    detector: dict[str, Any],
+    generator_path: Path,
+    generation: dict[str, Any],
+    *,
+    generator_handle: tuple | None = None,
+) -> dict[str, Any]:
+    vulnerable_units = [
+        item
+        for item in detector.get("unit_results", [])
+        if item.get("label") == "Vulnerable"
+    ]
+    fallback_reason = (
+        "The binary detector remains above threshold for "
+        + ", ".join(
+            f"{item.get('unit_id') or 'fixed source'} "
+            f"(probability {float(item.get('vulnerability_probability') or 0.0):.3f})"
+            for item in vulnerable_units
+        )
+        + ". A concrete root cause could not be generated, so manual review is required."
+    )
+    tokenizer = model = None
+    should_cleanup = generator_handle is None
+    try:
+        if generator_handle is not None:
+            tokenizer, model = generator_handle
+        else:
+            tokenizer, model = load_generator(generator_path)
+        llm = JSONGenerator(tokenizer, model, generation)
+        result = llm.ask(
+            phase="verifier_explanation",
             system=(
-                "You write concise evidence-based smart-contract audit summaries. Do not claim safety when "
-                "verification is incomplete."
+                "You are a Solidity security verifier explaining a positive binary-classifier result. "
+                "Inspect only the supplied fixed code. Give a concrete code-grounded reason and never "
+                "invent a weakness solely to agree with the classifier."
             ),
             user=(
-                "Write an executive_summary and 3-7 recommendations for the deterministic final report. "
-                "Every recommendation must be a plain JSON string, not an object. "
-                'JSON shape: {"executive_summary": "...", "recommendations": [...]}\n'
-                f"Findings: {compact_json(agent_findings)}\n"
-                f"Risk: {compact_json(phases['assessor'])}\n"
-                f"Verification: {compact_json(phases['verifier'])}"
+                "The binary detector classified the listed units as Vulnerable. Explain why the fixed code "
+                "still appears vulnerable. Return verdict, reason, and remaining_findings. Each remaining "
+                "finding must include unit_id, title, reason, evidence, and recommended_fix. If this appears "
+                "to be a false positive, set verdict to Inconclusive and explain the disagreement in reason.\n"
+                'JSON shape: {"verdict": "Vulnerable|Inconclusive", "reason": "...", '
+                '"remaining_findings": [{"unit_id": "...", "title": "...", "reason": "...", '
+                '"evidence": "...", "recommended_fix": "..."}]}\n'
+                f"Detector output: {compact_json(detector)}\n"
+                f"Fixed code:\n{fixed_code[:30000]}"
             ),
-            required={"executive_summary": str, "recommendations": list},
+            required={"verdict": str, "reason": str, "remaining_findings": list},
+            item_requirements=(
+                "remaining_findings",
+                {
+                    "unit_id": str,
+                    "title": str,
+                    "reason": str,
+                    "evidence": str,
+                    "recommended_fix": str,
+                },
+            ),
         )
-        return phases, fixed_code
+        if result.get("status") == "ok" and str(result.get("reason") or "").strip():
+            return result
+        return {
+            "status": "error",
+            "verdict": "Inconclusive",
+            "reason": fallback_reason,
+            "remaining_findings": [],
+            "errors": result.get("errors", []),
+        }
+    except Exception as error:
+        return {
+            "status": "error",
+            "verdict": "Inconclusive",
+            "reason": fallback_reason,
+            "remaining_findings": [],
+            "errors": [f"{type(error).__name__}: {error}"],
+        }
     finally:
-        cleanup_model(model, tokenizer)
+        if should_cleanup:
+            cleanup_model(model, tokenizer)
 
 
 def code_units_for_fixed(
@@ -1197,32 +1521,63 @@ def main() -> dict[str, Any]:
         result["run_id"] = request["run_id"]
         result["source_sha256"] = request["source"]["sha256"]
         mode = request.get("execution", {}).get("mode", "full")
-        threshold = float(request.get("execution", {}).get("detector_threshold") or 0.25)
+        threshold = float(request.get("execution", {}).get("detector_threshold") or 0.525)
+        generation_options = request.get("execution", {}).get("generation", {})
         adapter_path = find_adapter_path()
         detector_base = None
         generator_path = None
         result["models"]["detector_adapter"] = str(adapter_path)
 
+        can_keep_both = False
+        try:
+            import torch
+            if torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory >= 14 * (1024**3):
+                can_keep_both = True
+        except Exception:
+            pass
+
+        detector_handle = None
+        generator_handle = None
         detector_original = None
         if mode in {"detector_only", "full"}:
             detector_base = find_base_model(instruct=False, adapter_path=adapter_path)
             result["models"]["detector"] = str(detector_base)
-            detector_original = detect_units(
+            detector_original, detector_handle = detect_units(
                 request["code_units"],
                 adapter_path,
                 detector_base,
                 threshold,
+                keep_loaded=can_keep_both,
             )
             result["phases"]["detector"] = {"status": "ok", "original": detector_original}
 
         fixed_code = request["source"]["code"]
+        local_findings = request.get("local_phase1", {}).get("provisional_fusion", {}).get("findings", [])
+        no_findings_after_detector = (
+            mode == "full"
+            and detector_original is not None
+            and detector_original.get("verdict") == "Safe"
+            and not local_findings
+            and not request.get("repair_feedback")
+        )
+        if no_findings_after_detector:
+            result["phases"].update(no_finding_agent_phases(request["run_id"], fixed_code))
+            result["phases"]["detector"]["fixed"] = {
+                **detector_original,
+                "verification_target": "original_source_no_patch_required",
+            }
+            result["timings"]["generator_skipped"] = True
+            result["timings"]["skip_reason"] = "no local findings and CodeLlama detector original verdict Safe"
+            mode = "detector_only"
+
         if mode in {"agents_only", "full"}:
             generator_path = find_base_model(instruct=True, adapter_path=adapter_path)
             result["models"]["generator"] = str(generator_path)
-            agent_phases, fixed_code = run_agents(
+            agent_phases, fixed_code, generator_handle = run_agents(
                 request,
                 detector_original,
                 generator_path,
+                keep_loaded=True,
             )
             result["phases"].update(agent_phases)
 
@@ -1232,7 +1587,43 @@ def main() -> dict[str, Any]:
                 fixed_code,
                 result.get("phases", {}).get("fixer", {}).get("patches", []),
             )
-            detector_fixed = detect_units(fixed_units, adapter_path, detector_base, threshold)
+            detector_fixed, _ = detect_units(
+                fixed_units,
+                adapter_path,
+                detector_base,
+                threshold,
+                detector_handle=detector_handle,
+            )
+            if (
+                detector_fixed.get("verdict") == "Vulnerable"
+                and generator_path is not None
+                and not bool(generation_options.get("skip_detector_explanation", True))
+            ):
+                explanation = explain_vulnerable_detection(
+                    fixed_code,
+                    detector_fixed,
+                    generator_path,
+                    generation_options,
+                    generator_handle=generator_handle,
+                )
+                detector_fixed["vulnerability_reason"] = explanation.get("reason", "")
+                verifier = result.get("phases", {}).setdefault("verifier", {})
+                verifier["detector_explanation"] = explanation
+                verifier["vulnerability_reason"] = explanation.get("reason", "")
+            elif detector_fixed.get("verdict") == "Vulnerable":
+                reason = (
+                    "The fixed-code binary detector remains above threshold for "
+                    + ", ".join(
+                        f"{item.get('unit_id') or 'fixed source'} "
+                        f"({float(item.get('vulnerability_probability') or 0.0):.3f})"
+                        for item in detector_fixed.get("unit_results", [])
+                        if item.get("label") == "Vulnerable"
+                    )
+                    + "."
+                )
+                detector_fixed["vulnerability_reason"] = reason
+                verifier = result.get("phases", {}).setdefault("verifier", {})
+                verifier["vulnerability_reason"] = reason
             result["phases"]["detector"]["fixed"] = detector_fixed
 
         phase_statuses = [
@@ -1242,13 +1633,36 @@ def main() -> dict[str, Any]:
         ]
         result["status"] = "ok" if all(status == "ok" for status in phase_statuses) else "partial"
     except Exception as error:
+        log_step(f"Error encountered during audit: {type(error).__name__}: {error}")
         result["errors"].append(f"{type(error).__name__}: {error}")
         result["status"] = "error" if not result["phases"] else "partial"
     finally:
+        log_step("Cleaning up model handles and freeing GPU VRAM...")
+        if detector_handle is not None:
+            cleanup_model(*detector_handle)
+        if generator_handle is not None:
+            cleanup_model(*generator_handle)
         result["timings"]["total_ms"] = now_ms() - started
         write_result(result)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        log_step(f"Result successfully saved to /kaggle/working/result.json (status={result['status']}, elapsed={result['timings']['total_ms']}ms)")
+        print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
+        log_step("Audit execution finished. Notebook cell ending successfully.")
     return result
 
 
-main()
+if __name__ == "__main__" or True:
+    log_step("=== CodeLlama E2E Smart Contract Audit Worker Starting ===")
+    main()
+    log_step("=== All tasks completed. Session ready for automatic cloud shutdown. ===")
+    sys.stdout.flush()
+    sys.stderr.flush()

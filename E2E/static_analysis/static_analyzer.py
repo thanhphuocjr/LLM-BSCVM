@@ -25,7 +25,7 @@ from __future__ import annotations
 import re
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,29 @@ class VulnerabilityFinding:
     @property
     def weighted_score(self) -> float:
         return self.raw_score * self.type_weight
+
+
+@dataclass(frozen=True)
+class SolidityFunction:
+    """Lightweight function boundary used by semantic checks."""
+
+    name: str
+    params: str
+    header: str
+    start: int
+    body_start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class SolidityContract:
+    """Lightweight contract boundary used by contract-level checks."""
+
+    name: str
+    header: str
+    start: int
+    body_start: int
+    end: int
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -215,9 +238,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
              "Modifier rỗng - không có logic kiểm tra"),
             (r'modifier\s+\w+\s*\([^)]*\)\s*\{\s*//[^\n]*\n\s*_;\s*\}', 0.55,
              "Modifier chỉ có comment - nghi ngờ placeholder"),
-            # Không kiểm tra zero address
-            (r'function\s+\w+[^{]*address\s+\w+[^{]*\{(?:(?!require\s*\(\s*\w+\s*!=\s*address\s*\(\s*0).){0,200}\w+\s*=\s*\w+',
-             0.30, "Gán address mà không kiểm tra zero address"),
             # Role-based access sai
             (r'hasRole\s*\([^)]*\)\s*==\s*false', 0.40,
              "Kiểm tra hasRole ngược - logic sai tiềm ẩn"),
@@ -284,9 +304,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
              "Downcast uint - có thể mất dữ liệu nếu giá trị vượt range"),
             (r'int(?:8|16|32|64|128)\s*\(\s*\w+\s*\)', 0.35,
              "Downcast int - có thể mất dữ liệu"),
-            # Nhân trước khi chia (precision loss)
-            (r'\w+\s*/\s*\w+\s*\*\s*\w+', 0.25,
-             "Chia trước rồi nhân - mất độ chính xác (nên nhân trước)"),
             # Exponentiation có thể overflow
             (r'\w+\s*\*\*\s*\w+', 0.20,
              "Phép lũy thừa - kiểm tra overflow"),
@@ -610,8 +627,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
             # Tautology trong require
             (r'require\s*\(\s*true\s*\)', 0.60,
              "require(true) - vô nghĩa"),
-            (r'require\s*\(\s*\w+\s*==\s*\w+\s*\)', 0.25,
-             "require với so sánh bằng tự thân - kiểm tra logic"),
             # Dead code
             (r'return\s*;[^}]*\w+\s*=', 0.40,
              "Code sau return statement - dead code"),
@@ -707,20 +722,54 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         ],
     },
 
-    # ──────────────────────────── SHORT ADDRESS ───────────────────────────────
+    # ───────────────────── SLITHER-DERIVED LOGIC CHECKS ──────────────────────
 
     {
-        "vuln_id": "SWC-103",
-        "vuln_type": "short_address_attack",
+        "vuln_id": "SWC-111",
+        "vuln_type": "deprecated_solidity_usage",
+        "risk_level": "Low",
+        "type_weight": 0.05,
+        "patterns": [
+            (r'\bmsg\.gas\b', 0.35, "msg.gas đã bị thay thế bởi gasleft()"),
+            (r'\bsha3\s*\(', 0.35, "sha3() đã bị thay thế bởi keccak256()"),
+            (r'\bthrow\s*;', 0.40, "throw đã bị thay thế bởi revert()/require()"),
+            (r'\.callcode\s*\(', 0.45, "callcode đã bị thay thế bởi delegatecall"),
+        ],
+        "negative_patterns": [],
+    },
+
+    {
+        "vuln_id": "SWC-129",
+        "vuln_type": "incorrect_unary_expression",
+        "risk_level": "Medium",
+        "type_weight": 0.10,
+        "patterns": [
+            (r'(?<![+\-*/%&|^])=\s*\+\s*(?:\d+|[A-Za-z_]\w*)', 0.55,
+             "Biểu thức '= +' thường là lỗi gõ nhầm của '+='"),
+        ],
+        "negative_patterns": [],
+    },
+
+    {
+        "vuln_id": "SWC-135",
+        "vuln_type": "tautological_comparison",
+        "risk_level": "Medium",
+        "type_weight": 0.10,
+        "patterns": [
+            (r'\b([A-Za-z_]\w*)\s*(?:==|!=|<=|>=|<|>)\s*\1\b', 0.55,
+             "Một giá trị đang được so sánh với chính nó"),
+        ],
+        "negative_patterns": [],
+    },
+
+    {
+        "vuln_id": "STATIC-DIVIDE-BEFORE-MULTIPLY",
+        "vuln_type": "divide_before_multiply",
         "risk_level": "Medium",
         "type_weight": 0.08,
         "patterns": [
-            # Transfer không validate độ dài address
-            (r'function\s+transfer\s*\(\s*address\s+\w+\s*,\s*uint\w*\s*\w+\s*\)', 0.20,
-             "Transfer function - kiểm tra short address padding"),
-            # ABI encoding dễ bị short address
-            (r'abi\.encodePacked\s*\([^)]*address', 0.25,
-             "encodePacked với address - dễ bị hash collision"),
+            (r'\b[A-Za-z_]\w*\s*/\s*[A-Za-z_]\w*\s*\*\s*[A-Za-z_]\w*\b',
+             0.35, "Chia số nguyên trước khi nhân có thể làm mất độ chính xác"),
         ],
         "negative_patterns": [],
     },
@@ -748,19 +797,1523 @@ def _extract_context(code: str, pos: int, window: int = 120) -> str:
 
 
 def _strip_comments(code: str) -> str:
-    """Loại bỏ comment để tránh false positive."""
-    # Bỏ block comment /* ... */
-    code = re.sub(r'/\*[\s\S]*?\*/', '', code)
-    # Bỏ single-line comment //
-    code = re.sub(r'//[^\n]*', '', code)
-    return code
+    """Mask comments while preserving source offsets and line numbers."""
+    return re.sub(
+        r'/\*[\s\S]*?\*/|//[^\n]*',
+        lambda match: _mask_text(match.group()),
+        code,
+    )
 
 
 def _strip_strings(code: str) -> str:
-    """Loại bỏ string literals để tránh false positive."""
-    code = re.sub(r'"[^"\\]*(?:\\.[^"\\]*)*"', '""', code)
-    code = re.sub(r"'[^'\\]*(?:\\.[^'\\]*)*'", "''", code)
-    return code
+    """Mask string literals while preserving source offsets and line numbers."""
+    code = re.sub(
+        r'"[^"\\]*(?:\\.[^"\\]*)*"',
+        lambda match: _mask_text(match.group()),
+        code,
+    )
+    return re.sub(
+        r"'[^'\\]*(?:\\.[^'\\]*)*'",
+        lambda match: _mask_text(match.group()),
+        code,
+    )
+
+
+def _mask_text(value: str) -> str:
+    """Replace non-newline characters with spaces so offsets stay stable."""
+    return "".join("\n" if char == "\n" else " " for char in value)
+
+
+def _clean_code(code: str) -> str:
+    """Return Solidity code with comments and strings masked."""
+    return _strip_comments(_strip_strings(code))
+
+
+def _balanced_end(
+    code: str,
+    open_pos: int,
+    opening: str = "{",
+    closing: str = "}",
+) -> Optional[int]:
+    """Return the matching closing delimiter position."""
+    if open_pos < 0 or open_pos >= len(code) or code[open_pos] != opening:
+        return None
+    depth = 0
+    for pos in range(open_pos, len(code)):
+        char = code[pos]
+        if char == opening:
+            depth += 1
+        elif char == closing:
+            depth -= 1
+            if depth == 0:
+                return pos
+    return None
+
+
+def _iter_functions(code: str) -> Iterator[SolidityFunction]:
+    """Yield implemented functions without requiring a Solidity compiler."""
+    clean = _clean_code(code)
+    patterns = (
+        re.compile(
+            r'\bfunction\s+(?P<name>[A-Za-z_]\w*)\s*'
+            r'\((?P<params>[^)]*)\)(?P<header>[^;{}]*)\{',
+            re.DOTALL,
+        ),
+        re.compile(
+            r'\b(?P<name>constructor|receive|fallback)\s*'
+            r'\((?P<params>[^)]*)\)(?P<header>[^;{}]*)\{',
+            re.DOTALL,
+        ),
+    )
+    functions: List[SolidityFunction] = []
+    for pattern in patterns:
+        for match in pattern.finditer(clean):
+            open_pos = match.end() - 1
+            close_pos = _balanced_end(clean, open_pos)
+            if close_pos is None:
+                continue
+            functions.append(SolidityFunction(
+                name=match.group("name"),
+                params=code[match.start("params"):match.end("params")],
+                header=code[match.start("header"):match.end("header")],
+                start=match.start(),
+                body_start=open_pos + 1,
+                end=close_pos,
+            ))
+    yield from sorted(functions, key=lambda item: item.start)
+
+
+def _iter_contracts(code: str) -> Iterator[SolidityContract]:
+    """Yield concrete contract boundaries for contract-level checks."""
+    clean = _clean_code(code)
+    pattern = re.compile(
+        r'\bcontract\s+(?P<name>[A-Za-z_]\w*)'
+        r'(?P<header>[^;{}]*)\{',
+        re.DOTALL,
+    )
+    for match in pattern.finditer(clean):
+        open_pos = match.end() - 1
+        close_pos = _balanced_end(clean, open_pos)
+        if close_pos is None:
+            continue
+        yield SolidityContract(
+            name=match.group("name"),
+            header=code[match.start("header"):match.end("header")],
+            start=match.start(),
+            body_start=open_pos + 1,
+            end=close_pos,
+        )
+
+
+def _split_top_level_arguments(value: str) -> List[str]:
+    """Split a Solidity argument list while respecting nested expressions."""
+    arguments: List[str] = []
+    start = 0
+    depths = {"(": 0, "[": 0, "{": 0}
+    closing_to_opening = {")": "(", "]": "[", "}": "{"}
+    quote: Optional[str] = None
+    escaped = False
+    for pos, char in enumerate(value):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char in depths:
+            depths[char] += 1
+        elif char in closing_to_opening:
+            opening = closing_to_opening[char]
+            depths[opening] = max(0, depths[opening] - 1)
+        elif char == "," and not any(depths.values()):
+            arguments.append(value[start:pos].strip())
+            start = pos + 1
+    tail = value[start:].strip()
+    if tail or arguments:
+        arguments.append(tail)
+    return arguments
+
+
+def _collect_symbol_types(code: str) -> Dict[str, str]:
+    """Collect simple variable-to-type bindings used by focused checks."""
+    clean = _clean_code(code)
+    declaration = re.compile(
+        r'\b(?P<type>[A-Za-z_]\w*(?:\s*\[\s*\d*\s*\])*)\s+'
+        r'(?:(?:public|private|internal|external|constant|immutable|memory|'
+        r'calldata|storage|payable|indexed)\s+)*'
+        r'(?P<name>[A-Za-z_]\w*)\b'
+    )
+    ignored_types = {
+        "contract", "function", "event", "error", "modifier", "return",
+        "returns", "import", "pragma", "using", "struct", "enum",
+    }
+    bindings: Dict[str, str] = {}
+    for match in declaration.finditer(clean):
+        type_name = re.sub(r'\s+', '', match.group("type"))
+        if type_name.lower() in ignored_types:
+            continue
+        bindings[match.group("name")] = type_name
+    return bindings
+
+
+def _is_dynamic_abi_argument(argument: str, symbol_types: Dict[str, str]) -> bool:
+    value = argument.strip()
+    if not value:
+        return False
+    if (value.startswith('"') and value.endswith('"')) or (
+        value.startswith("'") and value.endswith("'")
+    ):
+        return True
+    identifier = re.fullmatch(r'([A-Za-z_]\w*)', value)
+    if not identifier:
+        return False
+    type_name = symbol_types.get(identifier.group(1), "").replace(" ", "")
+    return type_name in {"string", "bytes"} or "[]" in type_name
+
+
+def _looks_like_erc20(receiver: str, symbol_types: Dict[str, str]) -> bool:
+    compact = re.sub(r'\s+', '', receiver)
+    cast = re.match(r'(?P<type>[A-Za-z_]\w*)\(', compact)
+    if cast:
+        return "erc20" in cast.group("type").lower()
+    type_name = symbol_types.get(compact, "").lower()
+    return "erc20" in type_name
+
+
+def _parse_parameter_details(params: str) -> Dict[str, Tuple[str, str]]:
+    """Return parameter name -> (type, data location)."""
+    details: Dict[str, Tuple[str, str]] = {}
+    pattern = re.compile(
+        r'^\s*(?P<type>[A-Za-z_]\w*(?:\s*\[\s*\d*\s*\])*)\s*'
+        r'(?P<location>memory|storage|calldata|payable)?\s*'
+        r'(?P<name>[A-Za-z_]\w*)\s*$'
+    )
+    for parameter in _split_top_level_arguments(params):
+        match = pattern.match(parameter)
+        if not match:
+            continue
+        details[match.group("name")] = (
+            re.sub(r'\s+', '', match.group("type")),
+            match.group("location") or "",
+        )
+    return details
+
+
+def _contract_top_level_statements(
+    code: str, contract: SolidityContract
+) -> Iterator[Tuple[int, str]]:
+    """Yield semicolon-terminated declarations for one contract."""
+    clean = _clean_code(code)
+    depth = 0
+    statement_start = contract.body_start
+    for pos in range(contract.body_start, contract.end):
+        char = clean[pos]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth = max(0, depth - 1)
+            if depth == 0:
+                statement_start = pos + 1
+        elif char == ";" and depth == 0:
+            yield statement_start, code[statement_start:pos + 1]
+            statement_start = pos + 1
+
+
+def _top_level_contract_statements(code: str) -> Iterator[Tuple[int, str]]:
+    """Yield semicolon-terminated state declarations outside nested blocks."""
+    for contract in _iter_contracts(code):
+        yield from _contract_top_level_statements(code, contract)
+
+
+def _collect_contract_state_declarations(
+    code: str, contract: SolidityContract
+) -> Dict[str, Tuple[str, int, bool]]:
+    """Return state name -> (type, source position, has initializer)."""
+    result: Dict[str, Tuple[str, int, bool]] = {}
+    standard = re.compile(
+        r'^\s*(?P<type>[A-Za-z_]\w*(?:\s*\[\s*\d*\s*\])*)\s+'
+        r'(?:(?:public|private|internal|constant|immutable|payable)\s+)*'
+        r'(?P<name>[A-Za-z_]\w*)\b(?P<tail>[^;]*);'
+    )
+    mapping = re.compile(
+        r'^\s*mapping\s*\([^;]+\)\s*'
+        r'(?:(?:public|private|internal)\s+)*(?P<name>[A-Za-z_]\w*)\b'
+    )
+    for position, statement in _contract_top_level_statements(code, contract):
+        clean_statement = _clean_code(statement)
+        match = standard.match(clean_statement)
+        if match:
+            leading = len(clean_statement) - len(clean_statement.lstrip())
+            result[match.group("name")] = (
+                re.sub(r'\s+', '', match.group("type")),
+                position + leading,
+                "=" in match.group("tail"),
+            )
+            continue
+        mapping_match = mapping.match(clean_statement)
+        if mapping_match:
+            leading = len(clean_statement) - len(clean_statement.lstrip())
+            result[mapping_match.group("name")] = (
+                "mapping",
+                position + leading,
+                False,
+            )
+    return result
+
+
+def _collect_state_symbol_types(code: str) -> Dict[str, str]:
+    """Collect simple top-level state variable declarations."""
+    result: Dict[str, str] = {}
+    declaration = re.compile(
+        r'^\s*(?P<type>[A-Za-z_]\w*(?:\s*\[\s*\d*\s*\])*)\s+'
+        r'(?:(?:public|private|internal|constant|immutable|payable)\s+)*'
+        r'(?P<name>[A-Za-z_]\w*)\b'
+    )
+    for _, statement in _top_level_contract_statements(code):
+        match = declaration.match(_clean_code(statement))
+        if match:
+            result[match.group("name")] = re.sub(r'\s+', '', match.group("type"))
+    return result
+
+
+def _collect_mapping_value_types(code: str) -> Dict[str, str]:
+    """Collect top-level mapping name -> direct value type."""
+    result: Dict[str, str] = {}
+    pattern = re.compile(
+        r'^\s*mapping\s*\([^=;]+=>\s*(?P<value>[A-Za-z_]\w*)\s*\)\s*'
+        r'(?:(?:public|private|internal)\s+)*(?P<name>[A-Za-z_]\w*)\b'
+    )
+    for _, statement in _top_level_contract_statements(code):
+        match = pattern.match(_clean_code(statement))
+        if match:
+            result[match.group("name")] = match.group("value")
+    return result
+
+
+def _collect_struct_members(code: str) -> Dict[str, Tuple[set[str], bool]]:
+    """Return struct member types and whether each struct directly has a mapping."""
+    clean = _clean_code(code)
+    structs: Dict[str, Tuple[set[str], bool]] = {}
+    for match in re.finditer(r'\bstruct\s+(?P<name>[A-Za-z_]\w*)\s*\{', clean):
+        open_pos = match.end() - 1
+        close_pos = _balanced_end(clean, open_pos)
+        if close_pos is None:
+            continue
+        body = code[open_pos + 1:close_pos]
+        member_types = set(_collect_symbol_types(body).values())
+        structs[match.group("name")] = (
+            member_types,
+            bool(re.search(r'\bmapping\s*\(', _clean_code(body))),
+        )
+    return structs
+
+
+def _struct_contains_mapping(
+    struct_name: str,
+    structs: Dict[str, Tuple[set[str], bool]],
+    visiting: Optional[set[str]] = None,
+) -> bool:
+    """Recursively determine whether a struct contains a mapping."""
+    if struct_name not in structs:
+        return False
+    seen = set(visiting or ())
+    if struct_name in seen:
+        return False
+    seen.add(struct_name)
+    member_types, direct_mapping = structs[struct_name]
+    if direct_mapping:
+        return True
+    return any(
+        _struct_contains_mapping(re.sub(r'\[.*$', '', type_name), structs, seen)
+        for type_name in member_types
+    )
+
+
+def _iter_loop_ranges(code: str, start: int, end: int) -> Iterator[Tuple[int, int]]:
+    """Yield for/while ranges inside a source interval."""
+    clean = _clean_code(code)
+    loop_pattern = re.compile(r'\b(?:for|while)\s*\(')
+    for match in loop_pattern.finditer(clean, start, end):
+        open_paren = clean.find("(", match.start(), match.end())
+        close_paren = _balanced_end(clean, open_paren, "(", ")")
+        if close_paren is None or close_paren >= end:
+            continue
+        body_pos = close_paren + 1
+        while body_pos < end and clean[body_pos].isspace():
+            body_pos += 1
+        if body_pos < end and clean[body_pos] == "{":
+            close_body = _balanced_end(clean, body_pos)
+            if close_body is not None and close_body <= end:
+                yield match.start(), close_body + 1
+        else:
+            semicolon = clean.find(";", body_pos, end)
+            if semicolon >= 0:
+                yield match.start(), semicolon + 1
+
+
+def _build_semantic_finding(
+    code: str,
+    vuln_id: str,
+    vuln_type: str,
+    risk_level: str,
+    type_weight: float,
+    hits: List[Tuple[int, str, float, str]],
+) -> Optional[VulnerabilityFinding]:
+    if not hits:
+        return None
+    finding = VulnerabilityFinding(
+        vuln_id=vuln_id,
+        vuln_type=vuln_type,
+        risk_level=risk_level,
+        type_weight=type_weight,
+        confirmed=True,
+    )
+    for pos, matched_text, weight, description in hits:
+        line, col = _get_line_col(code, pos)
+        finding.matches.append(PatternMatch(
+            line=line,
+            column=col,
+            matched_text=matched_text[:80],
+            context=_extract_context(code, pos),
+            pattern_weight=weight,
+        ))
+        finding.notes.append(f"L{line}: {description}")
+    return finding
+
+
+def _detect_bidirectional_controls(code: str) -> Optional[VulnerabilityFinding]:
+    controls = {
+        "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",
+        "\u2066", "\u2067", "\u2068", "\u2069",
+    }
+    hits = [
+        (
+            pos,
+            f"U+{ord(char):04X}",
+            0.80,
+            "Ký tự điều khiển hướng văn bản có thể che giấu thứ tự token hiển thị",
+        )
+        for pos, char in enumerate(code)
+        if char in controls
+    ]
+    return _build_semantic_finding(
+        code, "SWC-130", "right_to_left_override", "High", 0.18, hits
+    )
+
+
+def _detect_incorrect_exponentiation(code: str) -> Optional[VulnerabilityFinding]:
+    clean = _clean_code(code)
+    operand = r'(?:0x[0-9A-Fa-f]+|\d+|[A-Za-z_]\w*)'
+    pattern = re.compile(
+        rf'(?P<left>{operand})\s*\^(?!=)\s*(?P<right>{operand})'
+    )
+    hits: List[Tuple[int, str, float, str]] = []
+    for match in pattern.finditer(clean):
+        operands = (match.group("left"), match.group("right"))
+        if not any(re.fullmatch(r'\d+', value) for value in operands):
+            continue
+        hits.append((
+            match.start(),
+            code[match.start():match.end()],
+            0.70,
+            "Toán tử ^ là XOR; nếu muốn lũy thừa phải dùng **",
+        ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-INCORRECT-EXP",
+        "incorrect_exponentiation_operator",
+        "High",
+        0.16,
+        hits,
+    )
+
+
+def _detect_encode_packed_collision(code: str) -> Optional[VulnerabilityFinding]:
+    clean = _clean_code(code)
+    symbol_types = _collect_symbol_types(code)
+    hits: List[Tuple[int, str, float, str]] = []
+    for match in re.finditer(r'\babi\.encodePacked\s*\(', clean):
+        open_pos = clean.find("(", match.start(), match.end())
+        close_pos = _balanced_end(clean, open_pos, "(", ")")
+        if close_pos is None:
+            continue
+        arguments = _split_top_level_arguments(code[open_pos + 1:close_pos])
+        dynamic_flags = [
+            _is_dynamic_abi_argument(argument, symbol_types)
+            for argument in arguments
+        ]
+        has_adjacent_dynamic = any(
+            left and right
+            for left, right in zip(dynamic_flags, dynamic_flags[1:])
+        )
+        if not has_adjacent_dynamic:
+            continue
+        hits.append((
+            match.start(),
+            code[match.start():close_pos + 1],
+            0.70,
+            "abi.encodePacked ghép các đối số kiểu động liền nhau mà không có ranh giới",
+        ))
+    return _build_semantic_finding(
+        code,
+        "SWC-133",
+        "abi_encode_packed_collision",
+        "High",
+        0.18,
+        hits,
+    )
+
+
+def _iter_erc20_calls(
+    code: str,
+) -> Iterator[Tuple[SolidityFunction, re.Match, str, List[str], int]]:
+    clean = _clean_code(code)
+    symbol_types = _collect_symbol_types(code)
+    call_pattern = re.compile(
+        r'(?P<receiver>(?:[A-Za-z_]\w*|'
+        r'[A-Za-z_]\w*\s*\([^()]*\)))\s*\.\s*'
+        r'(?P<method>transferFrom|transfer)\s*\('
+    )
+    for function in _iter_functions(code):
+        for match in call_pattern.finditer(clean, function.body_start, function.end):
+            receiver = match.group("receiver")
+            if not _looks_like_erc20(receiver, symbol_types):
+                continue
+            open_pos = clean.find("(", match.start("method"), match.end())
+            close_pos = _balanced_end(clean, open_pos, "(", ")")
+            if close_pos is None or close_pos > function.end:
+                continue
+            arguments = _split_top_level_arguments(code[open_pos + 1:close_pos])
+            yield function, match, match.group("method"), arguments, close_pos
+
+
+def _detect_arbitrary_erc20_transfer_from(code: str) -> Optional[VulnerabilityFinding]:
+    hits: List[Tuple[int, str, float, str]] = []
+    for function, match, method, arguments, close_pos in _iter_erc20_calls(code):
+        if method != "transferFrom" or len(arguments) < 3:
+            continue
+        parameter_types = _collect_symbol_types(function.params)
+        source = arguments[0].strip()
+        if parameter_types.get(source, "").lower() != "address":
+            continue
+        hits.append((
+            match.start(),
+            code[match.start():close_pos + 1],
+            0.65,
+            f"Nguồn token '{source}' do caller cung cấp và không ràng buộc với msg.sender",
+        ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-ARBITRARY-ERC20",
+        "arbitrary_erc20_transfer_from",
+        "High",
+        0.16,
+        hits,
+    )
+
+
+def _detect_unchecked_erc20_transfer(code: str) -> Optional[VulnerabilityFinding]:
+    clean = _clean_code(code)
+    hits: List[Tuple[int, str, float, str]] = []
+    for function, match, method, _, close_pos in _iter_erc20_calls(code):
+        boundaries = [
+            clean.rfind(delimiter, function.body_start, match.start())
+            for delimiter in (";", "{", "}")
+        ]
+        nearest_boundary = max(boundaries, default=-1)
+        statement_start = (
+            nearest_boundary
+            if nearest_boundary >= function.body_start
+            else function.body_start - 1
+        )
+        prefix = clean[statement_start + 1:match.start()].strip()
+        suffix_pos = close_pos + 1
+        while suffix_pos < function.end and clean[suffix_pos].isspace():
+            suffix_pos += 1
+        if prefix or suffix_pos >= function.end or clean[suffix_pos] != ";":
+            continue
+        hits.append((
+            match.start(),
+            code[match.start():close_pos + 1],
+            0.60,
+            f"Giá trị bool trả về từ ERC20 {method}() bị bỏ qua",
+        ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-UNCHECKED-ERC20",
+        "unchecked_erc20_transfer",
+        "High",
+        0.15,
+        hits,
+    )
+
+
+def _detect_locked_ether(code: str) -> Optional[VulnerabilityFinding]:
+    clean = _clean_code(code)
+    functions = list(_iter_functions(code))
+    hits: List[Tuple[int, str, float, str]] = []
+    outgoing_ether = re.compile(
+        r'\.call\s*\{[^}]*\bvalue\s*:'
+        r'|\.send\s*\('
+        r'|\.transfer\s*\('
+        r'|\b(?:selfdestruct|suicide)\s*\('
+        r'|\bassembly\s*\{[^}]*\bcall\s*\(',
+        re.DOTALL,
+    )
+    for contract in _iter_contracts(code):
+        prefix = clean[max(0, contract.start - 16):contract.start]
+        if re.search(r'\babstract\s*$', prefix) or re.search(r'\bis\b', contract.header):
+            continue
+        contract_functions = [
+            function for function in functions
+            if contract.body_start <= function.start < contract.end
+        ]
+        payable_entries = [
+            function for function in contract_functions
+            if re.search(r'\bpayable\b', function.header)
+            and (
+                function.name in {"constructor", "receive", "fallback"}
+                or re.search(r'\b(?:public|external)\b', function.header)
+            )
+        ]
+        if not payable_entries:
+            continue
+        body = clean[contract.body_start:contract.end]
+        if outgoing_ether.search(body):
+            continue
+        entry = payable_entries[0]
+        hits.append((
+            entry.start,
+            code[entry.start:entry.body_start].strip(),
+            0.55,
+            f"Contract '{contract.name}' nhận được Ether nhưng không có đường gửi Ether ra",
+        ))
+    return _build_semantic_finding(
+        code, "STATIC-LOCKED-ETHER", "locked_ether", "Medium", 0.12, hits
+    )
+
+
+def _detect_msg_value_in_loop(code: str) -> Optional[VulnerabilityFinding]:
+    clean = _clean_code(code)
+    hits: List[Tuple[int, str, float, str]] = []
+    zero_comparison = re.compile(
+        r'msg\.value\s*(?:==|!=)\s*0|0\s*(?:==|!=)\s*msg\.value'
+    )
+    for function in _iter_functions(code):
+        if not re.search(r'\bpayable\b', function.header):
+            continue
+        for loop_start, loop_end in _iter_loop_ranges(
+            code, function.body_start, function.end
+        ):
+            loop = clean[loop_start:loop_end]
+            residual = zero_comparison.sub("", loop)
+            value_match = re.search(r'\bmsg\.value\b', residual)
+            if not value_match:
+                continue
+            pos = loop_start + value_match.start()
+            hits.append((
+                pos,
+                "msg.value",
+                0.55,
+                f"Hàm payable '{function.name}' tái sử dụng msg.value trong vòng lặp",
+            ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-MSG-VALUE-LOOP",
+        "msg_value_in_loop",
+        "Medium",
+        0.11,
+        hits,
+    )
+
+
+def _detect_delegatecall_in_loop(code: str) -> Optional[VulnerabilityFinding]:
+    clean = _clean_code(code)
+    hits: List[Tuple[int, str, float, str]] = []
+    for function in _iter_functions(code):
+        if not (
+            re.search(r'\bpayable\b', function.header)
+            and re.search(r'\b(?:public|external)\b', function.header)
+        ):
+            continue
+        for loop_start, loop_end in _iter_loop_ranges(
+            code, function.body_start, function.end
+        ):
+            call = re.search(r'\.delegatecall\s*\(', clean[loop_start:loop_end])
+            if not call:
+                continue
+            pos = loop_start + call.start()
+            hits.append((
+                pos,
+                code[pos:pos + len(call.group())],
+                0.65,
+                f"Hàm payable '{function.name}' thực hiện delegatecall trong vòng lặp",
+            ))
+    return _build_semantic_finding(
+        code,
+        "SWC-112",
+        "delegatecall_in_loop",
+        "High",
+        0.16,
+        hits,
+    )
+
+
+def _missing_zero_address_hits(
+    code: str,
+) -> List[Tuple[int, str, float, str]]:
+    clean = _clean_code(code)
+    hits: List[Tuple[int, str, float, str]] = []
+    zero = r'address\s*\(\s*(?:0|0x0+)\s*\)'
+    for function in _iter_functions(code):
+        parameter_types = _collect_symbol_types(function.params)
+        address_parameters = [
+            name for name, type_name in parameter_types.items()
+            if type_name.lower() == "address"
+        ]
+        if not address_parameters:
+            continue
+        body = clean[function.body_start:function.end]
+        local_names = set(_collect_symbol_types(body))
+        for parameter in address_parameters:
+            escaped = re.escape(parameter)
+            require_check = re.search(
+                rf'\b(?:require|assert)\s*\([^;]*'
+                rf'(?:\b{escaped}\b\s*!=\s*{zero}|{zero}\s*!=\s*\b{escaped}\b)',
+                body,
+            )
+            reverting_if = re.search(
+                rf'\bif\s*\([^;{{}}]*'
+                rf'(?:\b{escaped}\b\s*==\s*{zero}|{zero}\s*==\s*\b{escaped}\b)'
+                rf'[^;{{}}]*\)\s*(?:\{{\s*)?(?:revert|return)\b',
+                body,
+                re.DOTALL,
+            )
+            if require_check or reverting_if:
+                continue
+
+            sensitive_pos: Optional[int] = None
+            assignment = re.search(
+                rf'(?P<lhs>\b[A-Za-z_]\w*(?:\s*\[[^\]]+\]|\.[A-Za-z_]\w*)?)'
+                rf'\s*=\s*\b{escaped}\b\s*;',
+                body,
+            )
+            if assignment:
+                lhs = re.match(r'[A-Za-z_]\w*', assignment.group("lhs"))
+                lhs_name = lhs.group() if lhs else ""
+                if lhs_name not in local_names and lhs_name not in parameter_types:
+                    sensitive_pos = assignment.start()
+
+            destination = re.search(
+                rf'(?:\b{escaped}\b\s*\.\s*(?:call|send|transfer)\b'
+                rf'|payable\s*\(\s*\b{escaped}\b\s*\)\s*\.'
+                rf'|[A-Za-z_]\w*\s*\(\s*\b{escaped}\b\s*\)\s*\.)',
+                body,
+            )
+            if sensitive_pos is None and destination:
+                sensitive_pos = destination.start()
+            if sensitive_pos is None:
+                continue
+            pos = function.body_start + sensitive_pos
+            hits.append((
+                pos,
+                parameter,
+                0.40,
+                f"Address '{parameter}' được ghi vào state/dùng làm call target mà chưa kiểm tra zero address",
+            ))
+    return hits
+
+
+def _detect_missing_zero_address(code: str) -> Optional[VulnerabilityFinding]:
+    return _build_semantic_finding(
+        code,
+        "STATIC-MISSING-ZERO-ADDRESS",
+        "missing_zero_address_validation",
+        "Low",
+        0.06,
+        _missing_zero_address_hits(code),
+    )
+
+
+def _detect_incorrect_shift_in_assembly(code: str) -> Optional[VulnerabilityFinding]:
+    clean = _clean_code(code)
+    hits: List[Tuple[int, str, float, str]] = []
+    assembly_pattern = re.compile(r'\bassembly(?:\s*\([^)]*\))?\s*\{')
+    shift_pattern = re.compile(
+        r'\b(?:shl|shr|sar)\s*\(\s*'
+        r'(?P<shift>[A-Za-z_]\w*)\s*,\s*'
+        r'(?P<value>0x[0-9A-Fa-f]+|\d+)\s*\)'
+    )
+    for assembly in assembly_pattern.finditer(clean):
+        open_pos = assembly.end() - 1
+        close_pos = _balanced_end(clean, open_pos)
+        if close_pos is None:
+            continue
+        for shift in shift_pattern.finditer(clean, open_pos + 1, close_pos):
+            hits.append((
+                shift.start(),
+                code[shift.start():shift.end()],
+                0.75,
+                "Tham số shift trong Yul có vẻ bị đảo: shift amount là biến còn value là hằng",
+            ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-INCORRECT-SHIFT",
+        "incorrect_shift_in_assembly",
+        "High",
+        0.17,
+        hits,
+    )
+
+
+def _detect_controlled_array_length(code: str) -> Optional[VulnerabilityFinding]:
+    clean = _clean_code(code)
+    state_arrays = {
+        name for name, type_name in _collect_state_symbol_types(code).items()
+        if "[]" in type_name
+    }
+    hits: List[Tuple[int, str, float, str]] = []
+    if not state_arrays:
+        return None
+    assignment_pattern = re.compile(
+        r'\b(?P<array>[A-Za-z_]\w*)\.length\s*=\s*(?P<rhs>[^;]+);'
+    )
+    for function in _iter_functions(code):
+        if not re.search(r'\b(?:public|external)\b', function.header):
+            continue
+        parameters = set(_parse_parameter_details(function.params))
+        if not parameters:
+            continue
+        for assignment in assignment_pattern.finditer(
+            clean, function.body_start, function.end
+        ):
+            if assignment.group("array") not in state_arrays:
+                continue
+            rhs = assignment.group("rhs")
+            tainted_by_parameter = next(
+                (
+                    parameter for parameter in parameters
+                    if re.search(rf'\b{re.escape(parameter)}\b', rhs)
+                ),
+                None,
+            )
+            if not tainted_by_parameter:
+                continue
+            hits.append((
+                assignment.start(),
+                code[assignment.start():assignment.end()],
+                0.70,
+                f"Độ dài storage array phụ thuộc input '{tainted_by_parameter}' của caller",
+            ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-CONTROLLED-ARRAY-LENGTH",
+        "controlled_array_length",
+        "High",
+        0.17,
+        hits,
+    )
+
+
+def _detect_array_by_reference(code: str) -> Optional[VulnerabilityFinding]:
+    clean = _clean_code(code)
+    functions = list(_iter_functions(code))
+    modifying_parameters: List[Tuple[SolidityFunction, int, int, str]] = []
+    for function in functions:
+        details = _parse_parameter_details(function.params)
+        for index, (name, (type_name, location)) in enumerate(details.items()):
+            if "[" not in type_name or location == "storage":
+                continue
+            body = clean[function.body_start:function.end]
+            if re.search(
+                rf'\b{re.escape(name)}\s*\[[^\]]+\]\s*'
+                rf'(?:=|\+=|-=|\*=|/=|%=|\+\+|--)',
+                body,
+            ):
+                modifying_parameters.append((function, len(details), index, name))
+
+    state_arrays = {
+        name for name, type_name in _collect_state_symbol_types(code).items()
+        if "[" in type_name
+    }
+    if not modifying_parameters or not state_arrays:
+        return None
+
+    hits: List[Tuple[int, str, float, str]] = []
+    seen_positions: set[int] = set()
+    for caller in functions:
+        caller_body = clean[caller.body_start:caller.end]
+        storage_arrays = set(state_arrays)
+        storage_arrays.update(
+            match.group("name")
+            for match in re.finditer(
+                r'\b[A-Za-z_]\w*(?:\s*\[\s*\d*\s*\])+\s+storage\s+'
+                r'(?P<name>[A-Za-z_]\w*)\b',
+                caller_body,
+            )
+        )
+        for callee, arity, parameter_index, parameter_name in modifying_parameters:
+            call_pattern = re.compile(rf'\b{re.escape(callee.name)}\s*\(')
+            for call in call_pattern.finditer(clean, caller.body_start, caller.end):
+                open_pos = clean.find("(", call.start(), call.end())
+                close_pos = _balanced_end(clean, open_pos, "(", ")")
+                if close_pos is None or close_pos > caller.end:
+                    continue
+                arguments = _split_top_level_arguments(code[open_pos + 1:close_pos])
+                if len(arguments) != arity or parameter_index >= len(arguments):
+                    continue
+                argument = arguments[parameter_index].strip()
+                if argument not in storage_arrays or call.start() in seen_positions:
+                    continue
+                seen_positions.add(call.start())
+                hits.append((
+                    call.start(),
+                    code[call.start():close_pos + 1],
+                    0.70,
+                    f"Storage array '{argument}' được truyền vào '{callee.name}' qua tham số '{parameter_name}' không phải storage",
+                ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-ARRAY-BY-REFERENCE",
+        "array_by_reference",
+        "High",
+        0.17,
+        hits,
+    )
+
+
+def _detect_multiple_constructors(code: str) -> Optional[VulnerabilityFinding]:
+    functions = list(_iter_functions(code))
+    hits: List[Tuple[int, str, float, str]] = []
+    for contract in _iter_contracts(code):
+        declared = [
+            function for function in functions
+            if contract.body_start <= function.start < contract.end
+        ]
+        modern = [function for function in declared if function.name == "constructor"]
+        legacy = [function for function in declared if function.name == contract.name]
+        if not modern or not legacy:
+            continue
+        first = modern[0]
+        hits.append((
+            first.start,
+            code[first.start:first.body_start].strip(),
+            0.80,
+            f"Contract '{contract.name}' khai báo đồng thời constructor() và function {contract.name}()",
+        ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-MULTIPLE-CONSTRUCTORS",
+        "multiple_constructor_schemes",
+        "High",
+        0.18,
+        hits,
+    )
+
+
+def _detect_public_mapping_nested(code: str) -> Optional[VulnerabilityFinding]:
+    clean = _clean_code(code)
+    if not re.search(r'\bpragma\s+solidity\s+[^;]*\b0\.4\.', clean):
+        return None
+    structs = _collect_struct_members(code)
+    if not structs:
+        return None
+    hits: List[Tuple[int, str, float, str]] = []
+    pattern = re.compile(
+        r'\bmapping\s*\([^=;]+=>\s*(?P<value>[A-Za-z_]\w*)\s*\)\s*'
+        r'public\s+(?P<name>[A-Za-z_]\w*)\b'
+    )
+    for match in pattern.finditer(clean):
+        value_type = match.group("value")
+        if value_type not in structs:
+            continue
+        member_types, _ = structs[value_type]
+        if not any(re.sub(r'\[.*$', '', item) in structs for item in member_types):
+            continue
+        hits.append((
+            match.start(),
+            code[match.start():match.end()],
+            0.75,
+            f"Public mapping '{match.group('name')}' trả về struct lồng nhau sai trên Solidity 0.4.x",
+        ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-PUBLIC-MAPPING-NESTED",
+        "public_mapping_with_nested_struct",
+        "High",
+        0.17,
+        hits,
+    )
+
+
+def _detect_mapping_deletion(code: str) -> Optional[VulnerabilityFinding]:
+    clean = _clean_code(code)
+    structs = _collect_struct_members(code)
+    if not structs:
+        return None
+    symbol_types = _collect_symbol_types(code)
+    mapping_values = _collect_mapping_value_types(code)
+    hits: List[Tuple[int, str, float, str]] = []
+    pattern = re.compile(
+        r'\bdelete\s+(?P<target>(?P<base>[A-Za-z_]\w*)'
+        r'(?:\s*\[[^\]]+\])?)\s*;'
+    )
+    for match in pattern.finditer(clean):
+        base = match.group("base")
+        type_name = mapping_values.get(base) or symbol_types.get(base, "")
+        struct_name = re.sub(r'\[.*$', '', type_name)
+        if not _struct_contains_mapping(struct_name, structs):
+            continue
+        hits.append((
+            match.start(),
+            code[match.start():match.end()],
+            0.65,
+            f"delete không xóa dữ liệu mapping nằm trong struct '{struct_name}'",
+        ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-MAPPING-DELETION",
+        "mapping_deletion_in_struct",
+        "Medium",
+        0.12,
+        hits,
+    )
+
+
+def _integer_type_range(type_name: str) -> Optional[Tuple[int, int]]:
+    match = re.fullmatch(r'(?P<unsigned>u?)int(?P<bits>\d*)', type_name)
+    if not match:
+        return None
+    bits = int(match.group("bits") or "256")
+    if bits < 8 or bits > 256 or bits % 8:
+        return None
+    if match.group("unsigned"):
+        return 0, (2 ** bits) - 1
+    return -(2 ** (bits - 1)), (2 ** (bits - 1)) - 1
+
+
+def _range_makes_comparison_constant(
+    low: int, high: int, operator: str, constant: int
+) -> bool:
+    if operator == "<":
+        return high < constant or low >= constant
+    if operator == ">":
+        return low > constant or high <= constant
+    if operator == "<=":
+        return high <= constant or low > constant
+    if operator == ">=":
+        return low >= constant or high < constant
+    return False
+
+
+def _detect_type_based_tautology(code: str) -> Optional[VulnerabilityFinding]:
+    clean = _clean_code(code)
+    token = r'(?:[A-Za-z_]\w*|-?(?:0x[0-9A-Fa-f]+|\d+))'
+    pattern = re.compile(
+        rf'(?P<left>{token})\s*(?P<operator><=|>=|<|>)\s*(?P<right>{token})'
+    )
+    flip = {"<": ">", ">": "<", "<=": ">=", ">=": "<="}
+    hits: List[Tuple[int, str, float, str]] = []
+    state_types = _collect_state_symbol_types(code)
+    for function in _iter_functions(code):
+        symbol_types = dict(state_types)
+        symbol_types.update({
+            name: details[0]
+            for name, details in _parse_parameter_details(function.params).items()
+        })
+        symbol_types.update(
+            _collect_symbol_types(code[function.body_start:function.end])
+        )
+        for match in pattern.finditer(clean, function.body_start, function.end):
+            left, right = match.group("left"), match.group("right")
+            variable: Optional[str] = None
+            constant_text: Optional[str] = None
+            operator = match.group("operator")
+            if left in symbol_types and re.fullmatch(r'-?(?:0x[0-9A-Fa-f]+|\d+)', right):
+                variable, constant_text = left, right
+            elif right in symbol_types and re.fullmatch(r'-?(?:0x[0-9A-Fa-f]+|\d+)', left):
+                variable, constant_text = right, left
+                operator = flip[operator]
+            if variable is None or constant_text is None:
+                continue
+            value_range = _integer_type_range(symbol_types[variable])
+            if value_range is None:
+                continue
+            constant = int(constant_text, 0)
+            if not _range_makes_comparison_constant(*value_range, operator, constant):
+                continue
+            hits.append((
+                match.start(),
+                code[match.start():match.end()],
+                0.65,
+                f"So sánh luôn đúng hoặc luôn sai theo miền giá trị của {symbol_types[variable]}",
+            ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-TYPE-TAUTOLOGY",
+        "type_based_tautology",
+        "Medium",
+        0.12,
+        hits,
+    )
+
+
+def _detect_boolean_constant_misuse(code: str) -> Optional[VulnerabilityFinding]:
+    clean = _clean_code(code)
+    hits: List[Tuple[int, str, float, str]] = []
+    seen: set[int] = set()
+    patterns = (
+        re.compile(r'\bif\s*\(\s*(?:true|false)\s*\)'),
+        re.compile(
+            r'(?:\b(?:true|false)\b\s*(?:&&|\|\|)'
+            r'|(?:&&|\|\|)\s*\b(?:true|false)\b)'
+        ),
+    )
+    for pattern in patterns:
+        for match in pattern.finditer(clean):
+            if match.start() in seen:
+                continue
+            seen.add(match.start())
+            hits.append((
+                match.start(),
+                code[match.start():match.end()],
+                0.55,
+                "Boolean constant làm điều kiện trở nên cố định hoặc dư thừa",
+            ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-BOOLEAN-CONSTANT",
+        "boolean_constant_misuse",
+        "Medium",
+        0.10,
+        hits,
+    )
+
+
+def _detect_dangerous_balance_equality(code: str) -> Optional[VulnerabilityFinding]:
+    clean = _clean_code(code)
+    balance_source = re.compile(r'\.balance\b|\.balanceOf\s*\(')
+    hits: List[Tuple[int, str, float, str]] = []
+    for function in _iter_functions(code):
+        body = clean[function.body_start:function.end]
+        tainted_names = {
+            match.group("name")
+            for match in re.finditer(
+                r'\b(?:u?int\d*\s+)?(?P<name>[A-Za-z_]\w*)\s*=\s*'
+                r'[^;]*(?:\.balance\b|\.balanceOf\s*\()[^;]*;',
+                body,
+            )
+        }
+        for equality in re.finditer(r'==', body):
+            absolute = function.body_start + equality.start()
+            left_boundaries = [
+                clean.rfind(delimiter, function.body_start, absolute)
+                for delimiter in (";", "{", "}")
+            ]
+            start = max(left_boundaries)
+            start = start + 1 if start >= function.body_start else function.body_start
+            right_positions = [
+                position for position in (
+                    clean.find(";", absolute, function.end),
+                    clean.find("{", absolute, function.end),
+                    clean.find("}", absolute, function.end),
+                ) if position >= 0
+            ]
+            end = min(right_positions) if right_positions else function.end
+            expression = clean[start:end]
+            if not balance_source.search(expression) and not any(
+                re.search(rf'\b{re.escape(name)}\b', expression)
+                for name in tainted_names
+            ):
+                continue
+            hits.append((
+                absolute,
+                "==",
+                0.60,
+                "Strict equality trên Ether/token balance có thể bị phá vỡ bởi thay đổi balance ngoài dự kiến",
+            ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-DANGEROUS-BALANCE-EQUALITY",
+        "dangerous_balance_equality",
+        "Medium",
+        0.12,
+        hits,
+    )
+
+
+def _detect_dangerous_enum_conversion(code: str) -> Optional[VulnerabilityFinding]:
+    clean = _clean_code(code)
+    if not re.search(r'\bpragma\s+solidity\s+(?:=\s*)?0\.4\.[0-4]\s*;', clean):
+        return None
+    enum_names = {
+        match.group("name")
+        for match in re.finditer(r'\benum\s+(?P<name>[A-Za-z_]\w*)\s*\{', clean)
+    }
+    hits: List[Tuple[int, str, float, str]] = []
+    for function in _iter_functions(code):
+        for enum_name in enum_names:
+            pattern = re.compile(rf'\b{re.escape(enum_name)}\s*\([^)]*\)')
+            for conversion in pattern.finditer(clean, function.body_start, function.end):
+                hits.append((
+                    conversion.start(),
+                    code[conversion.start():conversion.end()],
+                    0.65,
+                    f"Ép kiểu sang enum '{enum_name}' có thể nhận giá trị ngoài miền trên solc <= 0.4.4",
+                ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-ENUM-CONVERSION",
+        "dangerous_enum_conversion",
+        "Medium",
+        0.11,
+        hits,
+    )
+
+
+def _assembly_return_positions(
+    code: str, function: SolidityFunction
+) -> List[Tuple[int, int]]:
+    """Return Yul return(offset, size) ranges inside one function."""
+    clean = _clean_code(code)
+    results: List[Tuple[int, int]] = []
+    assembly_pattern = re.compile(r'\bassembly(?:\s*\([^)]*\))?\s*\{')
+    for assembly in assembly_pattern.finditer(
+        clean, function.body_start, function.end
+    ):
+        open_pos = assembly.end() - 1
+        close_pos = _balanced_end(clean, open_pos)
+        if close_pos is None or close_pos > function.end:
+            continue
+        return_pattern = re.compile(r'\breturn\s*\([^,]+,[^)]+\)')
+        for call in return_pattern.finditer(clean, open_pos, close_pos):
+            results.append((call.start(), call.end()))
+    return results
+
+
+def _detect_return_instead_of_leave(code: str) -> Optional[VulnerabilityFinding]:
+    hits: List[Tuple[int, str, float, str]] = []
+    for function in _iter_functions(code):
+        if not re.search(r'\b(?:internal|private)\b', function.header):
+            continue
+        returns = re.search(r'\breturns\s*\((?P<values>[^)]*)\)', function.header)
+        if not returns or len(_split_top_level_arguments(returns.group("values"))) != 2:
+            continue
+        for start, end in _assembly_return_positions(code, function):
+            hits.append((
+                start,
+                code[start:end],
+                0.65,
+                f"Hàm '{function.name}' có hai return value nhưng Yul return() dừng toàn bộ execution; thường phải dùng leave",
+            ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-RETURN-INSTEAD-OF-LEAVE",
+        "return_instead_of_leave",
+        "High",
+        0.16,
+        hits,
+    )
+
+
+def _detect_incorrect_assembly_return(code: str) -> Optional[VulnerabilityFinding]:
+    clean = _clean_code(code)
+    functions = list(_iter_functions(code))
+    halting_names = {
+        function.name for function in functions
+        if _assembly_return_positions(code, function)
+    }
+    if not halting_names:
+        return None
+
+    changed = True
+    while changed:
+        changed = False
+        for function in functions:
+            body = clean[function.body_start:function.end]
+            if function.name in halting_names:
+                continue
+            if any(
+                re.search(rf'\b{re.escape(name)}\s*\(', body)
+                for name in halting_names
+            ):
+                halting_names.add(function.name)
+                changed = True
+
+    hits: List[Tuple[int, str, float, str]] = []
+    seen: set[int] = set()
+    for function in functions:
+        for target in halting_names:
+            call_pattern = re.compile(rf'\b{re.escape(target)}\s*\(')
+            for call in call_pattern.finditer(clean, function.body_start, function.end):
+                open_pos = clean.find("(", call.start(), call.end())
+                close_pos = _balanced_end(clean, open_pos, "(", ")")
+                if close_pos is None or close_pos > function.end:
+                    continue
+                trailing = clean[close_pos + 1:function.end].strip(" \t\r\n;")
+                if not trailing or call.start() in seen:
+                    continue
+                seen.add(call.start())
+                hits.append((
+                    call.start(),
+                    code[call.start():close_pos + 1],
+                    0.65,
+                    f"Lời gọi '{target}' có thể dừng execution bằng Yul return() trước phần code phía sau",
+                ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-INCORRECT-ASSEMBLY-RETURN",
+        "incorrect_assembly_return",
+        "High",
+        0.16,
+        hits,
+    )
+
+
+def _uses_exact_vulnerable_storage_array_compiler(code: str) -> bool:
+    """Recognize explicitly pinned solc versions affected by 2019 storage bugs."""
+    clean = _clean_code(code)
+    versions = [
+        (int(match.group("minor")), int(match.group("patch")))
+        for match in re.finditer(
+            r'\bpragma\s+solidity\s+(?:=\s*)?0\.(?P<minor>[45])\.'
+            r'(?P<patch>\d+)\s*;',
+            clean,
+        )
+    ]
+    return any(
+        (minor == 4 and 7 <= patch <= 25)
+        or (minor == 5 and 0 <= patch <= 9)
+        for minor, patch in versions
+    )
+
+
+def _detect_storage_abiencoderv2_array(code: str) -> Optional[VulnerabilityFinding]:
+    clean = _clean_code(code)
+    if not (
+        _uses_exact_vulnerable_storage_array_compiler(code)
+        and re.search(r'\bpragma\s+experimental\s+ABIEncoderV2\s*;', clean)
+    ):
+        return None
+    structs = _collect_struct_members(code)
+    state_types = _collect_state_symbol_types(code)
+    vulnerable_arrays = {
+        name for name, type_name in state_types.items()
+        if type_name.count("[") >= 2
+        or ("[" in type_name and re.sub(r'\[.*$', '', type_name) in structs)
+    }
+    hits: List[Tuple[int, str, float, str]] = []
+    for call in re.finditer(r'\babi\.encode\s*\(', clean):
+        open_pos = clean.find("(", call.start(), call.end())
+        close_pos = _balanced_end(clean, open_pos, "(", ")")
+        if close_pos is None:
+            continue
+        arguments = _split_top_level_arguments(code[open_pos + 1:close_pos])
+        affected = next(
+            (argument.strip() for argument in arguments if argument.strip() in vulnerable_arrays),
+            None,
+        )
+        if not affected:
+            continue
+        hits.append((
+            call.start(),
+            code[call.start():close_pos + 1],
+            0.75,
+            f"ABIEncoderV2 có thể encode sai storage array '{affected}' trên compiler đã pin",
+        ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-ABIENCODERV2-STORAGE-ARRAY",
+        "storage_abiencoderv2_array",
+        "High",
+        0.18,
+        hits,
+    )
+
+
+def _signed_integer_base(type_name: str) -> Optional[str]:
+    match = re.match(r'(?P<base>int\d*)\[', type_name)
+    return match.group("base") if match else None
+
+
+def _detect_storage_signed_integer_array(code: str) -> Optional[VulnerabilityFinding]:
+    if not _uses_exact_vulnerable_storage_array_compiler(code):
+        return None
+    clean = _clean_code(code)
+    state_types = _collect_state_symbol_types(code)
+    symbol_types = _collect_symbol_types(code)
+    vulnerable_arrays = {
+        name: type_name for name, type_name in state_types.items()
+        if _signed_integer_base(type_name)
+    }
+    hits: List[Tuple[int, str, float, str]] = []
+    for name, target_type in vulnerable_arrays.items():
+        pattern = re.compile(rf'\b{re.escape(name)}\s*=\s*(?P<rhs>[^;]+);')
+        for assignment in pattern.finditer(clean):
+            rhs = assignment.group("rhs").strip()
+            vulnerable = rhs.startswith("[")
+            if not vulnerable and re.fullmatch(r'[A-Za-z_]\w*', rhs):
+                source_type = symbol_types.get(rhs, "")
+                source_base = _signed_integer_base(source_type)
+                vulnerable = bool(
+                    source_base and source_base != _signed_integer_base(target_type)
+                )
+            if not vulnerable:
+                continue
+            hits.append((
+                assignment.start(),
+                code[assignment.start():assignment.end()],
+                0.65,
+                f"Gán toàn bộ signed storage array '{name}' kích hoạt compiler bug của solc đã pin",
+            ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-SIGNED-STORAGE-ARRAY",
+        "signed_storage_array_compiler_bug",
+        "High",
+        0.17,
+        hits,
+    )
+
+
+def _direct_base_names(header: str) -> List[str]:
+    inheritance = re.search(r'\bis\s+(?P<bases>[\s\S]+)$', header)
+    if not inheritance:
+        return []
+    names = []
+    for base in _split_top_level_arguments(inheritance.group("bases")):
+        match = re.match(r'\s*([A-Za-z_]\w*)', base)
+        if match:
+            names.append(match.group(1))
+    return names
+
+
+def _detect_state_variable_shadowing(code: str) -> Optional[VulnerabilityFinding]:
+    contracts = {contract.name: contract for contract in _iter_contracts(code)}
+    declarations = {
+        name: _collect_contract_state_declarations(code, contract)
+        for name, contract in contracts.items()
+    }
+
+    def inherited_states(contract_name: str, visiting: Optional[set[str]] = None) -> set[str]:
+        if contract_name not in contracts:
+            return set()
+        seen = set(visiting or ())
+        if contract_name in seen:
+            return set()
+        seen.add(contract_name)
+        states: set[str] = set()
+        for base in _direct_base_names(contracts[contract_name].header):
+            states.update(declarations.get(base, {}))
+            states.update(inherited_states(base, seen))
+        return states
+
+    hits: List[Tuple[int, str, float, str]] = []
+    for contract_name, state_variables in declarations.items():
+        inherited = inherited_states(contract_name)
+        for variable, (_, position, _) in state_variables.items():
+            if variable == "__gap" or variable not in inherited:
+                continue
+            hits.append((
+                position,
+                variable,
+                0.75,
+                f"State variable '{variable}' trong '{contract_name}' che khuất biến cùng tên từ base contract",
+            ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-STATE-SHADOWING",
+        "state_variable_shadowing",
+        "High",
+        0.18,
+        hits,
+    )
+
+
+def _detect_uninitialized_state_address(code: str) -> Optional[VulnerabilityFinding]:
+    clean = _clean_code(code)
+    contracts = list(_iter_contracts(code))
+    inherited_base_names = {
+        base for contract in contracts for base in _direct_base_names(contract.header)
+    }
+    hits: List[Tuple[int, str, float, str]] = []
+    for contract in contracts:
+        if contract.name in inherited_base_names or _direct_base_names(contract.header):
+            continue
+        body = clean[contract.body_start:contract.end]
+        for name, (type_name, position, initialized) in (
+            _collect_contract_state_declarations(code, contract).items()
+        ):
+            if type_name != "address" or initialized:
+                continue
+            escaped = re.escape(name)
+            write = re.search(
+                rf'\b{escaped}\b\s*(?:=(?!=)|\+=|-=|\+\+|--)', body
+            )
+            if write:
+                continue
+            dangerous_read = re.search(
+                rf'(?:\b{escaped}\b\s*\.\s*(?:transfer|send|call)\b'
+                rf'|payable\s*\(\s*\b{escaped}\b\s*\)\s*\.'
+                rf'|(?:selfdestruct|suicide)\s*\(\s*\b{escaped}\b)',
+                body,
+            )
+            if not dangerous_read:
+                continue
+            hits.append((
+                position,
+                name,
+                0.75,
+                f"State address '{name}' không bao giờ được khởi tạo nhưng được dùng làm đích chuyển Ether/call",
+            ))
+    return _build_semantic_finding(
+        code,
+        "STATIC-UNINITIALIZED-STATE-ADDRESS",
+        "uninitialized_state_address",
+        "High",
+        0.18,
+        hits,
+    )
+
+
+def _run_semantic_checks(code: str) -> List[VulnerabilityFinding]:
+    detectors = (
+        _detect_bidirectional_controls,
+        _detect_incorrect_exponentiation,
+        _detect_encode_packed_collision,
+        _detect_arbitrary_erc20_transfer_from,
+        _detect_unchecked_erc20_transfer,
+        _detect_locked_ether,
+        _detect_msg_value_in_loop,
+        _detect_delegatecall_in_loop,
+        _detect_missing_zero_address,
+        _detect_incorrect_shift_in_assembly,
+        _detect_controlled_array_length,
+        _detect_array_by_reference,
+        _detect_multiple_constructors,
+        _detect_public_mapping_nested,
+        _detect_mapping_deletion,
+        _detect_type_based_tautology,
+        _detect_boolean_constant_misuse,
+        _detect_dangerous_balance_equality,
+        _detect_dangerous_enum_conversion,
+        _detect_return_instead_of_leave,
+        _detect_incorrect_assembly_return,
+        _detect_storage_abiencoderv2_array,
+        _detect_storage_signed_integer_array,
+        _detect_state_variable_shadowing,
+        _detect_uninitialized_state_address,
+    )
+    findings: List[VulnerabilityFinding] = []
+    for detector in detectors:
+        finding = detector(code)
+        if finding is not None:
+            findings.append(finding)
+    return findings
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -795,7 +2348,7 @@ def check_call_before_state_update(code: str) -> List[str]:
         else:
             continue
 
-        clean = _strip_comments(body)
+        clean = _clean_code(body)
 
         # Tìm vị trí external call
         call_m = re.search(
@@ -822,41 +2375,13 @@ def check_call_before_state_update(code: str) -> List[str]:
 
 def check_missing_zero_address(code: str) -> List[str]:
     """
-    Phát hiện hàm nhận address parameter nhưng không kiểm tra != address(0).
+    Report only address parameters that reach state or a call destination.
+
+    This deliberately avoids flagging every address parameter. The usage-based
+    filter mirrors the useful part of Slither's missing-zero-check detector and
+    keeps ordinary lookup/query parameters out of the result.
     """
-    violations: List[str] = []
-    func_pattern = re.compile(
-        r'function\s+(\w+)\s*\(([^)]*)\)[^{]*\{', re.DOTALL
-    )
-    for m in func_pattern.finditer(code):
-        func_name = m.group(1)
-        params = m.group(2)
-        # Hàm có address param?
-        if not re.search(r'\baddress\b', params):
-            continue
-        # Lấy body
-        start = m.end()
-        depth, body = 1, ""
-        for i, ch in enumerate(code[start:], start):
-            if ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0:
-                    body = code[start:i]
-                    break
-        if not body:
-            continue
-        clean = _strip_comments(body)
-        # Có kiểm tra zero address không?
-        has_zero_check = bool(re.search(
-            r'require\s*\([^)]*!=\s*address\s*\(\s*0\s*\)', clean
-        ))
-        if not has_zero_check:
-            violations.append(
-                f"Hàm '{func_name}': nhận address nhưng thiếu kiểm tra zero address"
-            )
-    return violations
+    return [description for _, _, _, description in _missing_zero_address_hits(code)]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -900,7 +2425,7 @@ class StaticAnalyzer:
             "summary"        : str,
         }
         """
-        clean = _strip_comments(_strip_strings(contract_code))
+        clean = _clean_code(contract_code)
 
         findings: Dict[str, VulnerabilityFinding] = {}
         total_score = 0.0
@@ -923,6 +2448,20 @@ class StaticAnalyzer:
                     findings[key].notes.extend(finding.notes)
                 else:
                     findings[key] = finding
+
+        # Focused semantic checks derived from detector behavior, implemented
+        # locally without importing or invoking Slither.
+        for finding in _run_semantic_checks(contract_code):
+            total_score += finding.weighted_score
+            key = finding.vuln_type
+            if key in findings:
+                findings[key].matches.extend(finding.matches)
+                findings[key].notes.extend(finding.notes)
+                findings[key].confirmed = (
+                    findings[key].confirmed or finding.confirmed
+                )
+            else:
+                findings[key] = finding
 
         # Context checks nâng cao
         context_issues = check_call_before_state_update(contract_code)

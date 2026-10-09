@@ -1,22 +1,243 @@
 from __future__ import annotations
 
 import html
+import re
 import textwrap
 from collections import Counter
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
 from E2E.shared.io_utils import write_text
+from agents.reporter import VULNERABILITY_REFERENCE
 
 
 DEFAULT_RECOMMENDATIONS = [
     "Apply and manually review every accepted patch before deployment.",
     "Pin a supported Solidity compiler version and run compilation in CI.",
-    "Run Slither and project tests after every security-sensitive change.",
+    "Run the security tool matrix and project tests after every security-sensitive change.",
     "Use checks-effects-interactions and established OpenZeppelin guards for external calls.",
     "Repeat the audit after dependency, privilege, or business-logic changes.",
 ]
+def format_solidity_for_comparison(code: str) -> list[str]:
+    """Format Solidity into stable statement lines for a readable visual diff."""
+    lines: list[str] = []
+    current: list[str] = []
+    indent = 0
+    paren_depth = 0
+    bracket_depth = 0
+    expression_brace_depth = 0
+    quote = ""
+    line_comment = False
+    block_comment = False
+    pending_space = False
+    physical_line_content = False
+    index = 0
+
+    def emit(*, blank: bool = False) -> None:
+        nonlocal current, pending_space
+        text = "".join(current).strip()
+        if text:
+            lines.append(f"{'    ' * indent}{text}")
+        elif blank and lines and lines[-1] != "":
+            lines.append("")
+        current = []
+        pending_space = False
+
+    def append(char: str) -> None:
+        nonlocal pending_space, physical_line_content
+        if pending_space and current and not current[-1].endswith((" ", "\t")):
+            current.append(" ")
+        pending_space = False
+        current.append(char)
+        physical_line_content = True
+
+    while index < len(code):
+        char = code[index]
+        pair = code[index : index + 2]
+
+        if line_comment:
+            if char == "\n":
+                emit()
+                line_comment = False
+                physical_line_content = False
+            else:
+                current.append(char)
+            index += 1
+            continue
+
+        if block_comment:
+            current.append(char)
+            if pair == "*/":
+                current.append("/")
+                index += 2
+                block_comment = False
+                emit()
+            else:
+                index += 1
+            continue
+
+        if quote:
+            append(char)
+            if char == "\\" and index + 1 < len(code):
+                current.append(code[index + 1])
+                index += 2
+                continue
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+
+        if pair == "//":
+            if "".join(current).strip():
+                emit()
+            current.extend(("/", "/", " "))
+            physical_line_content = True
+            line_comment = True
+            index += 2
+            while index < len(code) and code[index] in " \t":
+                index += 1
+            continue
+
+        if pair == "/*":
+            if "".join(current).strip():
+                emit()
+            current.extend(("/", "*"))
+            physical_line_content = True
+            block_comment = True
+            index += 2
+            continue
+
+        if char in {'"', "'"}:
+            append(char)
+            quote = char
+            index += 1
+            continue
+
+        if char.isspace():
+            if char == "\n":
+                if "".join(current).strip():
+                    emit()
+                elif not physical_line_content:
+                    emit(blank=True)
+                physical_line_content = False
+            else:
+                pending_space = True
+            index += 1
+            continue
+
+        if char == "(":
+            append(char)
+            paren_depth += 1
+        elif char == ")":
+            append(char)
+            paren_depth = max(0, paren_depth - 1)
+        elif char == "[":
+            append(char)
+            bracket_depth += 1
+        elif char == "]":
+            append(char)
+            bracket_depth = max(0, bracket_depth - 1)
+        elif char == "{":
+            prefix = "".join(current).rstrip()
+            is_call_options = bool(
+                paren_depth
+                or bracket_depth
+                or re.search(r"(?:\.(?:call|delegatecall|staticcall)|\bnew\s+[A-Za-z_]\w*)$", prefix)
+            )
+            if expression_brace_depth or is_call_options:
+                append(char)
+                expression_brace_depth += 1
+            else:
+                append("{")
+                emit()
+                indent += 1
+        elif char == "}":
+            if expression_brace_depth:
+                append(char)
+                expression_brace_depth -= 1
+            else:
+                emit()
+                indent = max(0, indent - 1)
+                current.append("}")
+                physical_line_content = True
+                lookahead = index + 1
+                while lookahead < len(code) and code[lookahead] in " \t":
+                    lookahead += 1
+                if lookahead < len(code) and code[lookahead] == ";":
+                    current.append(";")
+                    index = lookahead
+                emit()
+        elif char == ";":
+            append(char)
+            if paren_depth == 0 and bracket_depth == 0 and expression_brace_depth == 0:
+                emit()
+        else:
+            append(char)
+        index += 1
+
+    emit()
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def build_code_comparison_rows(original_code: str, fixed_code: str) -> list[dict[str, Any]]:
+    """Return side-by-side code rows with fixed-side change markers."""
+    original_lines = format_solidity_for_comparison(original_code)
+    fixed_lines = format_solidity_for_comparison(fixed_code)
+    rows: list[dict[str, Any]] = []
+
+    for tag, source_start, source_end, fixed_start, fixed_end in SequenceMatcher(
+        None,
+        original_lines,
+        fixed_lines,
+        autojunk=False,
+    ).get_opcodes():
+        source_chunk = original_lines[source_start:source_end]
+        fixed_chunk = fixed_lines[fixed_start:fixed_end]
+        changed = tag in {"replace", "insert"}
+        row_count = max(len(source_chunk), len(fixed_chunk), 1)
+        for index in range(row_count):
+            rows.append(
+                {
+                    "source": source_chunk[index] if index < len(source_chunk) else "",
+                    "fixed": fixed_chunk[index] if index < len(fixed_chunk) else "",
+                    "fixed_changed": changed and index < len(fixed_chunk),
+                }
+            )
+    return rows or [{"source": "", "fixed": "", "fixed_changed": False}]
+
+
+def _markdown_code_compare(rows: list[dict[str, Any]]) -> str:
+    source_lines = [html.escape(row["source"]) or "&nbsp;" for row in rows]
+    fixed_lines = []
+    for row in rows:
+        line = html.escape(row["fixed"]) or "&nbsp;"
+        fixed_lines.append(f"<mark>{line}</mark>" if row["fixed_changed"] else line)
+    return "\n".join(
+        [
+            '<table class="code-comparison">',
+            "<thead><tr><th>Source Code (Sample)</th><th>Fixed Source Code</th></tr></thead>",
+            "<tbody><tr>",
+            f"<td><pre><code>{'<br>'.join(source_lines)}</code></pre></td>",
+            f"<td><pre><code>{'<br>'.join(fixed_lines)}</code></pre></td>",
+            "</tr></tbody>",
+            "</table>",
+        ]
+    )
+
+
+def _html_code_lines(rows: list[dict[str, Any]], key: str, highlight_key: str | None = None) -> str:
+    lines = []
+    for row in rows:
+        css_class = "code-line"
+        if highlight_key and row.get(highlight_key):
+            css_class += " changed"
+        line = html.escape(row.get(key, "")) or " "
+        lines.append(f"<span class='{css_class}'>{line}</span>")
+    return "\n".join(lines)
 
 
 def _phase(remote: dict[str, Any], name: str) -> dict[str, Any]:
@@ -58,12 +279,60 @@ def normalize_recommendations(value: Any) -> list[str]:
     return recommendations or list(DEFAULT_RECOMMENDATIONS)
 
 
+def verification_channel_rows(data: dict[str, Any]) -> list[dict[str, str]]:
+    rows = []
+    channels = data.get("verification_channels", {})
+    legacy_keys = {"static", "rag", "llm"}
+    if channels and set(channels).issubset(legacy_keys):
+        items = (("static", "Static Analysis"), ("rag", "RAG"), ("llm", "LLM"))
+    else:
+        preferred_order = (
+            "slither",
+            "mythril",
+            "smartcheck",
+        )
+        ordered_keys = [key for key in preferred_order if key in channels]
+        ordered_keys.extend(key for key in channels if key not in ordered_keys)
+        items = tuple((key, key.replace("_", " ").title()) for key in ordered_keys)
+    for key, label in items:
+        component = channels.get(key, {})
+        findings = component.get("findings", [])
+        detail = str(component.get("reason") or component.get("error") or "").strip()
+        if not detail and findings:
+            detail = f"{len(findings)} remaining finding(s)"
+        if not detail:
+            detail = "No remaining vulnerability signal."
+        verdict = str(component.get("verdict") or "Not run")
+        passed = component.get("passed")
+        if passed is None:
+            passed = verdict in {"PASS", "WARN"}
+        if verdict == "SKIPPED":
+            result_str = "SKIPPED"
+        elif passed:
+            result_str = "PASS"
+        elif verdict == "ERROR":
+            result_str = "ERROR"
+        else:
+            result_str = "FAIL"
+        rows.append(
+            {
+                "component": label,
+                "result": result_str,
+                "verdict": verdict,
+                "detail": detail,
+            }
+        )
+    return rows
+
+
 def apply_verification_to_report(
     report_data: dict[str, Any],
     verification: dict[str, Any],
 ) -> None:
     verdict = str(verification.get("overall_verdict") or "Not complete")
     report_data["patch_verdict"] = verdict
+    report_data["verification_channels"] = verification.get("verification_channels", {})
+    report_data["repair_attempts"] = verification.get("repair_attempts", [])
     for row in report_data.get("phase_rows", []):
         if row.get("phase") == "5 Verifier":
             row["status"] = verification.get("status", "partial")
@@ -82,10 +351,10 @@ def apply_verification_to_report(
     )
     outcome = "rejected" if verdict.startswith("Patch rejected") else "not accepted"
     report_data["executive_summary"] = (
-        f"The audit identified {finding_count} finding(s). A CodeLlama patch was generated but {outcome} "
+        f"The audit identified {finding_count} finding(s). A patch was generated but {outcome} "
         f"by deterministic verification: {verdict}.{detail} The patch must not be deployed; "
-        "the original finding remains open until a behavior-preserving patch passes redetection, "
-        "compilation, Slither, and project tests."
+        "the original finding remains open until a behavior-preserving patch passes compilation, "
+        "the security tool matrix, and project tests."
     )
     for finding in report_data.get("findings", []):
         finding["verification_status"] = (
@@ -141,7 +410,24 @@ def build_report_data(
     fixed_code = fixer.get("fixed_code") or original_code
     compile_status = tool_verification.get("compile", {}).get("status", "not run")
     slither = tool_verification.get("slither", {})
+    if not slither and "tools" in tool_verification:
+        slither = tool_verification["tools"].get("slither", {})
+    slither_verdict = str(
+        slither.get("verdict")
+        or tool_verification.get("tools", {}).get("slither", {}).get("verdict")
+        or ""
+    ).upper()
+    if slither_verdict == "FAIL" and slither.get("status") in {"passed", "ok"}:
+        slither["status"] = "failed"
     slither_count = len(slither.get("findings", []))
+    tool_summary = tool_verification.get("summary", {})
+    tool_matrix_status = (
+        f"security tool matrix pass/fail/warn/error: "
+        f"{tool_summary.get('pass', 0)}/{tool_summary.get('fail', 0)}/"
+        f"{tool_summary.get('warn', 0)}/{tool_summary.get('error', 0)}"
+        if tool_summary
+        else "security tool matrix not run"
+    )
     function_names = ", ".join(unit["unit_id"] for unit in request.get("code_units", [])[:8])
     if len(request.get("code_units", [])) > 8:
         function_names += ", ..."
@@ -151,57 +437,89 @@ def build_report_data(
             f"The audit result is {fused.get('verdict', 'Inconclusive')} with a fused confidence "
             f"score of {float(fused.get('score') or 0.0):.3f}. The pipeline identified "
             f"{len(findings)} confirmed finding(s). Compilation status: {compile_status}; "
-            f"Slither reported {slither_count} detector finding(s)."
+            f"Slither reported {slither_count} detector finding(s); {tool_matrix_status}."
         )
     recommendations = normalize_recommendations(reporter.get("recommendations"))
+    backend_key = str(
+        remote.get("backend")
+        or request.get("execution", {}).get("backend")
+        or request.get("backend")
+        or ""
+    ).lower()
+
+    if "server_gpu" in backend_key or "rtx" in backend_key:
+        p1c_title = "1C Qwen2.5-Coder-14B detector (v13)"
+        detector_location = "GPU Server (RTX 4070 Ti SUPER)"
+        detector_engine = "Qwen2.5-Coder-14B-Instruct v13 Quality-First (LoRA r=64, alpha=128)"
+        agent_location = "GPU Server (RTX 4070 Ti SUPER)"
+        agent_engine = "Qwen2.5-Coder-14B-Instruct v13"
+    elif "ollama" in backend_key:
+        p1c_title = "1C Ollama detector"
+        detector_location = "Local Ollama"
+        detector_engine = "Ollama codellama:7b"
+        agent_location = "Local Ollama"
+        agent_engine = "Ollama codellama:7b"
+    elif "local" in backend_key:
+        p1c_title = "1C Local detector"
+        detector_location = "Local"
+        detector_engine = "Local Fast Heuristic / AST"
+        agent_location = "Local"
+        agent_engine = "Local Fast Generator"
+    else:
+        p1c_title = "1C Neural detector"
+        detector_location = "Kaggle"
+        detector_engine = remote.get("models", {}).get("detector", "Qwen2.5-Coder-14B / CodeLlama")
+        agent_location = "Kaggle"
+        agent_engine = "Qwen2.5-Coder-14B / CodeLlama Instruct"
+
     phase_rows = [
         {
             "phase": "1A Static detector",
             "location": "Local",
             "status": request["local_phase1"]["static"].get("status", "unknown"),
-            "engine": request["local_phase1"]["static"].get("engine", ""),
+            "engine": request["local_phase1"]["static"].get("engine", "Regex / AST Rule Engine"),
         },
         {
             "phase": "1B RAG detector",
             "location": "Local",
             "status": request["local_phase1"]["rag"].get("status", "unknown"),
-            "engine": request["local_phase1"]["rag"].get("engine", ""),
+            "engine": request["local_phase1"]["rag"].get("engine", "SWC TF-IDF (11,869 cases)"),
         },
         {
-            "phase": "1C CodeLlama detector",
-            "location": "Kaggle",
+            "phase": p1c_title,
+            "location": detector_location,
             "status": _phase(remote, "detector").get("status", "pending"),
-            "engine": remote.get("models", {}).get("detector", ""),
+            "engine": detector_engine,
         },
         {
             "phase": "2 Advisor",
-            "location": "Kaggle",
+            "location": agent_location,
             "status": _phase(remote, "advisor").get("status", "pending"),
-            "engine": "CodeLlama Instruct",
+            "engine": agent_engine,
         },
         {
             "phase": "3 Risk assessor",
-            "location": "Kaggle",
+            "location": agent_location,
             "status": _phase(remote, "assessor").get("status", "pending"),
-            "engine": "CodeLlama Instruct",
+            "engine": agent_engine,
         },
         {
             "phase": "4 Fixer",
-            "location": "Kaggle",
+            "location": agent_location,
             "status": fixer.get("status", "pending"),
-            "engine": "CodeLlama Instruct + deterministic patch apply",
+            "engine": f"{agent_engine} + deterministic patch apply",
         },
         {
             "phase": "5 Verifier",
-            "location": "Local + Kaggle",
-            "status": _phase(remote, "verifier").get("status", tool_verification.get("status", "pending")),
-            "engine": "redetection, compiler, Slither, CodeLlama review",
+            "location": "Local",
+            "status": tool_verification.get("status", "pending"),
+            "engine": "solc compiler, behavioral checks, SmartBugs 9-tool matrix",
         },
         {
             "phase": "6 Reporter",
-            "location": "Local + Kaggle",
-            "status": reporter.get("status", "local fallback"),
-            "engine": "deterministic renderer + CodeLlama narrative",
+            "location": "Local",
+            "status": reporter.get("status", "ok"),
+            "engine": "deterministic audit report renderer",
         },
     ]
     return {
@@ -223,12 +541,32 @@ def build_report_data(
         "fixed_code": fixed_code,
         "patch_outcomes": fixer.get("patch_outcomes", []),
         "patch_verdict": _phase(remote, "verifier").get("overall_verdict", "Not complete"),
+        "reference_table": [
+            {
+                "name": entry["name"],
+                "abbr": entry["abbr"],
+                "severity": entry["severity"],
+                "detected": any(
+                    any(
+                        k.lower() in str(f.get("swc") or "").lower()
+                        or k.lower() in str(f.get("title") or "").lower()
+                        or k.lower() in str(f.get("unit_id") or "").lower()
+                        for k in entry.get("keys", [])
+                    )
+                    for f in findings
+                ),
+                "impact": entry["impact"],
+            }
+            for entry in VULNERABILITY_REFERENCE
+        ],
         "tool_verification": tool_verification,
+        "verification_channels": {},
+        "repair_attempts": remote.get("repair_attempts", []),
         "recommendations": recommendations,
         "limitations": [
             "SWC Registry source material is no longer actively maintained and is not exhaustive.",
             "The fine-tuned classifier is a binary detector; SWC attribution comes from local static/RAG evidence.",
-            "A model-generated patch is not deployment approval. Manual review and project tests remain required.",
+            "Security tools can disagree or time out; manual review and project tests remain required.",
         ],
         "disclaimer": (
             "This report represents a best-effort automated security review. It cannot guarantee that all "
@@ -240,6 +578,8 @@ def build_report_data(
 def render_markdown(data: dict[str, Any]) -> str:
     findings = data["findings"]
     dist = data["distribution"]
+    code_comparison = build_code_comparison_rows(data["original_code"], data["fixed_code"])
+    channel_rows = verification_channel_rows(data)
     lines = [
         "# Smart Contract Audit Report",
         "",
@@ -261,9 +601,9 @@ def render_markdown(data: dict[str, Any]) -> str:
         "## 3. Methodology",
         "",
         (
-            "The audit combines restored context-aware static rules, local SWC TF-IDF retrieval, the "
-            "fine-tuned CodeLlama sequence classifier, CodeLlama Instruct repair agents, compiler checks, "
-            "Slither, fixed-code redetection, and deterministic report generation."
+            "The audit combines restored context-aware static rules, local SWC TF-IDF retrieval (11,869 cases), "
+            "fine-tuned neural vulnerability detection (Qwen2.5-Coder-14B v13 Quality-First), generative repair agents, "
+            "compiler checks, behavior-preservation checks, the security tool matrix, and deterministic report generation."
         ),
         "",
         "| Phase | Location | Status | Engine |",
@@ -291,14 +631,27 @@ def render_markdown(data: dict[str, Any]) -> str:
             "",
             "### 4.3 Vulnerability Reference Table",
             "",
-            "| ID | Vulnerability | Unit | Severity | Confidence | Evidence |",
-            "| :-- | :------------ | :--- | :------- | :--------: | :------- |",
+            "| Vulnerability Name | Severity | Detected | Impact Scope |",
+            "| :----------------- | :------- | :------: | :----------- |",
+        ]
+    )
+    for row in data.get("reference_table", []):
+        mark = "✓" if row.get("detected") else ""
+        lines.append(f"| {row['name']} ({row['abbr']}) | {row['severity']} | {mark} | {row['impact']} |")
+    lines.extend(
+        [
+            "",
+            "### 4.4 Confirmed Findings Summary",
+            "",
+            "| ID | Vulnerability | Unit | Line | Severity | Confidence | Evidence |",
+            "| :-- | :------------ | :--- | :--: | :------- | :--------: | :------- |",
         ]
     )
     for finding in findings:
+        line_str = str(finding.get("line") or "-")
         lines.append(
             f"| {finding['swc']} | {finding['title']} | {finding.get('unit_id') or 'contract'} | "
-            f"{finding['severity']} | {float(finding.get('confidence') or 0):.3f} | "
+            f"{line_str} | {finding['severity']} | {float(finding.get('confidence') or 0):.3f} | "
             f"{', '.join(finding.get('sources', []))} |"
         )
     lines.extend(
@@ -348,13 +701,23 @@ def render_markdown(data: dict[str, Any]) -> str:
             "",
             f"_Patch verification verdict: **{data['patch_verdict']}**_",
             "",
-            "```solidity",
-            data["fixed_code"],
-            "```",
+            _markdown_code_compare(code_comparison),
             "",
-            "### 5.5 Tool Verification",
+            "### 5.5 Verification Results",
+            "",
+            "- **Fix attempt:** Single attempt",
+            "",
+            "| Verification channel | Result | Verdict | Details |",
+            "| :------------------- | :----: | :------ | :------ |",
+            *[
+                f"| {row['component']} | **{row['result']}** | {row['verdict']} | "
+                f"{row['detail'].replace('|', '&#124;')} |"
+                for row in channel_rows
+            ],
             "",
             f"- **Compilation:** {data['tool_verification'].get('compile', {}).get('status', 'not run')}",
+            f"- **Security tool matrix:** {data['tool_verification'].get('policy_verdict', 'not run')}",
+            f"- **Matrix reason:** {data['tool_verification'].get('policy_reason', 'not run')}",
             f"- **Slither:** {data['tool_verification'].get('slither', {}).get('status', 'not run')}",
             f"- **Slither findings:** {len(data['tool_verification'].get('slither', {}).get('findings', []))}",
             f"- **Behavior preservation:** {data['tool_verification'].get('behavioral', {}).get('status', 'not run')}",
@@ -372,28 +735,50 @@ def render_markdown(data: dict[str, Any]) -> str:
 
 
 def render_html(data: dict[str, Any], markdown_text: str) -> str:
+    code_comparison = build_code_comparison_rows(data["original_code"], data["fixed_code"])
+    source_code_lines = _html_code_lines(code_comparison, "source")
+    fixed_code_lines = _html_code_lines(code_comparison, "fixed", "fixed_changed")
     behavioral = data["tool_verification"].get("behavioral", {})
     behavioral_evidence = "".join(
         f"<li>{html.escape(str(item.get('evidence') or item.get('check') or ''))}</li>"
         for item in behavioral.get("findings", [])
+    )
+    catalogue_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(row['name'])} ({html.escape(row['abbr'])})</td>"
+        f"<td><span class='severity {row['severity'].lower()}'>{html.escape(row['severity'])}</span></td>"
+        f"<td style='text-align:center;'>{'<span style=\"color:#10b981;font-weight:bold;\">✓</span>' if row.get('detected') else '-'}</td>"
+        f"<td>{html.escape(row['impact'])}</td>"
+        "</tr>"
+        for row in data.get("reference_table", [])
     )
     findings_rows = "".join(
         "<tr>"
         f"<td>{html.escape(item['swc'])}</td>"
         f"<td>{html.escape(str(item['title']))}</td>"
         f"<td>{html.escape(str(item.get('unit_id') or 'contract'))}</td>"
+        f"<td style='text-align:center;'>{html.escape(str(item.get('line') or '-'))}</td>"
         f"<td><span class='severity {item['severity'].lower()}'>{html.escape(item['severity'])}</span></td>"
         f"<td>{float(item.get('confidence') or 0):.3f}</td>"
         f"<td>{html.escape(', '.join(item.get('sources', [])))}</td>"
         "</tr>"
         for item in data["findings"]
-    ) or "<tr><td colspan='6'>No confirmed findings</td></tr>"
+    ) or "<tr><td colspan='7'>No confirmed findings</td></tr>"
     phase_rows = "".join(
         "<tr>"
         f"<td>{html.escape(row['phase'])}</td><td>{row['location']}</td>"
         f"<td>{html.escape(str(row['status']))}</td><td>{html.escape(str(row['engine']))}</td>"
         "</tr>"
         for row in data["phase_rows"]
+    )
+    verification_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(row['component'])}</td>"
+        f"<td class='{row['result'].lower()}'>{row['result']}</td>"
+        f"<td>{html.escape(row['verdict'])}</td>"
+        f"<td>{html.escape(row['detail'])}</td>"
+        "</tr>"
+        for row in verification_channel_rows(data)
     )
     details = ""
     for index, item in enumerate(data["findings"], 1):
@@ -421,9 +806,17 @@ table {{ border-collapse: collapse; width: 100%; margin: 12px 0 22px; font-size:
 th {{ background: #26394d; color: white; text-align: left; }} th, td {{ border: 1px solid #bcc5cf; padding: 7px; vertical-align: top; }}
 .severity {{ font-weight: bold; }} .critical {{ color: #9e1d1d; }} .high {{ color: #bd4c13; }}
 .medium {{ color: #8a6500; }} .low {{ color: #28633b; }}
+.pass {{ color: #28633b; font-weight: bold; }} .fail {{ color: #9e1d1d; font-weight: bold; }}
 pre {{ background: #f3f5f7; border-left: 4px solid #52687f; padding: 12px; overflow-wrap: anywhere; white-space: pre-wrap; font-size: 11px; }}
+.code-compare {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; margin: 12px 0 22px; }}
+.code-panel {{ border: 1px solid #bcc5cf; background: #f8fafc; min-width: 0; }}
+.code-panel h4 {{ margin: 0; padding: 7px 10px; background: #26394d; color: white; font-size: 12px; }}
+.code-panel pre {{ border-left: 0; margin: 0; background: transparent; }}
+.code-line {{ display: block; min-height: 1.2em; }}
+.code-line.changed {{ background: #fff2a8; outline: 1px solid #e0c448; }}
 .notice {{ border-left: 4px solid #a17600; background: #fff8df; padding: 10px 14px; }}
 footer {{ border-top: 1px solid #bcc5cf; margin-top: 30px; padding: 12px 0; color: #66717d; font-size: 12px; }}
+@media (max-width: 760px) {{ .code-compare {{ grid-template-columns: 1fr; }} }}
 </style></head><body>
 <header><h1>Smart Contract Audit Report</h1><p>Run <code>{html.escape(data['run_id'])}</code></p></header>
 <h2>1. Contract Information</h2><div class="meta">
@@ -435,8 +828,8 @@ footer {{ border-top: 1px solid #bcc5cf; margin-top: 30px; padding: 12px 0; colo
 <b>Fused Score</b><span>{data['score']:.3f}</span>
 <b>Audit Time</b><span>{data['audit_time']}</span></div>
 <h2>2. Executive Summary</h2><p>{html.escape(data['executive_summary'])}</p>
-<h2>3. Methodology</h2><p>The audit combines static analysis, local RAG, the fine-tuned CodeLlama detector,
-CodeLlama Instruct repair agents, compilation, Slither, patch redetection, and deterministic reporting.</p>
+<h2>3. Methodology</h2><p>The audit combines static analysis, local SWC TF-IDF retrieval (11,869 cases), fine-tuned neural vulnerability detection (Qwen2.5-Coder-14B v13 Quality-First),
+generative repair agents, compilation, behavior-preservation checks, the security tool matrix, and deterministic reporting.</p>
 <table><thead><tr><th>Phase</th><th>Location</th><th>Status</th><th>Engine</th></tr></thead><tbody>{phase_rows}</tbody></table>
 <h2>4. Findings</h2><h3>4.1 Vulnerability Statistics</h3>
 <p><b>{len(data['findings'])}</b> confirmed finding(s); highest risk: <b>{data['risk_level']}</b>.</p>
@@ -444,22 +837,33 @@ CodeLlama Instruct repair agents, compilation, Slither, patch redetection, and d
 <table><tr><th>Critical</th><th>High</th><th>Medium</th><th>Low</th></tr><tr>
 <td>{data['distribution'].get('Critical', 0)}</td><td>{data['distribution'].get('High', 0)}</td>
 <td>{data['distribution'].get('Medium', 0)}</td><td>{data['distribution'].get('Low', 0)}</td></tr></table>
-<h3>4.3 Vulnerability Reference Table</h3>
-<table><thead><tr><th>ID</th><th>Vulnerability</th><th>Unit</th><th>Severity</th><th>Confidence</th><th>Evidence</th></tr></thead>
+<h3>4.3 Vulnerability Reference Catalogue</h3>
+<table><thead><tr><th>Vulnerability Name</th><th>Severity</th><th>Detected</th><th>Impact Scope</th></tr></thead>
+<tbody>{catalogue_rows}</tbody></table>
+<h3>4.4 Confirmed Findings Summary</h3>
+<table><thead><tr><th>ID</th><th>Vulnerability</th><th>Unit</th><th>Line</th><th>Severity</th><th>Confidence</th><th>Evidence</th></tr></thead>
 <tbody>{findings_rows}</tbody></table>
 <h2>5. Detailed Analysis</h2><h3>5.1 Contract Name</h3><p>{html.escape(data['analyzed_object'])}</p>
 <h3>5.2 Source Code</h3><pre>{html.escape(data['original_code'])}</pre>
 <h3>5.3 Repair Suggestion</h3>{details or '<p>No confirmed vulnerability was available for remediation.</p>'}
 <h3>5.4 Fixed Code</h3><p>Patch verification: <b>{html.escape(data['patch_verdict'])}</b></p>
-<pre>{html.escape(data['fixed_code'])}</pre>
-	<h3>5.5 Tool Verification</h3><p>Compilation: <b>{data['tool_verification'].get('compile', {}).get('status', 'not run')}</b>;
+<div class="code-compare">
+<section class="code-panel"><h4>Source Code (Sample)</h4><pre>{source_code_lines}</pre></section>
+<section class="code-panel"><h4>Fixed Source Code</h4><pre>{fixed_code_lines}</pre></section>
+</div>
+	<h3>5.5 Verification Results</h3>
+	<p>Fix attempt: <b>Single attempt</b></p>
+	<table><thead><tr><th>Channel</th><th>Result</th><th>Verdict</th><th>Details</th></tr></thead>
+	<tbody>{verification_rows}</tbody></table>
+	<p>Compilation: <b>{data['tool_verification'].get('compile', {}).get('status', 'not run')}</b>;
+	Security tool matrix: <b>{data['tool_verification'].get('policy_verdict', 'not run')}</b>;
 	Slither: <b>{data['tool_verification'].get('slither', {}).get('status', 'not run')}</b>;
 	Behavior preservation: <b>{behavioral.get('status', 'not run')}</b>.</p>
 	{f'<ul>{behavioral_evidence}</ul>' if behavioral_evidence else ''}
 <h2>6. Summary and Recommendations</h2><ul>{''.join(f'<li>{html.escape(str(item))}</li>' for item in data['recommendations'])}</ul>
 <div class="notice"><b>Limitations</b><ul>{''.join(f'<li>{html.escape(str(item))}</li>' for item in data['limitations'])}</ul></div>
 <h2>7. Disclaimer</h2><p>{html.escape(data['disclaimer'])}</p>
-<footer>Generated by the self-contained CodeLlama E2E audit pipeline.</footer>
+<footer>Generated by the LLM-BSCVM v13 Smart Contract Security Audit Studio.</footer>
 </body></html>"""
 
 
@@ -484,6 +888,29 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name="ReportTitle", parent=styles["Title"], textColor=colors.HexColor("#7b1f1f")))
     styles.add(ParagraphStyle(name="CodeSmall", parent=styles["Code"], fontSize=5.8, leading=7.2))
+    styles.add(
+        ParagraphStyle(
+            name="CodeCell",
+            parent=styles["Code"],
+            fontName="Courier",
+            fontSize=5.2,
+            leading=6.3,
+            leftIndent=0,
+            rightIndent=0,
+            firstLineIndent=0,
+            wordWrap="CJK",
+        )
+    )
+    styles.add(
+        ParagraphStyle(
+            name="CodeHeader",
+            parent=styles["BodyText"],
+            fontSize=7,
+            leading=8,
+            textColor=colors.white,
+            alignment=1,
+        )
+    )
     story: list[Any] = [Paragraph(data["title"], styles["ReportTitle"]), Spacer(1, 6 * mm)]
 
     def heading(text: str, level: int = 1) -> None:
@@ -492,6 +919,44 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
     def paragraph(text: Any) -> None:
         story.append(Paragraph(html.escape(str(text or "")), styles["BodyText"]))
         story.append(Spacer(1, 2 * mm))
+
+    def code_cell(text: str) -> Paragraph:
+        wrapped = textwrap.wrap(
+            text,
+            width=72,
+            replace_whitespace=False,
+            drop_whitespace=False,
+        ) or [""]
+        escaped_parts = [
+            (html.escape(part).replace(" ", "&#160;").replace("\t", "&#160;&#160;&#160;&#160;") or "&#160;")
+            for part in wrapped
+        ]
+        return Paragraph("<br/>".join(escaped_parts), styles["CodeCell"])
+
+    def code_compare_table(rows: list[dict[str, Any]]) -> Table:
+        table_rows = [
+            [
+                Paragraph("Source Code (Sample)", styles["CodeHeader"]),
+                Paragraph("Fixed Source Code", styles["CodeHeader"]),
+            ]
+        ]
+        table_rows.extend([code_cell(row["source"]), code_cell(row["fixed"])] for row in rows)
+        table = Table(table_rows, repeatRows=1, colWidths=[84 * mm, 84 * mm], splitByRow=1)
+        table_style = [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#26394d")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#bcc5cf")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ]
+        for index, row in enumerate(rows, 1):
+            if row["fixed_changed"]:
+                table_style.append(("BACKGROUND", (1, index), (1, index), colors.HexColor("#fff2a8")))
+        table.setStyle(TableStyle(table_style))
+        return table
 
     heading("1. Contract Information")
     metadata = [
@@ -510,8 +975,9 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
     paragraph(data["executive_summary"])
     heading("3. Methodology")
     paragraph(
-        "Static analysis, local SWC retrieval, the fine-tuned CodeLlama detector, CodeLlama Instruct "
-        "repair agents, compilation, Slither, patch redetection, and deterministic reporting."
+        "Static analysis, local SWC TF-IDF retrieval (11,869 cases), fine-tuned neural vulnerability detection "
+        "(Qwen2.5-Coder-14B v13 Quality-First), generative repair agents, solc compilation, behavior-preservation checks, "
+        "the security tool matrix, and deterministic reporting."
     )
     phase_table = [["Phase", "Location", "Status"], *[[r["phase"], r["location"], r["status"]] for r in data["phase_rows"]]]
     table = Table(phase_table, repeatRows=1, colWidths=[92 * mm, 35 * mm, 43 * mm])
@@ -538,15 +1004,38 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
     table = Table(severity_table, colWidths=[42.5 * mm] * 4)
     table.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.5, colors.grey), ("ALIGN", (0, 0), (-1, -1), "CENTER")]))
     story.extend([table, Spacer(1, 4 * mm)])
-    heading("4.3 Vulnerability Reference Table", 2)
-    rows = [["ID", "Vulnerability", "Unit", "Severity"]]
+    heading("4.3 Vulnerability Reference Catalogue", 2)
+    cat_rows = [["Vulnerability", "Severity", "Detected", "Scope"]]
+    for row in data.get("reference_table", []):
+        cat_rows.append([
+            f"{row['name']} ({row['abbr']})",
+            row["severity"],
+            "✓" if row.get("detected") else "-",
+            row["impact"][:70] + "..." if len(row["impact"]) > 70 else row["impact"],
+        ])
+    table = Table(cat_rows, repeatRows=1, colWidths=[42 * mm, 20 * mm, 18 * mm, 90 * mm])
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#26394d")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+                ("FONTSIZE", (0, 0), (-1, -1), 7),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ]
+        )
+    )
+    story.extend([table, Spacer(1, 4 * mm)])
+
+    heading("4.4 Confirmed Findings Summary", 2)
+    rows = [["ID", "Vulnerability", "Unit", "Line", "Severity"]]
     rows.extend(
-        [item["swc"], item["title"], item.get("unit_id") or "contract", item["severity"]]
+        [item["swc"], item["title"], item.get("unit_id") or "contract", str(item.get("line") or "-"), item["severity"]]
         for item in data["findings"]
     )
     if len(rows) == 1:
-        rows.append(["-", "No confirmed findings", "-", "-"])
-    table = Table(rows, repeatRows=1, colWidths=[22 * mm, 70 * mm, 53 * mm, 25 * mm])
+        rows.append(["-", "No confirmed findings", "-", "-", "-"])
+    table = Table(rows, repeatRows=1, colWidths=[22 * mm, 60 * mm, 45 * mm, 18 * mm, 25 * mm])
     table.setStyle(
         TableStyle(
             [
@@ -577,11 +1066,40 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
         paragraph(f"Patch verification: {item.get('verification_status') or 'Not verified'}")
     heading("5.4 Fixed Code", 2)
     paragraph(f"Patch verification verdict: {data['patch_verdict']}")
-    wrapped_fixed = "\n".join(textwrap.fill(line, width=118, replace_whitespace=False) for line in data["fixed_code"].splitlines())
-    story.extend([Preformatted(wrapped_fixed, styles["CodeSmall"]), Spacer(1, 3 * mm)])
-    heading("5.5 Tool Verification", 2)
+    code_comparison = build_code_comparison_rows(data["original_code"], data["fixed_code"])
+    story.extend([code_compare_table(code_comparison), Spacer(1, 3 * mm)])
+    heading("5.5 Verification Results", 2)
+    paragraph("Fix attempt: Single attempt")
+    verification_table = [["Channel", "Result", "Verdict", "Details"]]
+    verification_table.extend(
+        [
+            row["component"],
+            row["result"],
+            row["verdict"],
+            Paragraph(html.escape(row["detail"]), styles["BodyText"]),
+        ]
+        for row in verification_channel_rows(data)
+    )
+    table = Table(
+        verification_table,
+        repeatRows=1,
+        colWidths=[35 * mm, 20 * mm, 30 * mm, 85 * mm],
+    )
+    table_style = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#26394d")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]
+    for row_index, row in enumerate(verification_channel_rows(data), 1):
+        color = colors.HexColor("#28633b" if row["result"] == "PASS" else "#9e1d1d")
+        table_style.append(("TEXTCOLOR", (1, row_index), (1, row_index), color))
+    table.setStyle(TableStyle(table_style))
+    story.extend([table, Spacer(1, 3 * mm)])
     paragraph(
         f"Compilation: {data['tool_verification'].get('compile', {}).get('status', 'not run')}; "
+        f"Security tool matrix: {data['tool_verification'].get('policy_verdict', 'not run')}; "
         f"Slither: {data['tool_verification'].get('slither', {}).get('status', 'not run')}; "
         f"Behavior preservation: "
         f"{data['tool_verification'].get('behavioral', {}).get('status', 'not run')}."

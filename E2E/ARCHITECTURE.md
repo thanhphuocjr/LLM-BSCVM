@@ -27,7 +27,10 @@ Private Kaggle GPU kernel
                          v
 Local machine
   fuse original evidence
-  static/RAG redetection of fixed code
+  static/RAG redetection of fixed code ----+
+      ^                                      |
+      | failed verification feedback        |
+      +--- Kaggle Fixer (maximum 3 attempts)+
   compile + Slither
   observable-behavior preservation guard
   deterministic Markdown/HTML/PDF report
@@ -54,6 +57,12 @@ Patch verification has a separate outcome from the original audit verdict:
 - inconclusive when deterministic checks pass but the binary detector remains positive;
 - accepted only when redetection, compiler, Slither, and behavior checks agree.
 
+For `--submit-kaggle`, repair verification is an outer loop capped at three
+attempts. Static and RAG run locally after every candidate patch. Their remaining
+findings, plus the CodeLlama fixed-code verdict and a code-grounded vulnerability
+reason from the generative verifier, are embedded in the next request as
+`repair_feedback`. The loop stops as soon as all three channels report `Safe`.
+
 The deterministic report layer overrides model prose that conflicts with these
 outcomes. A completed run is not deployment approval.
 
@@ -73,6 +82,7 @@ Every run is isolated under `runs/<run_id>/` and records:
 | `phase3_assessor.json` | severity, likelihood, impact |
 | `phase4_fixer.json` | generated function patches |
 | `phase5_verification.json` | redetection, compiler, Slither, behavior guard, model review |
+| `repair_attempts/attempt-<n>/` | per-attempt request, Kaggle result, and three-channel feedback |
 | `phase6_audit_report.*` | final Markdown, HTML, and PDF |
 | `manifest.json` | run status and entry points |
 

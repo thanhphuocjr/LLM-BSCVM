@@ -163,6 +163,9 @@ def apply_unit_patches(code: str, units: Iterable[CodeUnit], patches: Iterable[d
         if not replacement:
             outcomes.append({"unit_id": unit_id, "status": "rejected", "reason": "empty replacement"})
             continue
+        if re.sub(r"\s+", "", replacement) == re.sub(r"\s+", "", unit.code):
+            outcomes.append({"unit_id": unit_id, "status": "rejected", "reason": "replacement is identical to original (no changes)"})
+            continue
         seen.add(unit_id)
         accepted.append((unit, replacement, patch))
 
@@ -177,3 +180,88 @@ def apply_unit_patches(code: str, units: Iterable[CodeUnit], patches: Iterable[d
             }
         )
     return updated, outcomes
+
+
+def validate_observable_behavior(original: str, replacement: str) -> None:
+    required_signals = {
+        "ETH value call": r"\.call\s*\{\s*value\s*:",
+        "ETH transfer": r"\.transfer\s*\(",
+        "ETH send": r"\.send\s*\(",
+        "event emission": r"\bemit\s+",
+        "return statement": r"\breturn\b",
+    }
+    for label, pattern in required_signals.items():
+        if re.search(pattern, original) and not re.search(pattern, replacement):
+            raise ValueError(f"Generated patch removed observable behavior: {label}")
+
+
+def extract_declaration_body(text: str, target_name: str | None = None) -> str:
+    """Extract a complete function/constructor/receive declaration from text or model output."""
+    pattern = (
+        rf"\b(function\s+{re.escape(target_name)}\s*\(|(?:constructor|receive|fallback)\s*\()"
+        if target_name
+        else r"\b(function\s+[A-Za-z_$][\w$]*\s*\(|(?:constructor|receive|fallback)\s*\()"
+    )
+    match = re.search(pattern, text)
+    if not match:
+        fence = re.search(r"```(?:solidity)?\s*([\s\S]*?)```", text)
+        if fence:
+            fenced_code = fence.group(1).strip()
+            match = re.search(pattern, fenced_code)
+            if match:
+                text = fenced_code
+            else:
+                return fenced_code
+        else:
+            return text.strip()
+
+    start_idx = match.start()
+    brace_idx = text.find("{", start_idx)
+    if brace_idx < 0:
+        return text[start_idx:].strip()
+
+    depth = 0
+    quote = ""
+    line_comment = False
+    block_comment = False
+    cursor = brace_idx
+
+    while cursor < len(text):
+        char = text[cursor]
+        pair = text[cursor : cursor + 2]
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+            cursor += 1
+            continue
+        if block_comment:
+            if pair == "*/":
+                block_comment = False
+                cursor += 2
+                continue
+            cursor += 1
+            continue
+        if pair == "//":
+            line_comment = True
+            cursor += 2
+            continue
+        if pair == "/*":
+            block_comment = True
+            cursor += 2
+            continue
+        if char in {'"', "'"}:
+            if not quote:
+                quote = char
+            elif quote == char:
+                quote = ""
+        elif not quote:
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    cursor += 1
+                    break
+        cursor += 1
+
+    return text[start_idx:cursor].strip()

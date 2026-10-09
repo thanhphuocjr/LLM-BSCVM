@@ -37,12 +37,28 @@
       "type": "object",
       "required": ["static", "rag", "provisional_fusion"]
     },
+    "repair_feedback": {
+      "type": "object",
+      "properties": {
+        "attempt": {"type": "integer", "minimum": 1, "maximum": 3},
+        "max_attempts": {"type": "integer", "minimum": 1, "maximum": 3},
+        "passed": {"type": "boolean"},
+        "components": {"type": "object"}
+      }
+    },
     "execution": {
       "type": "object",
       "required": ["mode", "detector_threshold"],
       "properties": {
         "mode": {"enum": ["detector_only", "agents_only", "full"]},
-        "detector_threshold": {"type": "number", "minimum": 0, "maximum": 1}
+        "detector_threshold": {"type": "number", "minimum": 0, "maximum": 1},
+        "repair": {
+          "type": "object",
+          "properties": {
+            "attempt": {"type": "integer", "minimum": 1, "maximum": 3},
+            "max_attempts": {"type": "integer", "minimum": 1, "maximum": 3}
+          }
+        }
       }
     }
   }

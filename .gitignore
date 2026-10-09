@@ -1,15 +1,119 @@
-*
+# ==============================================================================
+# Git Ignore Configuration for LLM-BSCVM Repository
+# Only source code, scripts, documentation, and small configurations are tracked.
+# All large datasets, model weights, binaries, logs, and outputs are excluded.
+# ==============================================================================
 
-!*/
-!*.py
-!*.ipynb
-!.gitignore
-
+# ── Python & Environments ─────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
-.DS_Store
-.env
+*.pyd
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
 .venv/
 venv/
 env/
+ENV/
+env.bak/
+venv.bak/
+
+# ── OS & IDE ──────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.tools/
+
+# ── Secrets & Environment Variables ──────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Heavy Datasets & Knowledge Stores (DO NOT PUSH) ───────────────────────────
+data/
+dataset/
+datasets/
+final_dataset_train/
+final_vulnerability_knowledge/
+E2E/data/
+server_train/*.json
+server_train/*.csv
+
+# Raw and processed tabular/dataset file formats
+*.csv
+*.tsv
+*.parquet
+*.jsonl
+*.arrow
+*.sqlite
+*.sqlite3
+*.db
+*.h5
+*.hdf5
+
+# Precomputed vector matrices & serialized vectorizers
+*.npz
+*.npy
+*.joblib
+*.pkl
+*.pickle
+
+# Heavy binary archives and documents
+*.pdf
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.rar
+*.7z
+
+# ── Machine Learning Models & Checkpoints (DO NOT PUSH) ───────────────────────
+models/
+E2E/models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+*.ckpt
+kaggle-output/
+kaggle-output-*/
+kaggle-kernel-build/
+
+# ── Logs, Temporary Artifacts, and Audit Outputs ──────────────────────────────
+*.log
+logs/
+server_train/*.log
+runs/
+results/
+reports/
+artifacts/
+E2E/runs/
+E2E/phase1_detection.json
+E2E/audit_report.*

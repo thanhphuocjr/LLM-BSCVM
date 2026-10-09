@@ -21,11 +21,16 @@ def verify_patch_behavior(
     patch_outcomes: list[dict[str, Any]],
     tool_result: dict[str, Any],
 ) -> dict[str, Any]:
-    applied_units = {
-        str(item.get("unit_id") or "")
-        for item in patch_outcomes
-        if item.get("status") == "applied"
-    }
+    applied_units = set()
+    for item in patch_outcomes:
+        if item.get("status") != "applied":
+            continue
+        uid = str(item.get("unit_id") or "").strip()
+        if not uid and ":" in str(item.get("finding_id") or ""):
+            uid = str(item.get("finding_id")).split(":", 1)[1].strip()
+        if uid and uid not in {"source", "contract"}:
+            applied_units.add(uid)
+
     if not applied_units:
         return {
             "status": "not_applicable",
@@ -39,8 +44,8 @@ def verify_patch_behavior(
     checks = []
 
     for unit_id in sorted(applied_units):
-        original = original_units.get(unit_id)
-        fixed = fixed_units.get(unit_id)
+        original = original_units.get(unit_id) or next((code for k, code in original_units.items() if k.endswith(f".{unit_id}")), None)
+        fixed = fixed_units.get(unit_id) or next((code for k, code in fixed_units.items() if k.endswith(f".{unit_id}")), None)
         if original is None or fixed is None:
             findings.append(
                 {

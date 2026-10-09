@@ -30,6 +30,7 @@
     },
     "models": {"type": "object"},
     "timings": {"type": "object"},
+    "repair_attempts": {"type": "array", "maxItems": 3},
     "errors": {"type": "array"}
   }
 }

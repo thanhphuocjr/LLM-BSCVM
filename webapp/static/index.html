@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LLM-BSCVM v13 | Smart Contract Security Audit Studio (Qwen2.5-Coder-14B)</title>
+  <meta name="description" content="Multi-phase automated smart contract security audit and patch generation studio combining Qwen2.5-Coder-14B LoRA v13, Static Analysis, and RAG Knowledge Store.">
+  
+  <!-- Google Fonts: Outfit, Inter, Fira Code -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  
+  <link rel="stylesheet" href="/static/app.css?v=20261009-120500">
+</head>
+<body>
+  <!-- Background Glow Accents -->
+  <div class="glow-sphere sphere-1"></div>
+  <div class="glow-sphere sphere-2"></div>
+  <div class="glow-sphere sphere-3"></div>
+
+  <!-- Header Navigation -->
+  <header class="app-header">
+    <div class="header-left">
+      <div class="logo-group">
+        <div class="logo-shield">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            <path d="M9 12l2 2 4-4" stroke="#00f2fe" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <h1>LLM-BSCVM <span class="version-badge">v13 Qwen2.5-14B</span></h1>
+          <p class="subtitle">Smart Contract Security Audit &amp; Automated Patching Studio</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="header-center">
+      <!-- System Metadata Badges -->
+      <div class="status-chip" id="chip-model" title="Neural Detector Model">
+        <span class="chip-dot dot-active"></span>
+        <span class="chip-label">Model:</span>
+        <span class="chip-val" id="val-model-name">Qwen2.5-Coder-14B v13</span>
+      </div>
+      <div class="status-chip" id="chip-threshold" title="Optimal F1 Threshold: 0.8877">
+        <span class="chip-label">Threshold τ:</span>
+        <span class="chip-val" id="val-threshold">0.700</span>
+      </div>
+      <div class="status-chip" id="chip-rag" title="Vulnerability Knowledge Base Cases">
+        <span class="chip-label">RAG:</span>
+        <span class="chip-val">11,869 Cases</span>
+      </div>
+      <div class="status-chip" id="chip-gpu" title="Execution GPU Environment">
+        <span class="chip-dot dot-ready" id="dot-gpu-status"></span>
+        <span class="chip-label" id="label-gpu-chip">GPU Backend:</span>
+        <span class="chip-val" id="val-gpu-status">RTX 4070 Ti SUPER</span>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <div class="active-run-badge" id="active-run-badge" style="display: none;">
+        <span class="pulse-ring"></span>
+        <span class="run-text">Running: <strong id="header-run-id">...</strong></span>
+      </div>
+      <button class="btn btn-secondary" id="btn-refresh-status" title="Reset studio & refresh system status">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+        </svg>
+        Reset / Refresh
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Container -->
+  <main class="app-main">
+    <!-- Left Column: Input & Controls -->
+    <section class="panel-left">
+      <!-- Card: Source Code Input -->
+      <div class="card editor-card">
+        <div class="card-header">
+          <div class="card-title-group">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+              <polyline points="14 2 14 8 20 8"/>
+              <line x1="16" y1="13" x2="8" y2="13"/>
+              <line x1="16" y1="17" x2="8" y2="17"/>
+              <polyline points="10 9 9 9 8 9"/>
+            </svg>
+            <h2>Solidity Smart Contract Source</h2>
+          </div>
+          <div class="card-actions">
+            <button class="btn btn-sm btn-primary" id="btn-paste-clipboard" title="Paste Solidity code directly from Clipboard">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>
+                <rect x="8" y="2" width="8" height="4" rx="1" ry="1"/>
+              </svg>
+              Paste Code
+            </button>
+            <label class="btn btn-sm btn-outline file-upload-btn" title="Upload .sol file from local computer">
+              <input type="file" id="file-input" accept=".sol,.txt" style="display: none;">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
+              </svg>
+              Upload File
+            </label>
+            <button class="btn btn-sm btn-ghost" id="btn-clear-code" title="Clear code editor">Clear</button>
+          </div>
+        </div>
+
+        <div class="card-body">
+          <!-- File Name Input & Mode Header -->
+          <div class="form-row filename-row">
+            <div class="filename-input-wrap">
+              <span class="input-prefix">Filename:</span>
+              <input type="text" id="input-filename" class="text-input" value="CustomContract.sol" placeholder="Contract.sol">
+            </div>
+            <span class="custom-mode-badge" id="badge-code-mode">Custom Source Code</span>
+          </div>
+
+          <!-- Benchmark Contract Pills -->
+          <div class="presets-row">
+            <span class="presets-label">Or load benchmark sample:</span>
+            <div class="presets-pills">
+              <button class="preset-pill" data-example="VulnerableBank.sol" title="Reentrancy Vulnerability (SWC-107)">
+                <span class="badge-dot dot-red"></span> VulnerableBank (SWC-107)
+              </button>
+              <button class="preset-pill" data-example="AccessControl.sol" title="Access Control tx.origin (SWC-105/115)">
+                <span class="badge-dot dot-orange"></span> AccessControl (SWC-105)
+              </button>
+              <button class="preset-pill" data-example="Signature.sol" title="Signature Replay Vulnerability (SWC-114)">
+                <span class="badge-dot dot-yellow"></span> Signature (SWC-114)
+              </button>
+              <button class="preset-pill" data-example="SafeBank.sol" title="Clean & Verified Contract">
+                <span class="badge-dot dot-green"></span> SafeBank (Clean / Verified)
+              </button>
+            </div>
+          </div>
+
+          <!-- Code Editor Box -->
+          <div class="editor-wrapper" id="editor-dropzone">
+            <div class="editor-lines" id="editor-lines">1</div>
+            <textarea id="code-editor" class="code-textarea" spellcheck="false" placeholder="// Paste or write your Solidity smart contract code here...
+// The editor automatically formats line breaks and detects the Contract name.
+
+pragma solidity ^0.8.0;
+
+contract MyContract {
+    // Write or paste your contract code here...
+}"></textarea>
+            <div class="drop-overlay" id="drop-overlay">
+              <div class="drop-message">
+                <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#00f2fe" stroke-width="2">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
+                </svg>
+                <p>Drop Solidity (.sol) file here</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- Editor Footer Stats -->
+          <div class="editor-footer">
+            <div class="stat-item"><span id="stat-lines">0</span> lines</div>
+            <div class="stat-item"><span id="stat-chars">0</span> chars</div>
+            <div class="stat-item"><span id="stat-size">0 KB</span></div>
+            <button class="btn-copy-code" id="btn-copy-editor" title="Copy full source code">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+              </svg>
+              Copy Code
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Card: Audit Configuration & Execution -->
+      <div class="card config-card">
+        <div class="card-header">
+          <div class="card-title-group">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+            <h2>Audit Pipeline Configuration</h2>
+          </div>
+        </div>
+
+        <div class="card-body">
+          <!-- Start Action Bar -->
+          <div class="action-bar action-bar-top" style="margin-top: 0; margin-bottom: 16px;">
+            <button class="btn btn-primary btn-large btn-audit" id="btn-start-audit">
+              <span class="btn-icon">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polygon points="5 3 19 12 5 21 5 3"/>
+                </svg>
+              </span>
+              <span class="btn-text">START SECURITY AUDIT</span>
+            </button>
+            <button class="btn btn-danger btn-large btn-cancel" id="btn-cancel-audit" style="display: none;">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+              </svg>
+              Abort Process
+            </button>
+          </div>
+
+          <!-- Backend Selector -->
+          <div class="form-group">
+            <label class="form-label">Execution Environment (Backend):</label>
+            <div class="backend-selector-grid">
+              <label class="backend-option selected" for="backend-server-gpu">
+                <input type="radio" name="backend" id="backend-server-gpu" value="server_gpu" checked>
+                <div class="backend-content">
+                  <div class="backend-header">
+                    <span class="backend-name">Dedicated GPU Server (v13)</span>
+                    <span class="tag-gpu">RTX 4070 Ti SUPER</span>
+                  </div>
+                  <p class="backend-desc">Runs on dedicated local GPU server. Complete 6-phase audit &amp; automated repair in 5–15s.</p>
+                </div>
+              </label>
+
+              <label class="backend-option" for="backend-kaggle">
+                <input type="radio" name="backend" id="backend-kaggle" value="kaggle">
+                <div class="backend-content">
+                  <div class="backend-header">
+                    <span class="backend-name">Kaggle GPU Cloud</span>
+                    <span class="tag-gpu">Tesla T4</span>
+                  </div>
+                  <p class="backend-desc">Cloud computing kernel on Kaggle Cloud (Tesla T4 GPU 16GB VRAM).</p>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <!-- Threshold Slider -->
+          <div class="form-group threshold-group">
+            <div class="slider-header">
+              <label for="threshold-slider" class="form-label">Neural Classifier Threshold (Detector τ):</label>
+              <div class="slider-value-tag">
+                <span id="slider-threshold-val">0.700</span>
+                <span class="v11-badge">v13 Standard</span>
+              </div>
+            </div>
+            <input type="range" id="threshold-slider" min="0.10" max="0.95" step="0.005" value="0.700" class="range-slider">
+            <div class="slider-ticks">
+              <span>0.10 (High Recall)</span>
+              <span class="optimal-tick">0.700 (Optimal F1 0.8877)</span>
+              <span>0.95 (High Precision)</span>
+            </div>
+          </div>
+
+          <!-- Security Tools Toggle -->
+          <div class="form-group tools-group" style="margin-bottom: 0;">
+            <label class="form-label">Integrated Security Engines:</label>
+            <div class="tools-toggle-row">
+              <label class="checkbox-label">
+                <input type="checkbox" id="tool-slither" checked disabled>
+                <span class="checkbox-custom"></span>
+                <span>Slither Static Engine</span>
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="tool-solc" checked disabled>
+                <span class="checkbox-custom"></span>
+                <span>Solc AST &amp; Compiler Verify</span>
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Right Column: Workspace & Results -->
+    <section class="panel-right">
+      <!-- Tabs Navigation -->
+      <nav class="tabs-header">
+        <button class="tab-btn active" data-tab="tab-tracker">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+          </svg>
+          <span>Pipeline &amp; Logs</span>
+          <span class="tab-badge badge-running" id="tab-tracker-badge" style="display: none;">Running</span>
+        </button>
+
+        <button class="tab-btn" data-tab="tab-findings">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/>
+            <line x1="12" y1="8" x2="12" y2="12"/>
+            <line x1="12" y1="16" x2="12.01" y2="16"/>
+          </svg>
+          <span>Findings &amp; Vulnerabilities</span>
+          <span class="tab-badge" id="tab-findings-badge">0</span>
+        </button>
+
+        <button class="tab-btn" data-tab="tab-diff">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M16 3h5v5"/>
+            <path d="M4 20L21 3"/>
+            <path d="M21 16v5h-5"/>
+            <path d="M15 15l6 6"/>
+            <path d="M4 4l5 5"/>
+          </svg>
+          <span>Source vs Patched Diff</span>
+        </button>
+
+        <button class="tab-btn" data-tab="tab-report">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <line x1="16" y1="13" x2="8" y2="13"/>
+            <line x1="16" y1="17" x2="8" y2="17"/>
+            <polyline points="10 9 9 9 8 9"/>
+          </svg>
+          <span>Audit Reports</span>
+        </button>
+
+        <button class="tab-btn" data-tab="tab-history">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/>
+            <polyline points="12 6 12 12 16 14"/>
+          </svg>
+          <span>Run History</span>
+          <span class="tab-badge" id="tab-history-badge">0</span>
+        </button>
+      </nav>
+
+      <!-- Tab Contents Area -->
+      <div class="tab-contents">
+        <!-- ================= TAB 1: PIPELINE TRACKER & LIVE LOGS ================= -->
+        <div class="tab-pane active" id="tab-tracker">
+          <!-- Pipeline Visual Stepper -->
+          <div class="card stepper-card">
+            <div class="stepper-header">
+              <div class="stepper-title-wrap">
+                <h3>Multi-Phase Pipeline (Architecture)</h3>
+                <span class="stepper-run-id" id="stepper-run-title">No active run</span>
+              </div>
+              <div class="stepper-status-pill" id="stepper-overall-status">Ready</div>
+            </div>
+
+            <div class="pipeline-grid" id="pipeline-steps">
+              <!-- Phase 0 -->
+              <div class="step-card step-pending" id="step-phase0" data-phase="phase0">
+                <div class="step-icon-wrap">
+                  <span class="step-num">0</span>
+                  <span class="step-status-tag">WAIT</span>
+                </div>
+                <div class="step-info">
+                  <div class="step-name">Phase 0: Input &amp; AST</div>
+                  <div class="step-desc">Parse syntax, generate AST &amp; normalize code</div>
+                </div>
+              </div>
+
+              <!-- Phase 1A -->
+              <div class="step-card step-pending" id="step-phase1a" data-phase="phase1a">
+                <div class="step-icon-wrap">
+                  <span class="step-num">1A</span>
+                  <span class="step-status-tag">WAIT</span>
+                </div>
+                <div class="step-info">
+                  <div class="step-name">Phase 1A: Slither Static</div>
+                  <div class="step-desc">Slither analysis &amp; rule-based SWC detection</div>
+                </div>
+              </div>
+
+              <!-- Phase 1B -->
+              <div class="step-card step-pending" id="step-phase1b" data-phase="phase1b">
+                <div class="step-icon-wrap">
+                  <span class="step-num">1B</span>
+                  <span class="step-status-tag">WAIT</span>
+                </div>
+                <div class="step-info">
+                  <div class="step-name">Phase 1B: RAG Retrieval</div>
+                  <div class="step-desc">Retrieve from 11,869 similar vulnerability cases</div>
+                </div>
+              </div>
+
+              <!-- Phase 1C -->
+              <div class="step-card step-pending" id="step-phase1c" data-phase="phase1c">
+                <div class="step-icon-wrap">
+                  <span class="step-num">1C</span>
+                  <span class="step-status-tag">WAIT</span>
+                </div>
+                <div class="step-info">
+                  <div class="step-name">Phase 1C: Qwen2.5-14B Detector</div>
+                  <div class="step-desc">Neural inference with LoRA v13 (τ = 0.700)</div>
+                </div>
+              </div>
+
+              <!-- Phase 1 Fusion -->
+              <div class="step-card step-pending" id="step-fusion" data-phase="fusion">
+                <div class="step-icon-wrap">
+                  <span class="step-num">1F</span>
+                  <span class="step-status-tag">WAIT</span>
+                </div>
+                <div class="step-info">
+                  <div class="step-name">Phase 1: Multi-Modal Fusion</div>
+                  <div class="step-desc">Consolidate Slither + RAG 11.8k + Qwen v13</div>
+                </div>
+              </div>
+
+              <!-- Phase 2 Advisor -->
+              <div class="step-card step-pending" id="step-phase2" data-phase="phase2">
+                <div class="step-icon-wrap">
+                  <span class="step-num">2</span>
+                  <span class="step-status-tag">WAIT</span>
+                </div>
+                <div class="step-info">
+                  <div class="step-name">Phase 2: Security Advisor (Qwen 14B)</div>
+                  <div class="step-desc">Analyze root cause &amp; PoC exploit scenarios</div>
+                </div>
+              </div>
+
+              <!-- Phase 3 Assessor -->
+              <div class="step-card step-pending" id="step-phase3" data-phase="phase3">
+                <div class="step-icon-wrap">
+                  <span class="step-num">3</span>
+                  <span class="step-status-tag">WAIT</span>
+                </div>
+                <div class="step-info">
+                  <div class="step-name">Phase 3: Impact Assessor (Qwen 14B)</div>
+                  <div class="step-desc">Evaluate CVSS, exploitability &amp; patch priority</div>
+                </div>
+              </div>
+
+              <!-- Phase 4 Fixer -->
+              <div class="step-card step-pending" id="step-phase4" data-phase="phase4">
+                <div class="step-icon-wrap">
+                  <span class="step-num">4</span>
+                  <span class="step-status-tag">WAIT</span>
+                </div>
+                <div class="step-info">
+                  <div class="step-name">Phase 4: Automated Fixer (Qwen 14B)</div>
+                  <div class="step-desc">Generate secure remediation code &amp; AST patches</div>
+                </div>
+              </div>
+
+              <!-- Phase 5 Verifier -->
+              <div class="step-card step-pending" id="step-phase5" data-phase="phase5">
+                <div class="step-icon-wrap">
+                  <span class="step-num">5</span>
+                  <span class="step-status-tag">WAIT</span>
+                </div>
+                <div class="step-info">
+                  <div class="step-name">Phase 5: Dual Verification (Qwen 14B)</div>
+                  <div class="step-desc">Solc compilation &amp; Qwen re-check verification</div>
+                </div>
+              </div>
+
+              <!-- Phase 6 Reporter -->
+              <div class="step-card step-pending" id="step-phase6" data-phase="phase6">
+                <div class="step-icon-wrap">
+                  <span class="step-num">6</span>
+                  <span class="step-status-tag">WAIT</span>
+                </div>
+                <div class="step-info">
+                  <div class="step-name">Phase 6: Executive Reporter</div>
+                  <div class="step-desc">Generate comprehensive PDF / HTML / Markdown reports</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Realtime Terminal Console -->
+          <div class="card terminal-card">
+            <div class="terminal-header">
+              <div class="terminal-dots">
+                <span class="mac-dot red"></span>
+                <span class="mac-dot yellow"></span>
+                <span class="mac-dot green"></span>
+              </div>
+              <div class="terminal-title">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="4 17 10 11 4 5"/>
+                  <line x1="12" y1="19" x2="20" y2="19"/>
+                </svg>
+                <span>Live Pipeline Execution Console</span>
+              </div>
+              <div class="terminal-controls">
+                <label class="autoscroll-toggle">
+                  <input type="checkbox" id="chk-autoscroll" checked>
+                  <span>Autoscroll</span>
+                </label>
+                <button class="btn-term" id="btn-copy-logs" title="Copy full console log">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                  </svg>
+                  Copy Logs
+                </button>
+                <button class="btn-term" id="btn-clear-logs" title="Clear console screen">Clear</button>
+              </div>
+            </div>
+
+            <!-- Terminal Phase Filter Bar -->
+            <div class="terminal-filter-bar" id="terminal-filter-bar">
+              <span class="filter-label">Filter Logs By Phase:</span>
+              <div class="filter-pills-wrap">
+                <button class="phase-filter-pill active" data-phase="all">All Logs</button>
+                <button class="phase-filter-pill" data-phase="phase0">Phase 0</button>
+                <button class="phase-filter-pill" data-phase="phase1a">Phase 1A</button>
+                <button class="phase-filter-pill" data-phase="phase1b">Phase 1B</button>
+                <button class="phase-filter-pill" data-phase="phase1c">Phase 1C</button>
+                <button class="phase-filter-pill" data-phase="fusion">Phase 1F</button>
+                <button class="phase-filter-pill" data-phase="phase2">Phase 2</button>
+                <button class="phase-filter-pill" data-phase="phase3">Phase 3</button>
+                <button class="phase-filter-pill" data-phase="phase4">Phase 4</button>
+                <button class="phase-filter-pill" data-phase="phase5">Phase 5</button>
+                <button class="phase-filter-pill" data-phase="phase6">Phase 6</button>
+              </div>
+            </div>
+
+            <div class="terminal-body" id="terminal-body">
+              <div class="log-line log-system">[System] Audit studio initialized. Ready to audit smart contracts.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ================= TAB 2: AUDIT FINDINGS ================= -->
+        <div class="tab-pane" id="tab-findings">
+          <!-- Verdict Hero Banner -->
+          <div class="verdict-banner" id="verdict-banner">
+            <div class="verdict-main">
+              <div class="verdict-badge-wrap">
+                <div class="verdict-badge" id="verdict-status-badge">NOT AUDITED</div>
+                <div class="verdict-meta" id="verdict-meta-text">Select a previous run or click &quot;START SECURITY AUDIT&quot;</div>
+              </div>
+              <div class="verdict-score-gauge">
+                <div class="gauge-value" id="gauge-score-val">0.00</div>
+                <div class="gauge-label">Risk Score (0 - 1)</div>
+              </div>
+            </div>
+
+            <!-- Metric Cards -->
+            <div class="metrics-grid">
+              <div class="metric-box">
+                <div class="metric-num text-red" id="metric-findings-count">0</div>
+                <div class="metric-lbl">Vulnerabilities Found</div>
+              </div>
+              <div class="metric-box">
+                <div class="metric-num text-orange" id="metric-verified-count">0</div>
+                <div class="metric-lbl">Dual-Verified Findings</div>
+              </div>
+              <div class="metric-box">
+                <div class="metric-num text-cyan" id="metric-rag-similar">0</div>
+                <div class="metric-lbl">RAG Similar Cases</div>
+              </div>
+              <div class="metric-box">
+                <div class="metric-num text-green" id="metric-fixed-status">Pending</div>
+                <div class="metric-lbl">Automated Patch Status</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Card: Audited Source Code View -->
+          <div class="card audited-code-card" id="card-audited-code" style="display: none; margin-bottom: 20px;">
+            <div class="card-header" style="cursor: pointer; justify-content: space-between;" id="header-audited-code-toggle">
+              <div class="card-title-group">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#00f2fe" stroke-width="2">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                  <polyline points="14 2 14 8 20 8"/>
+                  <line x1="16" y1="13" x2="8" y2="13"/>
+                  <line x1="16" y1="17" x2="8" y2="17"/>
+                  <polyline points="10 9 9 9 8 9"/>
+                </svg>
+                <h3 style="font-size: 0.92rem;">Audited Contract Code: <span id="audited-code-filename" style="color: #00f2fe; font-family: var(--font-mono);">Contract.sol</span></h3>
+              </div>
+              <div class="card-actions" style="display: flex; align-items: center; gap: 8px;">
+                <span class="pane-meta" id="audited-code-lines-count">0 lines</span>
+                <button class="btn btn-sm btn-ghost" id="btn-toggle-audited-code">Toggle Code</button>
+              </div>
+            </div>
+            <div class="card-body" id="body-audited-code" style="padding: 0; max-height: 240px; overflow-y: auto; background: #070a10; border-radius: 0 0 var(--radius-md) var(--radius-md);">
+              <pre style="margin: 0; padding: 12px 16px; font-family: var(--font-mono); font-size: 12px; line-height: 1.5; color: #e2e8f0; white-space: pre-wrap;"><code id="code-audited-display"></code></pre>
+            </div>
+          </div>
+
+          <!-- Findings List Card -->
+          <div class="card findings-card">
+            <div class="card-header findings-header">
+              <div class="card-title-group">
+                <h3>Vulnerability Findings</h3>
+              </div>
+              <div class="findings-filter-bar">
+                <button class="filter-chip active" data-filter="all">All</button>
+                <button class="filter-chip" data-filter="High">High</button>
+                <button class="filter-chip" data-filter="Medium">Medium</button>
+                <button class="filter-chip" data-filter="Low">Low</button>
+              </div>
+            </div>
+
+            <div class="card-body">
+              <div class="findings-list" id="findings-container">
+                <div class="empty-placeholder">
+                  <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <circle cx="12" cy="12" r="10"/>
+                    <path d="M12 8v4M12 16h.01"/>
+                  </svg>
+                  <p>No vulnerability findings yet. Please run an audit or select a past run from History.</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ================= TAB 3: CODE DIFF & PATCHES ================= -->
+        <div class="tab-pane" id="tab-diff">
+          <div class="card diff-card">
+            <div class="card-header diff-header">
+              <div class="card-title-group">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M16 3h5v5"/>
+                  <path d="M4 20L21 3"/>
+                  <path d="M21 16v5h-5"/>
+                  <path d="M15 15l6 6"/>
+                  <path d="M4 4l5 5"/>
+                </svg>
+                <h3>Side-by-Side Patch Comparison</h3>
+              </div>
+              <div class="diff-actions">
+                <div class="diff-view-toggle">
+                  <button class="btn btn-sm btn-ghost active" id="btn-view-side-by-side">Side-by-Side (Split)</button>
+                  <button class="btn btn-sm btn-ghost" id="btn-view-unified">Unified Diff</button>
+                </div>
+                <span class="verification-badge" id="diff-verification-status">Unverified</span>
+                <button class="btn btn-sm btn-outline" id="btn-copy-patch">Copy Patched Code</button>
+                <button class="btn btn-sm btn-primary" id="btn-download-fixed">Download Fixed .sol</button>
+              </div>
+            </div>
+
+            <div class="card-body diff-body">
+              <!-- Side-by-side Split View -->
+              <div class="side-by-side-diff" id="side-by-side-container">
+                <!-- Column 1: Original Contract -->
+                <div class="diff-pane diff-pane-original">
+                  <div class="diff-pane-header">
+                    <span class="pane-title">Original Contract</span>
+                    <span class="pane-meta" id="orig-code-meta">0 lines</span>
+                  </div>
+                  <div class="diff-code-wrapper" id="orig-code-wrapper">
+                    <div class="diff-code-lines" id="orig-line-numbers">1</div>
+                    <div class="diff-code-content" id="orig-code-content">
+                      <div class="empty-diff-hint">No original contract loaded.</div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Column 2: Secured / Patched Contract -->
+                <div class="diff-pane diff-pane-fixed">
+                  <div class="diff-pane-header">
+                    <span class="pane-title">Secured Contract (Patched)</span>
+                    <span class="pane-meta" id="fixed-code-meta">0 lines</span>
+                  </div>
+                  <div class="diff-code-wrapper" id="fixed-code-wrapper">
+                    <div class="diff-code-lines" id="fixed-line-numbers">1</div>
+                    <div class="diff-code-content" id="fixed-code-content">
+                      <div class="empty-diff-hint">No automated patch generated yet.</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Unified Diff Container -->
+              <div class="diff-container" id="diff-content" style="display: none;">
+                <div class="empty-placeholder">
+                  <p>No automated patch generated yet. After Phase 4 (Fixer) completes, diff comparison will be rendered here.</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ================= TAB 4: OFFICIAL REPORTS ================= -->
+        <div class="tab-pane" id="tab-report">
+          <div class="card report-card">
+            <div class="card-header report-header">
+              <div class="card-title-group">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                  <polyline points="14 2 14 8 20 8"/>
+                  <line x1="16" y1="13" x2="8" y2="13"/>
+                  <line x1="16" y1="17" x2="8" y2="17"/>
+                  <polyline points="10 9 9 9 8 9"/>
+                </svg>
+                <h3>Executive Security Audit Report</h3>
+              </div>
+              <div class="report-downloads">
+                <a href="#" class="btn btn-sm btn-primary" id="link-download-pdf" target="_blank" download>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>
+                  </svg>
+                  Download PDF Report
+                </a>
+                <a href="#" class="btn btn-sm btn-outline" id="link-download-html" target="_blank">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"/>
+                    <line x1="2" y1="12" x2="22" y2="12"/>
+                    <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+                  </svg>
+                  Open HTML Report
+                </a>
+                <a href="#" class="btn btn-sm btn-ghost" id="link-download-md" target="_blank" download>
+                  Markdown
+                </a>
+              </div>
+            </div>
+
+            <div class="card-body report-iframe-wrap">
+              <iframe id="report-frame" src="about:blank" title="Audit Report Preview"></iframe>
+              <div class="report-placeholder" id="report-empty">
+                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                  <polyline points="14 2 14 8 20 8"/>
+                </svg>
+                <p>Executive audit report will be automatically rendered here upon completion of Phase 6.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ================= TAB 5: RUNS HISTORY ================= -->
+        <div class="tab-pane" id="tab-history">
+          <div class="card history-card">
+            <div class="card-header history-header">
+              <div class="card-title-group">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="12" cy="12" r="10"/>
+                  <polyline points="12 6 12 12 16 14"/>
+                </svg>
+                <h3>Security Audit Run History</h3>
+              </div>
+              <button class="btn btn-sm btn-outline" id="btn-refresh-history">Refresh List</button>
+            </div>
+
+            <div class="card-body history-table-wrap">
+              <table class="history-table">
+                <thead>
+                  <tr>
+                    <th>Run ID</th>
+                    <th>Contract</th>
+                    <th>Timestamp</th>
+                    <th>Status</th>
+                    <th>Verdict</th>
+                    <th>Risk Score</th>
+                    <th>Findings</th>
+                    <th>Reports</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="history-table-body">
+                  <tr>
+                    <td colspan="9" class="text-center">Loading audit history...</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Notification Toast Container -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <!-- App JavaScript -->
+  <script src="/static/app.js?v=20261009-120500"></script>
+</body>
+</html>

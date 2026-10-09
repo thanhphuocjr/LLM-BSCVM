@@ -128,7 +128,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="cpu", help="Device for phase-1 detection: auto | cpu | cuda | mps.")
     parser.add_argument("--backend", default="auto", help="LLM backend: auto (.env LLM_BACKEND) | gemini | ollama.")
-    parser.add_argument("--knowledge-dir", default=str(PROJECT_ROOT / "rag" / "knowledge_store"))
+    parser.add_argument(
+        "--knowledge-dir",
+        default=str(
+            PROJECT_ROOT / "E2E" / "data" / "runtime"
+            if (PROJECT_ROOT / "E2E" / "data" / "runtime").exists()
+            else PROJECT_ROOT / "rag" / "knowledge_store"
+        ),
+    )
     parser.add_argument("--output", default=None, help="Optional JSON output path.")
     parser.add_argument("--include-upstream", action="store_true", help="Embed every upstream agent output.")
     return parser.parse_args()

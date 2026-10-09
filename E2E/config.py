@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 E2E_ROOT = Path(__file__).resolve().parent
 DATA_DIR = E2E_ROOT / "data"
 SOURCE_DATA_DIR = DATA_DIR / "source"
@@ -12,11 +13,15 @@ MODEL_DIR = E2E_ROOT / "models"
 DETECTOR_ADAPTER_DIR = MODEL_DIR / "codellama-vuln-detector"
 SCHEMA_DIR = E2E_ROOT / "schemas"
 KAGGLE_DIR = E2E_ROOT / "kaggle"
+VULNERABILITY_KNOWLEDGE_PATH = PROJECT_ROOT / "final_vulnerability_knowledge" / "final-vulnerability-knowledge.json"
 
 SCHEMA_VERSION = "1.0.0"
 PIPELINE_VERSION = "1.0.0"
 
 DEFAULT_FINAL_THRESHOLD = 0.50
+DEFAULT_DETECTOR_THRESHOLD = 0.700
+DEFAULT_DETECTOR_BASE_MODEL = "Qwen/Qwen2.5-Coder-14B-Instruct"
+DEFAULT_DETECTOR_MAX_LEN = 1024
 DEFAULT_COMPONENT_WEIGHTS = {
     "llm_detector": 0.65,
     "rag": 0.15,

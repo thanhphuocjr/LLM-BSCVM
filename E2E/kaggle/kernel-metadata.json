@@ -8,12 +8,13 @@
   "enable_gpu": true,
   "enable_internet": true,
   "machine_shape": "NvidiaTeslaT4",
-  "dataset_sources": [],
-  "competition_sources": [],
-  "kernel_sources": [
-    "ntpuet/codellama"
+  "dataset_sources": [
+    "thanhphuocjr/codellama-v11-13b-detector-final"
   ],
+  "competition_sources": [],
+  "kernel_sources": [],
   "model_sources": [
+    "metaresearch/codellama/PyTorch/13b-hf/1",
     "metaresearch/codellama/PyTorch/7b-hf/1",
     "metaresearch/codellama/PyTorch/7b-instruct-hf/1"
   ]

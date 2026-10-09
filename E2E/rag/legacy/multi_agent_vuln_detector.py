@@ -1,30 +1,24 @@
+from __future__ import annotations
+
 import argparse
 import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Any, Dict, List, Sequence
 
-try:
-    from .retrieve_best_vuln import (
-        CODE,
-        DEVICE,
-        KNOWLEDGE_DIR,
-        MAX_INPUT_CHARS,
-        MAX_SEQ_LENGTH,
-        MODEL_NAME,
-        KnowledgeBaseRetriever,
-    )
-except ImportError:
-    # Signal matching remains usable without sentence-transformers. The E2E
-    # runtime uses its local TF-IDF retriever and imports these restored rules.
-    CODE = ""
-    DEVICE = "cpu"
-    KNOWLEDGE_DIR = ""
-    MAX_INPUT_CHARS = 15000
-    MAX_SEQ_LENGTH = 512
-    MODEL_NAME = "BAAI/bge-m3"
-    KnowledgeBaseRetriever = None
+CODE = ""
+DEVICE = "cpu"
+KNOWLEDGE_DIR = ""
+MAX_INPUT_CHARS = 15000
+MAX_SEQ_LENGTH = 512
+MODEL_NAME = "BAAI/bge-m3"
+class KnowledgeBaseRetriever:
+    """Placeholder for legacy sentence-transformers retriever."""
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+    def search_many(self, *args: Any, **kwargs: Any) -> list:
+        return []
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]

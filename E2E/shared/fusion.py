@@ -3,7 +3,12 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-from E2E.config import DEFAULT_COMPONENT_WEIGHTS, DEFAULT_FINAL_THRESHOLD, RISK_ORDER
+from E2E.config import (
+    DEFAULT_COMPONENT_WEIGHTS,
+    DEFAULT_DETECTOR_THRESHOLD,
+    DEFAULT_FINAL_THRESHOLD,
+    RISK_ORDER,
+)
 
 
 def _score(component: dict[str, Any]) -> float:
@@ -16,7 +21,16 @@ def _score(component: dict[str, Any]) -> float:
 
 
 def _active(component: dict[str, Any]) -> bool:
-    return component.get("status") == "ok"
+    if not isinstance(component, dict):
+        return False
+    if component.get("status") == "ok":
+        return True
+    if component.get("verdict") in {"Vulnerable", "Safe", "Inconclusive"} and (
+        component.get("vulnerability_probability") is not None
+        or component.get("score") is not None
+    ):
+        return True
+    return False
 
 
 def merge_findings(static_result: dict[str, Any], rag_result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -61,6 +75,23 @@ def merge_findings(static_result: dict[str, Any], rag_result: dict[str, Any]) ->
                     (item.get("checklist") for item in evidence if item.get("checklist")),
                     [],
                 ),
+                "fixed_code": next(
+                    (item.get("fixed_code") for item in evidence if item.get("fixed_code")),
+                    "",
+                ),
+                "vulnerable_code": next(
+                    (item.get("vulnerable_code") for item in evidence if item.get("vulnerable_code")),
+                    "",
+                ),
+                "best_match_id": next(
+                    (item.get("best_match_id") for item in evidence if item.get("best_match_id")),
+                    None,
+                ),
+                "similarity_score": next(
+                    (item.get("similarity_score") for item in evidence if item.get("similarity_score") is not None),
+                    None,
+                ),
+                "has_code_patch": any(bool(item.get("has_code_patch", bool(item.get("fixed_code")))) for item in evidence),
                 "evidence": evidence,
             }
         )
@@ -77,28 +108,37 @@ def detector_findings(
 ) -> list[dict[str, Any]]:
     local_units = {item.get("unit_id") for item in local_findings}
     results = detector.get("unit_results", [])
-    return [
-        {
-            "finding_id": f"UNMAPPED:{item.get('unit_id') or 'source'}",
-            "swc": "UNMAPPED",
-            "unit_id": item.get("unit_id"),
-            "title": "CodeLlama binary vulnerability signal",
-            "severity": "Unknown",
-            "confidence": round(float(item.get("vulnerability_probability") or 0.0), 6),
-            "sources": ["llm_detector"],
-            "corroborated": False,
-            "line": item.get("start_line"),
-            "description": (
-                "The fine-tuned binary classifier crossed its vulnerability threshold. "
-                "Static/RAG did not assign a supported SWC category to this unit."
-            ),
-            "remediation": "Perform targeted manual review and use the Advisor phase for root-cause analysis.",
-            "checklist": [],
-            "evidence": [item],
-        }
-        for item in results
-        if item.get("label") == "Vulnerable" and item.get("unit_id") not in local_units
-    ]
+    findings = []
+    for item in results:
+        if item.get("label") == "Vulnerable" and item.get("unit_id") not in local_units:
+            start_line = item.get("start_line")
+            line_scores = item.get("line_scores")
+            line = item.get("line") or start_line
+            if line_scores and isinstance(line_scores, list) and line_scores and start_line and not line:
+                max_idx = line_scores.index(max(line_scores))
+                line = start_line + max_idx
+            findings.append({
+                "finding_id": f"UNMAPPED:{item.get('unit_id') or 'source'}",
+                "swc": "UNMAPPED",
+                "unit_id": item.get("unit_id"),
+                "title": "CodeLlama binary vulnerability signal",
+                "severity": "Unknown",
+                "confidence": round(float(item.get("vulnerability_probability") or 0.0), 6),
+                "sources": ["llm_detector"],
+                "corroborated": False,
+                "line": line,
+                "start_line": start_line,
+                "end_line": item.get("end_line"),
+                "line_scores": line_scores,
+                "description": (
+                    "The fine-tuned binary classifier crossed its vulnerability threshold. "
+                    "Static/RAG did not assign a supported SWC category to this unit."
+                ),
+                "remediation": "Perform targeted manual review and use the Advisor phase for root-cause analysis.",
+                "checklist": [],
+                "evidence": [item],
+            })
+    return findings
 
 
 def fuse_detection(
@@ -142,7 +182,7 @@ def fuse_detection(
     if any(finding["corroborated"] for finding in local_findings):
         score = max(score, 0.72)
         decision_rules.append("static_rag_corroboration_floor")
-    detector_threshold = float(detector.get("threshold") or 0.25)
+    detector_threshold = float(detector.get("threshold") or DEFAULT_DETECTOR_THRESHOLD)
     if _active(detector) and component_scores["llm_detector"] >= detector_threshold:
         score = max(score, 0.58)
         decision_rules.append("llm_detector_threshold_floor")
@@ -170,6 +210,23 @@ def fuse_detection(
         analysis_status = "inconclusive"
     binary_findings = detector_findings(detector, local_findings)
     evidence_findings = [*local_findings, *binary_findings]
+    unit_map = {item.get("unit_id"): item for item in detector.get("unit_results", []) if item.get("unit_id")}
+    for finding in evidence_findings:
+        uid = finding.get("unit_id")
+        if uid and uid in unit_map:
+            u_res = unit_map[uid]
+            st_line = u_res.get("start_line")
+            end_line = u_res.get("end_line")
+            l_scores = u_res.get("line_scores")
+            if st_line and not finding.get("start_line"):
+                finding["start_line"] = st_line
+            if end_line and not finding.get("end_line"):
+                finding["end_line"] = end_line
+            if l_scores and isinstance(l_scores, list) and l_scores:
+                finding["line_scores"] = l_scores
+                if not finding.get("line") and st_line:
+                    max_idx = l_scores.index(max(l_scores))
+                    finding["line"] = st_line + max_idx
     findings = evidence_findings if verdict == "Vulnerable" else []
     candidate_findings = evidence_findings if verdict != "Vulnerable" else []
     risk_level = findings[0]["severity"] if findings and verdict == "Vulnerable" else "None"

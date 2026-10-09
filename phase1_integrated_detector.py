@@ -67,20 +67,32 @@ DEFAULT_DETECTOR_ADAPTER = project_relative_path(
 DEFAULT_DETECTOR_BASE_MODEL = os.environ.get("DETECTOR_BASE_MODEL", "auto")
 DEFAULT_DETECTOR_INPUT_MODE = os.environ.get("DETECTOR_INPUT_MODE", "auto")
 DEFAULT_DETECTOR_LOAD_IN_4BIT = os.environ.get("DETECTOR_LOAD_IN_4BIT", "auto")
-DEFAULT_RAG_KNOWLEDGE_DIR = PROJECT_ROOT / "rag" / "knowledge_store"
-DEFAULT_TFIDF_DIR = PROJECT_ROOT / "rag" / "tfidf_store"
+DEFAULT_RAG_KNOWLEDGE_DIR = (
+    PROJECT_ROOT / "E2E" / "data" / "runtime"
+    if (PROJECT_ROOT / "E2E" / "data" / "runtime").exists()
+    else PROJECT_ROOT / "rag" / "knowledge_store"
+)
+DEFAULT_TFIDF_DIR = (
+    PROJECT_ROOT / "E2E" / "data" / "runtime"
+    if (PROJECT_ROOT / "E2E" / "data" / "runtime").exists()
+    else PROJECT_ROOT / "rag" / "tfidf_store"
+)
 DEFAULT_RAG_MODEL_NAME = "BAAI/bge-m3"
-DEFAULT_SWC_REGISTRY = PROJECT_ROOT / "dataset" / "swc_registry.json"
+DEFAULT_SWC_REGISTRY = (
+    PROJECT_ROOT / "E2E" / "data" / "runtime" / "swc_registry.json"
+    if (PROJECT_ROOT / "E2E" / "data" / "runtime" / "swc_registry.json").exists()
+    else PROJECT_ROOT / "dataset" / "swc_registry.json"
+)
 
 LABEL2ID = {"Safe": 0, "Vulnerable": 1}
 ID2LABEL = {0: "Safe", 1: "Vulnerable"}
-DEFAULT_LLM_THRESHOLD = 0.40
+DEFAULT_LLM_THRESHOLD = 0.700
 DEFAULT_FINAL_THRESHOLD = 0.50
 
 DEFAULT_WEIGHTS = {
-    "llm": 0.15,
-    "rag": 0.25,
-    "static_analysis": 0.60,
+    "llm": 0.65,
+    "rag": 0.15,
+    "static_analysis": 0.20,
 }
 
 STATIC_RISK_SCORE_FLOORS = {
@@ -230,7 +242,7 @@ class CodeBertVulnerabilityDetector:
     ) -> None:
         self.adapter_path = Path(adapter_path)
         self.detector_config = self._load_detector_config(self.adapter_path)
-        self.base_model = self._resolve_base_model(base_model, self.detector_config)
+        self.base_model = self._resolve_base_model(base_model, self.detector_config, self.adapter_path)
         self.device_name = resolve_torch_device(device)
         self.max_tokens = max_tokens or int(
             self.detector_config.get("max_len")
@@ -309,7 +321,11 @@ class CodeBertVulnerabilityDetector:
         return {}
 
     @staticmethod
-    def _resolve_base_model(base_model: str | None, detector_config: dict[str, Any]) -> str:
+    def _resolve_base_model(
+        base_model: str | None,
+        detector_config: dict[str, Any],
+        adapter_path: Path | None = None,
+    ) -> str:
         if base_model and base_model not in {"auto", "config", "default"}:
             return base_model
 
@@ -319,7 +335,15 @@ class CodeBertVulnerabilityDetector:
             return configured
         if hf_model:
             return hf_model
-        return "codellama/CodeLlama-7b-hf"
+        if adapter_path and (adapter_path / "adapter_config.json").exists():
+            try:
+                ad_data = json.loads((adapter_path / "adapter_config.json").read_text(encoding="utf-8"))
+                bm = str(ad_data.get("base_model_name_or_path") or "").strip()
+                if bm:
+                    return bm
+            except Exception:
+                pass
+        return "Qwen/Qwen2.5-Coder-14B-Instruct"
 
     @staticmethod
     def _resolve_input_mode(
@@ -329,13 +353,15 @@ class CodeBertVulnerabilityDetector:
         detector_config: dict[str, Any],
     ) -> str:
         normalized = (input_mode or "auto").strip().lower()
-        if normalized not in {"auto", "pair", "code", "function_tag"}:
-            raise ValueError("--detector-input-mode must be auto, pair, code, or function_tag.")
+        if normalized not in {"auto", "pair", "code", "function_tag", "instruction"}:
+            raise ValueError("--detector-input-mode must be auto, pair, code, function_tag, or instruction.")
         if normalized != "auto":
             return normalized
 
         train_mode = str(detector_config.get("train_mode") or "").lower()
         model_hint = f"{base_model} {adapter_path} {train_mode}".lower()
+        if "instruction_prompt" in detector_config or "qwen" in model_hint:
+            return "instruction"
         if detector_config.get("use_context_input") is True:
             return "function_tag"
         if "llama" in model_hint:
@@ -374,6 +400,12 @@ class CodeBertVulnerabilityDetector:
         text = code
         if self.input_mode == "function_tag":
             text = f"[FUNCTION]\n{code}"
+        elif self.input_mode == "instruction":
+            instruction = self.detector_config.get(
+                "instruction_prompt",
+                "Analyze the following Solidity smart contract code for security vulnerabilities. Determine whether this function is Safe or Vulnerable:\n\n",
+            )
+            text = f"{instruction}{code.strip()}"
         return self.tokenizer(
             text,
             max_length=self.max_tokens,
@@ -471,30 +503,57 @@ def map_tfidf_rag_result(result: Any) -> dict[str, Any]:
 
 
 def run_tfidf_rag_component(args: argparse.Namespace, code: str) -> dict[str, Any]:
-    from rag.tfidf_retriever import SmartContractRetriever
+    from E2E.rag.retriever import LocalRAGRetriever
 
-    retriever = SmartContractRetriever(tfidf_dir=str(args.tfidf_dir))
-    return map_tfidf_rag_result(retriever.retrieve(code, top_k=args.rag_top_k))
+    store_dir = str(args.tfidf_dir or DEFAULT_TFIDF_DIR)
+    if not Path(store_dir).exists():
+        fallback = PROJECT_ROOT / "E2E" / "data" / "runtime"
+        if fallback.exists():
+            store_dir = str(fallback)
+
+    retriever = LocalRAGRetriever(store_dir=store_dir)
+    rag_res = retriever.analyze(code, max_findings=args.rag_max_findings)
+    score = float(rag_res.get("final_score", 0.0) or 0.0)
+    return {
+        "component": "RAG / TF-IDF retrieval-based detection",
+        "status": "ok",
+        "score": round(score, 6),
+        "final_score": round(score, 6),
+        "final_verdict": rag_res.get("final_verdict", "Safe"),
+        "risk_level": rag_res.get("risk_level", "None"),
+        "top_k": args.rag_top_k,
+        "vulnerable_count": rag_res.get("positive_count", 0),
+        "top_findings": rag_res.get("top_findings", []),
+        "findings": rag_res.get("findings", []),
+        "retrieved_context": rag_res.get("retrieved_context", []),
+        "elapsed_ms": rag_res.get("elapsed_ms", 0.0),
+    }
 
 
 def run_semantic_rag_component(args: argparse.Namespace, code: str) -> dict[str, Any]:
     if args.skip_rag:
         return skipped_component("RAG / Retrieval-based detection")
 
-    from rag.multi_agent_vuln_detector import run_multi_agent_analysis
+    try:
+        from rag.multi_agent_vuln_detector import run_multi_agent_analysis
 
-    result = run_multi_agent_analysis(
-        code=code,
-        knowledge_dir=str(args.rag_knowledge_dir),
-        model_name=args.rag_model_name,
-        device=args.device,
-        max_seq_length=args.rag_max_seq_length,
-        max_input_chars=args.rag_max_input_chars,
-        top_k=args.rag_top_k,
-        swc_registry_path=str(args.swc_registry),
-        max_findings=args.rag_max_findings,
-        include_all_agents=args.include_all_agents,
-    )
+        result = run_multi_agent_analysis(
+            code=code,
+            knowledge_dir=str(args.rag_knowledge_dir),
+            model_name=args.rag_model_name,
+            device=args.device,
+            max_seq_length=args.rag_max_seq_length,
+            max_input_chars=args.rag_max_input_chars,
+            top_k=args.rag_top_k,
+            swc_registry_path=str(args.swc_registry),
+            max_findings=args.rag_max_findings,
+            include_all_agents=args.include_all_agents,
+        )
+        if result.get("total_agents", 0) == 0:
+            return run_tfidf_rag_component(args, code)
+    except Exception:
+        return run_tfidf_rag_component(args, code)
+
     result = to_jsonable(result)
     result.update(
         {
@@ -550,7 +609,10 @@ def run_static_component(args: argparse.Namespace, code: str) -> dict[str, Any]:
     if args.skip_static:
         return skipped_component("Static analysis")
 
-    from static_analysis.static_analyzer import run_static_analysis
+    try:
+        from static_analysis.static_analyzer import run_static_analysis
+    except ModuleNotFoundError:
+        from E2E.static_analysis.static_analyzer import run_static_analysis
 
     return serialize_static_result(run_static_analysis(code))
 
@@ -1178,8 +1240,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rag-backend",
         choices=["tfidf", "semantic"],
-        default="semantic",
-        help="Use semantic embedding RAG by default. tfidf remains available only for fallback/debug.",
+        default="tfidf",
+        help="Use 11,869-case runtime TF-IDF RAG by default. semantic remains available for legacy embeddings.",
     )
     parser.add_argument("--rag-model-name", default=DEFAULT_RAG_MODEL_NAME)
     parser.add_argument("--swc-registry", default=str(DEFAULT_SWC_REGISTRY))

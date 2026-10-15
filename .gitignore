@@ -61,6 +61,7 @@ datasets/
 final_dataset_train/
 final_vulnerability_knowledge/
 E2E/data/
+smartbugs_wild/
 server_train/*.json
 server_train/*.csv
 

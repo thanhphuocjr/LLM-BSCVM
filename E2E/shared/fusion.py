@@ -161,28 +161,49 @@ def fuse_detection(
         "rag": rag_result,
         "static": static_result,
     }
-    weights = configured_weights or DEFAULT_COMPONENT_WEIGHTS
+    component_scores = {name: _score(result) for name, result in components.items()}
+    local_findings = merge_findings(static_result, rag_result)
+    detector_threshold = float(detector.get("threshold") or DEFAULT_DETECTOR_THRESHOLD)
+
+    # Adaptive weighting: khi Neural Detector offline hoặc có confidence thấp (< threshold)
+    # trong khi RAG/Static phát hiện bằng chứng, tự động tái phân bổ trọng số cho RAG và Static
+    # nhằm tránh việc trọng số 65% của detector dập tắt các phát hiện bảo mật đã được xác thực.
+    if configured_weights is not None:
+        weights = dict(configured_weights)
+    elif not _active(detector):
+        # Detector offline/pending -> chia đều 50/50 cho RAG và Static
+        weights = {"llm_detector": 0.0, "rag": 0.50, "static": 0.50}
+    elif component_scores["llm_detector"] < detector_threshold and local_findings:
+        # Detector không kích hoạt nhưng RAG/Static có phát hiện -> tăng trọng số RAG & Static
+        weights = {"llm_detector": 0.20, "rag": 0.40, "static": 0.40}
+    else:
+        weights = DEFAULT_COMPONENT_WEIGHTS
+
     active_names = [name for name, result in components.items() if _active(result)]
     weight_total = sum(weights.get(name, 0.0) for name in active_names)
     effective_weights = {
         name: (weights.get(name, 0.0) / weight_total if name in active_names and weight_total else 0.0)
         for name in components
     }
-    component_scores = {name: _score(result) for name, result in components.items()}
     weighted_score = sum(effective_weights[name] * component_scores[name] for name in components)
-    local_findings = merge_findings(static_result, rag_result)
 
     score = weighted_score
     decision_rules = ["active_weighted_fusion"] if active_names else ["no_active_component"]
     if not _active(detector) and any(
-        finding["severity"] == "Critical" for finding in local_findings
+        finding["severity"] in {"Critical", "High"} for finding in local_findings
     ):
-        score = max(score, 0.78)
-        decision_rules.append("provisional_critical_local_evidence_floor")
+        is_crit = any(finding["severity"] == "Critical" for finding in local_findings)
+        score = max(score, 0.78 if is_crit else 0.68)
+        decision_rules.append("provisional_critical_local_evidence_floor" if is_crit else "provisional_high_local_evidence_floor")
     if any(finding["corroborated"] for finding in local_findings):
         score = max(score, 0.72)
         decision_rules.append("static_rag_corroboration_floor")
-    detector_threshold = float(detector.get("threshold") or DEFAULT_DETECTOR_THRESHOLD)
+    if any(
+        finding.get("severity") in {"Critical", "High"} and float(finding.get("confidence") or 0.0) >= 0.65
+        for finding in local_findings
+    ):
+        score = max(score, 0.65)
+        decision_rules.append("strong_local_evidence_floor")
     if _active(detector) and component_scores["llm_detector"] >= detector_threshold:
         score = max(score, 0.58)
         decision_rules.append("llm_detector_threshold_floor")

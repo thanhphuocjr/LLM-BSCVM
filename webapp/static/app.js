@@ -796,57 +796,80 @@
 
   function updateStepperFromLogs(logText, runStatus, phaseFiles) {
     const text = logText || '';
-    const isCompleted = runStatus === 'completed' || text.includes('Run completed successfully') || (phaseFiles && phaseFiles.phase6);
-    const isFailed = runStatus === 'failed' || text.includes('Process exited with code 1') || text.includes('Run failed');
 
-    // Trường hợp 1: Chạy xong toàn bộ -> TẤT CẢ 10 PHASE ĐỀU XANH LÁ (PASS)
-    if (isCompleted) {
-      PIPELINE_ORDER.forEach(({ id }) => {
-        setStepCardState(id, 'success', 'PASS');
-      });
-      if (DOM.stepperOverallStatus) {
-        DOM.stepperOverallStatus.textContent = 'Completed (All Phases Passed)';
-        DOM.stepperOverallStatus.className = 'stepper-status-pill status-success';
+    // Phase 6 is complete ONLY when:
+    // 1) Log explicitly contains '[PHASE 6] Completed' or 'Run completed successfully.', OR
+    // 2) runStatus is 'completed' (backend confirmed exit code 0) AND '[PHASE 6]' was started
+    const phase6IsDone =
+      text.includes('[PHASE 6] Completed') ||
+      text.includes('Run completed successfully.') ||
+      (runStatus === 'completed' && text.includes('[PHASE 6]'));
+
+    const isFailed =
+      runStatus === 'failed' ||
+      text.includes('Process exited with code 1') ||
+      text.includes('Run failed') ||
+      text.includes('Traceback (most recent call last)');
+
+    // Helper to test if a specific step has completed
+    function isStepDone(idx, step) {
+      if (step.id === 'step-phase6') {
+        return phase6IsDone;
       }
-      return;
+      if (text.includes(step.donePattern)) {
+        return true;
+      }
+      // For Phase 1A (idx 1), only consider steps after Phase 1B (idx >= 3)
+      // because Phase 1A and Phase 1B run concurrently.
+      const subsequent = idx === 1 ? PIPELINE_ORDER.slice(3) : PIPELINE_ORDER.slice(idx + 1);
+      return subsequent.some(
+        (next) => text.includes(next.startPattern) || text.includes(next.donePattern)
+      );
     }
 
-    // Trường hợp 2: Pipeline đang thực thi hoặc vừa khởi tạo
-    let runningStepFound = false;
+    let activeRunningStep = null;
 
     for (let i = 0; i < PIPELINE_ORDER.length; i++) {
       const step = PIPELINE_ORDER[i];
-      const hasCompletedInLog = text.includes(step.donePattern);
-      const anySubsequentStarted = PIPELINE_ORDER.slice(i + 1).some(
-        (nextStep) => text.includes(nextStep.startPattern) || text.includes(nextStep.donePattern)
-      );
-
-      // Bước này đã hoàn thành nếu log đã ghi completed hoặc có bất kỳ bước kế sau nào đã bắt đầu
-      const isDone = hasCompletedInLog || anySubsequentStarted;
+      const hasStarted = text.includes(step.startPattern);
+      const isDone = isStepDone(i, step);
 
       if (isDone) {
         setStepCardState(step.id, 'success', 'PASS');
-      } else if (!runningStepFound) {
-        // Đây là bước đầu tiên chưa hoàn thành -> ĐANG CHẠY (VÀNG HỔ PHÁCH)
-        runningStepFound = true;
+      } else if (hasStarted) {
         if (isFailed) {
           setStepCardState(step.id, 'failed', 'FAIL');
         } else {
           setStepCardState(step.id, 'running', 'RUNNING');
-          if (DOM.stepperOverallStatus) {
-            DOM.stepperOverallStatus.textContent = `Running: ${step.label}`;
-            DOM.stepperOverallStatus.className = 'stepper-status-pill status-running';
-          }
+          if (!activeRunningStep) activeRunningStep = step;
         }
       } else {
-        // Các bước còn lại phía sau chưa chạy tới -> XÁM (WAIT)
-        setStepCardState(step.id, 'pending', 'WAIT');
+        // Step not yet reached in log
+        // If run is actively ongoing and no step is marked running yet, Phase 0 is starting
+        if (!activeRunningStep && !isFailed && runStatus === 'running' && i === 0) {
+          setStepCardState(step.id, 'running', 'RUNNING');
+          activeRunningStep = step;
+        } else {
+          setStepCardState(step.id, 'pending', 'WAIT');
+        }
       }
     }
 
-    if (isFailed && DOM.stepperOverallStatus) {
-      DOM.stepperOverallStatus.textContent = 'Failed';
-      DOM.stepperOverallStatus.className = 'stepper-status-pill status-failed';
+    // Stepper header pill status
+    if (DOM.stepperOverallStatus) {
+      if (phase6IsDone) {
+        DOM.stepperOverallStatus.textContent = 'Completed (All Phases Passed)';
+        DOM.stepperOverallStatus.className = 'stepper-status-pill status-success';
+      } else if (isFailed) {
+        DOM.stepperOverallStatus.textContent = 'Failed (Check Logs)';
+        DOM.stepperOverallStatus.className = 'stepper-status-pill status-failed';
+      } else if (activeRunningStep) {
+        DOM.stepperOverallStatus.textContent = `Running: ${activeRunningStep.label}`;
+        DOM.stepperOverallStatus.className = 'stepper-status-pill status-running';
+      } else if (runStatus === 'running') {
+        DOM.stepperOverallStatus.textContent = 'Pipeline Running...';
+        DOM.stepperOverallStatus.className = 'stepper-status-pill status-running';
+      }
     }
   }
 

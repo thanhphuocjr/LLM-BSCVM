@@ -202,6 +202,14 @@ def submit_audit(req: AuditRequest) -> Dict[str, Any]:
 
     log_file = run_dir / "execution.log"
 
+    with TASK_LOCK:
+        ACTIVE_TASKS[run_id] = {
+            "process": None,
+            "status": "running",
+            "log_file": str(log_file),
+            "started_at": time.time(),
+        }
+
     def run_worker():
         with open(log_file, "w", encoding="utf-8") as out:
             out.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting E2E audit run: {run_id}\n")
@@ -222,12 +230,8 @@ def submit_audit(req: AuditRequest) -> Dict[str, Any]:
             )
 
             with TASK_LOCK:
-                ACTIVE_TASKS[run_id] = {
-                    "process": proc,
-                    "status": "running",
-                    "log_file": str(log_file),
-                    "started_at": time.time(),
-                }
+                if run_id in ACTIVE_TASKS:
+                    ACTIVE_TASKS[run_id]["process"] = proc
 
             if proc.stdout:
                 for line in iter(proc.stdout.readline, ""):
@@ -450,7 +454,7 @@ def get_run_detail(run_id: str) -> Dict[str, Any]:
             "phase3_assessor": assessor,
             "phase4_fixer": fixer,
             "phase5_verification": verifier,
-            "phase6_report": bool(report_data) or has_report,
+            "phase6_report": (bool(report_data) or has_report) and not is_awaiting_kaggle,
         },
         "findings": fused.get("findings", []),
         "patch_outcomes": fixer.get("patch_outcomes", []),
@@ -469,37 +473,61 @@ def get_run_logs(run_id: str) -> Dict[str, Any]:
     logs = ""
     if log_file.exists():
         try:
-            logs = log_file.read_text(encoding="utf-8")
+            logs = log_file.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             logs = "(Unable to read log file)"
 
-    has_pdf = (run_dir / "phase6_audit_report.pdf").exists()
-    has_html = (run_dir / "phase6_audit_report.html").exists()
-
-    status = "completed" if (has_pdf or has_html) else "unknown"
+    status = "unknown"
     with TASK_LOCK:
         if run_id in ACTIVE_TASKS:
             proc_info = ACTIVE_TASKS[run_id]
-            if proc_info["status"] == "running":
-                proc = proc_info.get("process")
+            proc = proc_info.get("process")
+            if proc_info.get("status") == "running":
                 if proc and proc.poll() is not None:
                     proc_info["status"] = "completed" if proc.returncode == 0 else "failed"
                     status = proc_info["status"]
                 else:
                     status = "running"
             else:
-                status = proc_info["status"]
+                status = proc_info.get("status", "unknown")
+        else:
+            # Task not active in memory (historical run or after server reload)
+            if "Run completed successfully." in logs or "Process exited with code 0" in logs:
+                status = "completed"
+            elif "Process exited with code" in logs or "Traceback (most recent call last)" in logs:
+                status = "failed"
+            elif (run_dir / "manifest.json").exists():
+                manifest = read_json_safe(run_dir / "manifest.json") or {}
+                if manifest.get("status") == "complete":
+                    status = "completed"
+
+    def is_phase_real(filename: str) -> bool:
+        p = run_dir / filename
+        if not p.exists():
+            return False
+        data = read_json_safe(p)
+        if isinstance(data, dict):
+            if data.get("status") in {"pending", "awaiting_kaggle"}:
+                return False
+            if "overall_verdict" in data and "pending" in str(data.get("overall_verdict", "")).lower():
+                return False
+        return True
+
+    is_p6_done = (
+        (status == "completed" or "[PHASE 6] Completed" in logs or "Run completed successfully" in logs)
+        and (run_dir / "phase6_audit_report.html").exists()
+    )
 
     phase_files = {
-        "phase0": (run_dir / "phase0_input.json").exists(),
-        "phase1a": (run_dir / "phase1a_static.json").exists(),
-        "phase1b": (run_dir / "phase1b_rag.json").exists(),
-        "fusion": (run_dir / "phase1_fused.json").exists(),
-        "phase2": (run_dir / "phase2_advisor.json").exists(),
-        "phase3": (run_dir / "phase3_assessor.json").exists(),
-        "phase4": (run_dir / "phase4_fixer.json").exists(),
-        "phase5": (run_dir / "phase5_verification.json").exists(),
-        "phase6": (run_dir / "phase6_audit_report.html").exists() or (run_dir / "manifest.json").exists(),
+        "phase0": is_phase_real("phase0_input.json"),
+        "phase1a": is_phase_real("phase1a_static.json"),
+        "phase1b": is_phase_real("phase1b_rag.json"),
+        "fusion": is_phase_real("phase1_fused.json"),
+        "phase2": is_phase_real("phase2_advisor.json"),
+        "phase3": is_phase_real("phase3_assessor.json"),
+        "phase4": is_phase_real("phase4_fixer.json"),
+        "phase5": is_phase_real("phase5_verification.json"),
+        "phase6": is_p6_done,
     }
 
     return {

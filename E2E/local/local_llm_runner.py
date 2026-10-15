@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import urllib.error
@@ -15,6 +16,8 @@ from agents.assessor import AssessorAgent
 
 OLLAMA_ENDPOINT = "http://localhost:11434/api/generate"
 DEFAULT_OLLAMA_MODEL = "codellama:7b"
+MAX_LLM_ADVISOR_CALLS = int(os.getenv("MAX_LLM_ADVISOR_CALLS", "5"))
+MAX_LLM_ASSESSOR_CALLS = int(os.getenv("MAX_LLM_ASSESSOR_CALLS", "5"))
 
 
 def _query_ollama(
@@ -247,8 +250,8 @@ def _generate_advisor_section(
         vulnerable_code = f.get("vulnerable_code") or ""
         checklist = list(f.get("checklist") or ([remediation] if remediation else []))
 
-        # 1. Try LLM generation if enabled (cap at 2 to keep pipeline fast and responsive)
-        if agent is not None and llm_calls < 2:
+        # 1. Try LLM generation if enabled (configurable cap, defaults to 5)
+        if agent is not None and llm_calls < MAX_LLM_ADVISOR_CALLS:
             try:
                 item_sug = agent.advise_one(code, f)
                 llm_calls += 1
@@ -361,8 +364,8 @@ def _generate_assessor_section(
             if sug.get("impact") and not f_enriched.get("impact"):
                 f_enriched["impact"] = sug["impact"]
 
-        # 1. Try LLM risk assessment if enabled (cap at 2 to keep pipeline fast and responsive)
-        if agent is not None and llm_calls < 2:
+        # 1. Try LLM risk assessment if enabled (configurable cap, defaults to 5)
+        if agent is not None and llm_calls < MAX_LLM_ASSESSOR_CALLS:
             try:
                 res = agent.assess_one(code, f_enriched)
                 llm_calls += 1
@@ -586,6 +589,8 @@ def run_local_llm_pipeline(
     except Exception:
         pass
 
+    print(f"[{time.strftime('%H:%M:%S')}] [PHASE 1 FUSED] Completed: Multi-modal signals synchronized ({len(findings)} finding(s)).", flush=True)
+
     # 2. Advisor, Assessor, and Fixer
     print(f"[{time.strftime('%H:%M:%S')}] [PHASE 2] Running Security Advisor agent (root cause & remediation analysis)...", flush=True)
     advisor = _generate_advisor_section(findings, source_code, backend=backend, use_llm=(backend == "ollama"))
@@ -617,11 +622,25 @@ def run_local_llm_pipeline(
                         f"Fixed pattern:\n```solidity\n{f['fixed_code']}\n```"
                     )
             ref_str = ("\n\nReference Fix Patterns from 11,869-case knowledge base:\n" + "\n\n".join(ref_patterns)) if ref_patterns else ""
+            rag_ctx = request.get("local_phase1", {}).get("rag", {}).get("retrieved_context", [])
+            rag_section = ""
+            if rag_ctx:
+                rag_items = []
+                for ctx in rag_ctx[:3]:
+                    if float(ctx.get("similarity") or 0.0) >= 0.08:
+                        c_swc = ctx.get("swc") or "Security"
+                        c_title = ctx.get("title") or c_swc
+                        c_desc = (ctx.get("root_cause") or ctx.get("description") or "")[:200]
+                        rag_items.append(f"- [{c_swc}] {c_title}: {c_desc}")
+                if rag_items:
+                    rag_section = "\n\nRAG Retrieved Security Context:\n" + "\n".join(rag_items)
+
             prompt = (
                 f"You are a smart contract security expert. The following Solidity code has vulnerabilities:\n"
                 f"{source_code}\n\n"
                 f"Identified findings: {json.dumps(findings, indent=2)}\n"
-                f"{ref_str}\n\n"
+                f"{ref_str}\n"
+                f"{rag_section}\n\n"
                 f"Please produce the complete secure fixed code for the contract inside ```solidity ... ``` fence."
             )
             llm_response = _query_ollama(prompt, model=ollama_model)

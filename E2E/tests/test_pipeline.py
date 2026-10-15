@@ -124,6 +124,97 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(positive["verdict"], "Vulnerable")
         self.assertEqual(positive["findings"][0]["swc"], "UNMAPPED")
 
+    def test_adaptive_fusion_when_detector_offline(self) -> None:
+        """Kiểm tra khi detector offline/pending, RAG và Static được chia đều 50/50 và floor hoạt động."""
+        rag_vuln = {
+            "status": "ok",
+            "score": 0.85,
+            "verdict": "Vulnerable",
+            "findings": [
+                {
+                    "swc": "SWC-107",
+                    "unit_id": "Bank.withdraw",
+                    "title": "Reentrancy",
+                    "severity": "High",
+                    "confidence": 0.85,
+                    "source": "rag",
+                }
+            ],
+        }
+        static_empty = {"status": "ok", "score": 0.0, "verdict": "Safe", "findings": []}
+        detector_pending = {"component": "llm_detector", "status": "pending", "score": 0.0, "verdict": "Pending"}
+
+        result = fuse_detection(static_empty, rag_vuln, detector_pending)
+        self.assertEqual(result["verdict"], "Vulnerable")
+        self.assertGreaterEqual(result["score"], 0.65)
+        self.assertEqual(result["configured_weights"]["rag"], 0.50)
+        self.assertEqual(result["configured_weights"]["static"], 0.50)
+
+    def test_adaptive_fusion_prevents_detector_false_negative_suppression(self) -> None:
+        """Kiểm tra khi detector trả về score thấp (0.05), phát hiện có độ tin cậy cao của RAG không bị dập tắt."""
+        rag_vuln = {
+            "status": "ok",
+            "score": 0.88,
+            "verdict": "Vulnerable",
+            "findings": [
+                {
+                    "swc": "SWC-107",
+                    "unit_id": "Vault.withdraw",
+                    "title": "Reentrancy",
+                    "severity": "High",
+                    "confidence": 0.88,
+                    "source": "rag",
+                }
+            ],
+        }
+        static_empty = {"status": "ok", "score": 0.0, "verdict": "Safe", "findings": []}
+        detector_false_negative = {
+            "component": "llm_detector",
+            "status": "ok",
+            "score": 0.05,
+            "threshold": 0.25,
+            "verdict": "Safe",
+            "unit_results": [],
+        }
+
+        result = fuse_detection(static_empty, rag_vuln, detector_false_negative)
+        self.assertEqual(result["verdict"], "Vulnerable")
+        self.assertGreaterEqual(result["score"], 0.50)
+        self.assertEqual(result["configured_weights"]["rag"], 0.40)
+
+    def test_rag_knowledge_section_builder(self) -> None:
+        """Kiểm tra helper _build_rag_knowledge_section định dạng và ưu tiên đúng case."""
+        from E2E.local.server_gpu_runner import _build_rag_knowledge_section
+
+        self.assertEqual(_build_rag_knowledge_section([]), "")
+
+        rag_ctx = [
+            {
+                "swc": "SWC-115",
+                "title": "tx.origin",
+                "similarity": 0.45,
+                "root_cause": "tx.origin used for auth",
+                "remediation": "use msg.sender",
+                "vulnerable_code": "require(tx.origin == owner);",
+                "fixed_code": "require(msg.sender == owner);",
+            },
+            {
+                "swc": "SWC-107",
+                "title": "Reentrancy",
+                "similarity": 0.82,
+                "root_cause": "State updated after call",
+                "remediation": "Apply CEI pattern",
+                "vulnerable_code": "msg.sender.call{value: bal}(); bal = 0;",
+                "fixed_code": "bal = 0; msg.sender.call{value: bal}();",
+            },
+        ]
+
+        section = _build_rag_knowledge_section(rag_ctx, target_swc="SWC-107", max_items=2)
+        self.assertIn("RAG Retrieved Knowledge", section)
+        self.assertIn("SWC-107", section)
+        self.assertIn("SWC-115", section)
+        self.assertIn("Apply CEI pattern", section)
+
 
 class IntegrationTests(unittest.TestCase):
     def test_repair_feedback_contains_failed_static_rag_and_llm_reasons(self) -> None:

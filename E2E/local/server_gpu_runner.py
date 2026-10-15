@@ -123,6 +123,57 @@ def generate_via_server(
     return str(res.get("response", "")).strip()
 
 
+def _build_rag_knowledge_section(
+    rag_context: list[dict[str, Any]],
+    target_swc: str | None = None,
+    max_items: int = 3,
+) -> str:
+    """Xây dựng phần bối cảnh tri thức bảo mật (RAG context) từ 11,869 cases cho Fixer LLM."""
+    if not rag_context:
+        return ""
+
+    candidates = []
+    for ctx in rag_context:
+        sim = float(ctx.get("similarity") or 0.0)
+        c_swc = ctx.get("swc") or "Security"
+        # Ưu tiên case khớp SWC của lỗ hổng mục tiêu
+        priority = (2.0 + sim) if (target_swc and c_swc == target_swc) else sim
+        if sim >= 0.08 or (target_swc and c_swc == target_swc):
+            candidates.append((priority, ctx))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    selected = [c[1] for c in candidates[:max_items]]
+    if not selected:
+        return ""
+
+    items_text = []
+    for ctx in selected:
+        c_swc = ctx.get("swc") or "Security"
+        c_title = ctx.get("title") or c_swc
+        sim = float(ctx.get("similarity") or 0.0)
+        c_root = (ctx.get("root_cause") or ctx.get("description") or "").strip()
+        c_rem = (ctx.get("remediation") or "").strip()
+        entry = f"- [{c_swc}] {c_title} (similarity: {sim:.2f})"
+        if c_root:
+            entry += f"\n  Root cause: {c_root[:250]}"
+        if c_rem:
+            entry += f"\n  Remediation guidance: {c_rem[:250]}"
+        if ctx.get("fixed_code") and ctx.get("vulnerable_code"):
+            v_code = str(ctx["vulnerable_code"]).strip()
+            f_code = str(ctx["fixed_code"]).strip()
+            if len(v_code) <= 350 and len(f_code) <= 350:
+                entry += (
+                    f"\n  Vulnerable reference snippet:\n  ```solidity\n{v_code}\n  ```\n"
+                    f"  Secure reference fix:\n  ```solidity\n{f_code}\n  ```"
+                )
+        items_text.append(entry)
+
+    return (
+        "\n\n### RAG Retrieved Knowledge & Defense Context (Empirical Cases):\n"
+        + "\n\n".join(items_text)
+    )
+
+
 def run_server_gpu_pipeline(
     request: dict[str, Any],
     *,
@@ -138,6 +189,18 @@ def run_server_gpu_pipeline(
     detector_threshold = float(
         request.get("execution", {}).get("detector_threshold") or DEFAULT_DETECTOR_THRESHOLD
     )
+
+    # Trích xuất RAG context từ Phase 1B (top items từ 11,869 cases)
+    rag_context = (
+        request.get("local_phase1", {}).get("rag", {}).get("retrieved_context", [])
+        or request.get("rag", {}).get("retrieved_context", [])
+    )
+    if not rag_context and source_code:
+        try:
+            from E2E.rag.retriever import LocalRAGRetriever
+            rag_context = LocalRAGRetriever().retrieve_context(source_code, top_k=5)
+        except Exception:
+            rag_context = []
 
     # 1. Kiểm tra kết nối tới Server
     health = check_server_health(server_url)
@@ -220,6 +283,14 @@ def run_server_gpu_pipeline(
                 inferred_swc = "SWC-107"
                 inferred_title = "Reentrancy Vulnerability"
 
+            if inferred_swc == "UNMAPPED" and rag_context:
+                for ctx in rag_context:
+                    sim = float(ctx.get("similarity") or 0.0)
+                    if sim >= 0.12 and ctx.get("swc") and ctx["swc"] != "UNMAPPED":
+                        inferred_swc = ctx["swc"]
+                        inferred_title = ctx.get("title") or inferred_title
+                        break
+
             findings.append({
                 "finding_id": f"NEURAL:{u_id}",
                 "swc": inferred_swc,
@@ -245,6 +316,8 @@ def run_server_gpu_pipeline(
         findings = kb.enrich_findings(findings, code=source_code, code_units=code_units)
     except Exception:
         pass
+
+    print(f"[{time.strftime('%H:%M:%S')}] [PHASE 1 FUSED] Completed: Multi-modal signals synchronized ({len(findings)} finding(s)).", flush=True)
 
     # 3. Phase 2-4: Advisor, Assessor, và Fixer
     print(f"[{time.strftime('%H:%M:%S')}] [PHASE 2] Running Security Advisor agent (root cause & remediation analysis)...", flush=True)
@@ -323,6 +396,10 @@ def run_server_gpu_pipeline(
                             )
                     ref_section = "\n\n### Reference Fix Patterns:\n" + "\n\n".join(ref_examples) if ref_examples else ""
 
+                    # Bổ sung RAG Knowledge Context từ 11,869 cases cho function này
+                    target_swc = next((uf.get("swc") for uf in unit_findings if uf.get("swc") and uf.get("swc") != "UNMAPPED"), None)
+                    rag_section = _build_rag_knowledge_section(rag_context, target_swc=target_swc, max_items=3)
+
                     finding_context = []
                     for uf in unit_findings:
                         f_title = uf.get("title", "")
@@ -331,7 +408,7 @@ def run_server_gpu_pipeline(
                         if not notes and uf.get("evidence"):
                             for ev in uf.get("evidence"):
                                 if isinstance(ev, dict) and ev.get("notes"):
-                                    notes.extend(ev["notes"])
+                                     notes.extend(ev["notes"])
                         notes_text = ("\n    - Details: " + "\n    - Details: ".join(notes)) if notes else ""
                         finding_context.append(f"  * [{f_swc}] {f_title}{notes_text}")
                     for us in unit_suggestions:
@@ -348,7 +425,8 @@ def run_server_gpu_pipeline(
                         f"Identified Vulnerabilities:\n{findings_str}\n\n"
                         f"Original declaration:\n```solidity\n{t_unit.code}\n```"
                         f"{contract_context_section}\n"
-                        f"{ref_section}\n"
+                        f"{ref_section}"
+                        f"{rag_section}\n"
                         f"{compiler_prompt_note}\n\n"
                         f"CRITICAL INSTRUCTIONS:\n"
                         f"1. Repair ALL the vulnerabilities identified above in this single function declaration.\n"
@@ -419,11 +497,14 @@ def run_server_gpu_pipeline(
                 if ref_examples:
                     ref_section = "\n\n### Reference Fix Patterns from Security Knowledge Base:\n" + "\n\n".join(ref_examples)
 
+                rag_section = _build_rag_knowledge_section(rag_context, max_items=3)
+
                 repair_prompt = (
                     f"You are a smart contract security auditor specializing in Solidity.\n"
                     f"The following Solidity contract has identified security vulnerabilities:\n"
                     f"Findings:\n{json.dumps(findings, indent=2)}\n"
-                    f"{ref_section}\n\n"
+                    f"{ref_section}"
+                    f"{rag_section}\n\n"
                     f"Original Vulnerable Code:\n```solidity\n{source_code}\n```\n\n"
                     f"{compiler_prompt_note}\n\n"
                     f"CRITICAL INSTRUCTIONS:\n"

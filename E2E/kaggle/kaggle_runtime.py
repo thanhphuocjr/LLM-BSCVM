@@ -866,7 +866,7 @@ def combined_findings(request: dict[str, Any], detector: dict[str, Any] | None) 
                 "finding_id": f"UNMAPPED:{item['unit_id']}",
                 "swc": "UNMAPPED",
                 "unit_id": item["unit_id"],
-                "title": "CodeLlama binary vulnerability signal",
+                "title": "Qwen2.5-14B neural vulnerability signal",
                 "severity": "Unknown",
                 "confidence": item["vulnerability_probability"],
                 "sources": ["llm_detector"],

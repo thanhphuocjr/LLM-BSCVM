@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import json
+import math
+from pathlib import Path
 from typing import Any
 
 from E2E.config import (
@@ -102,6 +105,144 @@ def merge_findings(static_result: dict[str, Any], rag_result: dict[str, Any]) ->
     )
 
 
+def fuse_findings(
+    unit_results: list[dict[str, Any]],
+    static_result: dict[str, Any] | list[dict[str, Any]],
+    rag_result: dict[str, Any] | list[dict[str, Any]],
+    *,
+    tau_agent: float = 0.45,
+    calibration_config: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Hợp nhất đa phương thức theo từng finding riêng biệt trước khi chuyển sang Phase 2 (Task B1 & B2).
+
+    - Gộp static + rag và dedupe duy nhất theo (swc, unit_id), không tính line vào key.
+    - Tính điểm p_final cho từng (swc, unit) dựa trên điểm của chính unit đó từ Neural Detector.
+    - Chỉ các finding có p_final >= tau_agent mới được chuyển sang Phase 2 (confirmed_findings).
+    - Các finding còn lại được đưa vào candidate_findings (Candidates).
+    - Đảm bảo số dòng (line) không vượt quá end_line của unit (Task B7, R-08).
+    """
+    if calibration_config is None:
+        calib_path = Path(__file__).resolve().parents[2] / "data" / "runtime" / "fusion_calibration.json"
+        if not calib_path.exists():
+            calib_path = Path(__file__).resolve().parent.parent / "data" / "runtime" / "fusion_calibration.json"
+        if calib_path.exists():
+            try:
+                calibration_config = json.loads(calib_path.read_text(encoding="utf-8"))
+            except Exception:
+                calibration_config = {}
+        else:
+            calibration_config = {}
+
+    mode = calibration_config.get("mode", "calibrated_logistic")
+    intercept = float(calibration_config.get("intercept", -2.15))
+    weights = calibration_config.get("weights", {
+        "p_detector": 3.85,
+        "static_conf": 1.20,
+        "rag_conf": 1.10,
+        "corroborated": 0.65,
+        "severity_critical": 0.80,
+        "severity_high": 0.40,
+        "severity_medium": 0.0,
+        "severity_low": -0.50,
+    })
+    paper_weights = calibration_config.get("paper_weights", {
+        "llm_detector": 0.70,
+        "rag": 0.20,
+        "static": 0.10,
+    })
+    configured_tau = float(calibration_config.get("tau_agent", tau_agent))
+
+    s_res = static_result if isinstance(static_result, dict) else {"findings": static_result}
+    r_res = rag_result if isinstance(rag_result, dict) else {"findings": rag_result}
+
+    local_merged = merge_findings(s_res, r_res)
+
+    unit_map = {str(item.get("unit_id")): item for item in unit_results if item.get("unit_id")}
+    valid_probs = [
+        float(item["vulnerability_probability"])
+        for item in unit_results
+        if item.get("vulnerability_probability") is not None
+    ]
+    contract_max_prob = max(valid_probs) if valid_probs else 0.0
+
+    confirmed: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+
+    for finding in local_merged:
+        u_id = finding.get("unit_id")
+        u_res = unit_map.get(str(u_id)) if u_id else None
+
+        if u_res and u_res.get("vulnerability_probability") is not None:
+            p_detector = float(u_res["vulnerability_probability"])
+        elif not u_id or u_id == "contract":
+            p_detector = contract_max_prob
+        else:
+            p_detector = 0.05
+
+        evidence = finding.get("evidence", [])
+        static_conf = max(
+            [float(item.get("confidence") or 0.0) for item in evidence if item.get("source") == "static"] or [0.0]
+        )
+        rag_conf = max(
+            [float(item.get("confidence") or 0.0) for item in evidence if item.get("source") == "rag"] or [0.0]
+        )
+        corroborated = bool(static_conf > 0.0 and rag_conf > 0.0)
+        severity = finding.get("severity", "Medium")
+
+        if mode == "paper_weighted":
+            p_final = (
+                paper_weights.get("llm_detector", 0.70) * p_detector
+                + paper_weights.get("rag", 0.20) * rag_conf
+                + paper_weights.get("static", 0.10) * static_conf
+            )
+        else:
+            sev_w = float(weights.get(f"severity_{severity.lower()}", 0.0))
+            z = (
+                intercept
+                + float(weights.get("p_detector", 3.85)) * p_detector
+                + float(weights.get("static_conf", 1.20)) * static_conf
+                + float(weights.get("rag_conf", 1.10)) * rag_conf
+                + (float(weights.get("corroborated", 0.65)) if corroborated else 0.0)
+                + sev_w
+            )
+            try:
+                p_final = 1.0 / (1.0 + math.exp(-z))
+            except OverflowError:
+                p_final = 1.0 if z > 0 else 0.0
+
+        p_final = max(0.0, min(1.0, round(p_final, 6)))
+        finding["confidence"] = p_final
+        finding["p_final"] = p_final
+        finding["p_detector"] = round(p_detector, 6)
+        finding["corroborated"] = corroborated
+
+        if u_res:
+            st_line = u_res.get("start_line")
+            en_line = u_res.get("end_line")
+            l_scores = u_res.get("line_scores")
+            if st_line:
+                finding["start_line"] = st_line
+            if en_line:
+                finding["end_line"] = en_line
+            if l_scores:
+                finding["line_scores"] = l_scores
+                if st_line and isinstance(l_scores, list) and l_scores:
+                    max_idx = l_scores.index(max(l_scores))
+                    calc_line = st_line + max_idx
+                    if en_line and calc_line > en_line:
+                        calc_line = en_line
+                    finding["line"] = calc_line
+            elif st_line and not finding.get("line"):
+                finding["line"] = st_line
+
+        if p_final >= configured_tau:
+            confirmed.append(finding)
+        else:
+            candidates.append(finding)
+
+    return confirmed, candidates
+
+
 def detector_findings(
     detector: dict[str, Any],
     local_findings: list[dict[str, Any]],
@@ -112,16 +253,25 @@ def detector_findings(
     for item in results:
         if item.get("label") == "Vulnerable" and item.get("unit_id") not in local_units:
             start_line = item.get("start_line")
+            end_line = item.get("end_line")
             line_scores = item.get("line_scores")
             line = item.get("line") or start_line
             if line_scores and isinstance(line_scores, list) and line_scores and start_line and not line:
                 max_idx = line_scores.index(max(line_scores))
-                line = start_line + max_idx
+                calc_line = start_line + max_idx
+                if end_line and calc_line > end_line:
+                    calc_line = end_line
+                line = calc_line
+            det_model = str(detector.get("model_name") or detector.get("engine") or "").lower()
+            if "codellama" in det_model:
+                det_title = "CodeLlama binary vulnerability signal"
+            else:
+                det_title = "Qwen2.5-14B neural vulnerability signal"
             findings.append({
                 "finding_id": f"UNMAPPED:{item.get('unit_id') or 'source'}",
                 "swc": "UNMAPPED",
                 "unit_id": item.get("unit_id"),
-                "title": "CodeLlama binary vulnerability signal",
+                "title": det_title,
                 "severity": "Unknown",
                 "confidence": round(float(item.get("vulnerability_probability") or 0.0), 6),
                 "sources": ["llm_detector"],
@@ -247,7 +397,10 @@ def fuse_detection(
                 finding["line_scores"] = l_scores
                 if not finding.get("line") and st_line:
                     max_idx = l_scores.index(max(l_scores))
-                    finding["line"] = st_line + max_idx
+                    calc_line = st_line + max_idx
+                    if end_line and calc_line > end_line:
+                        calc_line = end_line
+                    finding["line"] = calc_line
     findings = evidence_findings if verdict == "Vulnerable" else []
     candidate_findings = evidence_findings if verdict != "Vulnerable" else []
     risk_level = findings[0]["severity"] if findings and verdict == "Vulnerable" else "None"

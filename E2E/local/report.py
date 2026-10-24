@@ -331,6 +331,13 @@ def apply_verification_to_report(
 ) -> None:
     verdict = str(verification.get("overall_verdict") or "Not complete")
     report_data["patch_verdict"] = verdict
+    report_data["verification_verdict"] = verdict
+    report_data["risk_delta"] = verification.get("risk_delta", 0.0)
+    report_data["solc_version"] = (
+        verification.get("tool_verification", {}).get("compile", {}).get("compiler_version")
+        or verification.get("tool_verification", {}).get("solc_version")
+        or "solc-native"
+    )
     report_data["verification_channels"] = verification.get("verification_channels", {})
     report_data["repair_attempts"] = verification.get("repair_attempts", [])
     for row in report_data.get("phase_rows", []):
@@ -467,10 +474,10 @@ def build_report_data(
         agent_engine = "Local Fast Generator"
     else:
         p1c_title = "1C Neural detector"
-        detector_location = "Kaggle"
-        detector_engine = remote.get("models", {}).get("detector", "Qwen2.5-Coder-14B / CodeLlama")
-        agent_location = "Kaggle"
-        agent_engine = "Qwen2.5-Coder-14B / CodeLlama Instruct"
+        detector_location = "GPU Server / Cloud"
+        detector_engine = remote.get("models", {}).get("detector", "Qwen2.5-Coder-14B v13")
+        agent_location = "GPU Server / Cloud"
+        agent_engine = "Qwen2.5-Coder-14B Instruct v13"
 
     phase_rows = [
         {
@@ -513,7 +520,10 @@ def build_report_data(
             "phase": "5 Verifier",
             "location": "Local",
             "status": tool_verification.get("status", "pending"),
-            "engine": "solc compiler, behavioral checks, SmartBugs 9-tool matrix",
+            "engine": (
+                "solc compiler, AST behavioral invariants"
+                + (", Slither security matrix" if tool_verification.get("slither") else "")
+            ),
         },
         {
             "phase": "6 Reporter",
@@ -522,6 +532,23 @@ def build_report_data(
             "engine": "deterministic audit report renderer",
         },
     ]
+
+    for f in findings:
+        if f.get("swc") == "SWC-103":
+            f["title"] = "Floating Pragma"
+
+    raw_candidates = (
+        fused.get("candidate_findings", [])
+        or _phase(remote, "detector").get("candidate_findings", [])
+        or []
+    )
+    candidate_findings = []
+    for cand in raw_candidates:
+        cand_dict = dict(cand)
+        if cand_dict.get("swc") == "SWC-103":
+            cand_dict["title"] = "Floating Pragma"
+        candidate_findings.append(cand_dict)
+
     return {
         "title": "Smart Contract Audit Report",
         "run_id": request["run_id"],
@@ -535,6 +562,7 @@ def build_report_data(
         "risk_level": fused.get("risk_level", "None"),
         "executive_summary": executive_summary,
         "findings": findings,
+        "candidate_findings": candidate_findings,
         "distribution": distribution,
         "phase_rows": phase_rows,
         "original_code": original_code,
@@ -601,9 +629,9 @@ def render_markdown(data: dict[str, Any]) -> str:
         "## 3. Methodology",
         "",
         (
-            "The audit combines restored context-aware static rules, local SWC TF-IDF retrieval (11,869 cases), "
-            "fine-tuned neural vulnerability detection (Qwen2.5-Coder-14B v13 Quality-First), generative repair agents, "
-            "compiler checks, behavior-preservation checks, the security tool matrix, and deterministic report generation."
+            "The audit combines static rules, local SWC TF-IDF retrieval, "
+            "fine-tuned neural vulnerability detection, generative repair agents, "
+            "compiler checks, AST behavioral-preservation verification, and deterministic report generation."
         ),
         "",
         "| Phase | Location | Status | Engine |",
@@ -613,6 +641,10 @@ def render_markdown(data: dict[str, Any]) -> str:
         f"| {row['phase']} | {row['location']} | {row['status']} | {row['engine']} |"
         for row in data["phase_rows"]
     )
+    std_sevs = ["Critical", "High", "Medium", "Low"]
+    extra_sevs = [s for s in dist.keys() if s not in std_sevs and dist[s] > 0]
+    sev_cols = std_sevs + extra_sevs
+
     lines.extend(
         [
             "",
@@ -625,23 +657,11 @@ def render_markdown(data: dict[str, Any]) -> str:
             "",
             "### 4.2 Vulnerability Severity Distribution",
             "",
-            "| Critical | High | Medium | Low |",
-            "| :------: | :--: | :----: | :-: |",
-            f"| {dist.get('Critical', 0)} | {dist.get('High', 0)} | {dist.get('Medium', 0)} | {dist.get('Low', 0)} |",
+            "| " + " | ".join(sev_cols) + " |",
+            "| " + " | ".join([":---:"] * len(sev_cols)) + " |",
+            "| " + " | ".join(str(dist.get(s, 0)) for s in sev_cols) + " |",
             "",
-            "### 4.3 Vulnerability Reference Table",
-            "",
-            "| Vulnerability Name | Severity | Detected | Impact Scope |",
-            "| :----------------- | :------- | :------: | :----------- |",
-        ]
-    )
-    for row in data.get("reference_table", []):
-        mark = "✓" if row.get("detected") else ""
-        lines.append(f"| {row['name']} ({row['abbr']}) | {row['severity']} | {mark} | {row['impact']} |")
-    lines.extend(
-        [
-            "",
-            "### 4.4 Confirmed Findings Summary",
+            "### 4.3 Confirmed Findings Summary",
             "",
             "| ID | Vulnerability | Unit | Line | Severity | Confidence | Evidence |",
             "| :-- | :------------ | :--- | :--: | :------- | :--------: | :------- |",
@@ -654,6 +674,34 @@ def render_markdown(data: dict[str, Any]) -> str:
             f"{line_str} | {finding['severity']} | {float(finding.get('confidence') or 0):.3f} | "
             f"{', '.join(finding.get('sources', []))} |"
         )
+    if not findings:
+        lines.append("| - | No confirmed findings | - | - | - | - | - |")
+
+    lines.extend(
+        [
+            "",
+            "### 4.4 Candidate Findings",
+            "",
+        ]
+    )
+    candidate_findings = data.get("candidate_findings", [])
+    if candidate_findings:
+        lines.extend(
+            [
+                "| ID | Vulnerability | Unit | Line | Severity | Confidence | Sources |",
+                "| :-- | :------------ | :--- | :--: | :------- | :--------: | :------- |",
+            ]
+        )
+        for cand in candidate_findings:
+            line_str = str(cand.get("line") or "-")
+            lines.append(
+                f"| {cand.get('swc', '-')} | {cand.get('title', '-')} | {cand.get('unit_id') or 'contract'} | "
+                f"{line_str} | {cand.get('severity', 'Unknown')} | {float(cand.get('confidence') or 0):.3f} | "
+                f"{', '.join(cand.get('sources', []))} |"
+            )
+    else:
+        lines.append("_No unconfirmed candidate findings below threshold._")
+
     lines.extend(
         [
             "",
@@ -724,13 +772,31 @@ def render_markdown(data: dict[str, Any]) -> str:
             "",
         ]
     )
-    for finding in data["tool_verification"].get("behavioral", {}).get("findings", []):
-        lines.append(f"- **Behavioral evidence:** {finding.get('evidence') or finding.get('check')}")
+    if behavioral_evidence := [
+        item.get("evidence") or item.get("check")
+        for item in data["tool_verification"].get("behavioral", {}).get("findings", [])
+        if item.get("evidence") or item.get("check")
+    ]:
+        lines.append("- **Behavior preservation evidence:**")
+        lines.extend(f"  - {entry}" for entry in behavioral_evidence)
     lines.extend(["", "## 6. Summary and Recommendations", ""])
     lines.extend(f"- {item}" for item in data["recommendations"])
     lines.extend(["", "### Limitations", ""])
     lines.extend(f"- {item}" for item in data["limitations"])
     lines.extend(["", "## 7. Disclaimer", "", data["disclaimer"], ""])
+    lines.extend(
+        [
+            "",
+            "## 8. Appendix: Vulnerability Reference Catalogue",
+            "",
+            "| Vulnerability Name | Severity | Detected | Impact Scope |",
+            "| :----------------- | :------- | :------: | :----------- |",
+        ]
+    )
+    for row in data.get("reference_table", []):
+        mark = "✓" if row.get("detected") else ""
+        lines.append(f"| {row['name']} ({row['abbr']}) | {row['severity']} | {mark} | {row['impact']} |")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -764,6 +830,27 @@ def render_html(data: dict[str, Any], markdown_text: str) -> str:
         "</tr>"
         for item in data["findings"]
     ) or "<tr><td colspan='7'>No confirmed findings</td></tr>"
+    candidates_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(str(item.get('swc', '-')))}</td>"
+        f"<td>{html.escape(str(item.get('title', '-')))}</td>"
+        f"<td>{html.escape(str(item.get('unit_id') or 'contract'))}</td>"
+        f"<td style='text-align:center;'>{html.escape(str(item.get('line') or '-'))}</td>"
+        f"<td><span class='severity {str(item.get('severity', 'Unknown')).lower()}'>{html.escape(str(item.get('severity', 'Unknown')))}</span></td>"
+        f"<td>{float(item.get('confidence') or 0):.3f}</td>"
+        f"<td>{html.escape(', '.join(item.get('sources', [])))}</td>"
+        "</tr>"
+        for item in data.get("candidate_findings", [])
+    ) or "<tr><td colspan='7'>No unconfirmed candidate findings below threshold</td></tr>"
+
+    dist = data["distribution"]
+    std_sevs = ["Critical", "High", "Medium", "Low"]
+    extra_sevs = [s for s in dist.keys() if s not in std_sevs and dist[s] > 0]
+    sev_cols = std_sevs + extra_sevs
+    dist_th = "".join(f"<th>{s}</th>" for s in sev_cols)
+    dist_td = "".join(f"<td>{dist.get(s, 0)}</td>" for s in sev_cols)
+    distribution_html = f"<table><tr>{dist_th}</tr><tr>{dist_td}</tr></table>"
+
     phase_rows = "".join(
         "<tr>"
         f"<td>{html.escape(row['phase'])}</td><td>{row['location']}</td>"
@@ -783,12 +870,14 @@ def render_html(data: dict[str, Any], markdown_text: str) -> str:
     details = ""
     for index, item in enumerate(data["findings"], 1):
         steps = "".join(f"<li>{html.escape(str(step))}</li>" for step in item.get("repair_steps", []))
+        cvss_line = f"<p><b>CVSS:</b> {item['cvss_score']}</p>" if item.get("cvss_score") is not None else ""
         details += (
             f"<section><h4>{index}. {html.escape(item['title'])} ({item['swc']})</h4>"
             f"<p><b>Severity:</b> {item['severity']} &nbsp; <b>Unit:</b> "
             f"<code>{html.escape(str(item.get('unit_id') or 'contract'))}</code></p>"
             f"<p><b>Root cause:</b> {html.escape(str(item.get('root_cause') or 'Not provided'))}</p>"
             f"<p><b>Impact:</b> {html.escape(str(item.get('impact') or 'Requires manual analysis'))}</p>"
+            f"{cvss_line}"
             f"<ol>{steps}</ol><p><b>Verification:</b> "
             f"{html.escape(str(item.get('verification_status') or 'Not verified'))}</p></section>"
         )
@@ -828,21 +917,19 @@ footer {{ border-top: 1px solid #bcc5cf; margin-top: 30px; padding: 12px 0; colo
 <b>Fused Score</b><span>{data['score']:.3f}</span>
 <b>Audit Time</b><span>{data['audit_time']}</span></div>
 <h2>2. Executive Summary</h2><p>{html.escape(data['executive_summary'])}</p>
-<h2>3. Methodology</h2><p>The audit combines static analysis, local SWC TF-IDF retrieval (11,869 cases), fine-tuned neural vulnerability detection (Qwen2.5-Coder-14B v13 Quality-First),
-generative repair agents, compilation, behavior-preservation checks, the security tool matrix, and deterministic reporting.</p>
+<h2>3. Methodology</h2><p>The audit combines static rules, local SWC TF-IDF retrieval, fine-tuned neural vulnerability detection,
+generative repair agents, compilation, AST behavior-preservation checks, and deterministic reporting.</p>
 <table><thead><tr><th>Phase</th><th>Location</th><th>Status</th><th>Engine</th></tr></thead><tbody>{phase_rows}</tbody></table>
 <h2>4. Findings</h2><h3>4.1 Vulnerability Statistics</h3>
 <p><b>{len(data['findings'])}</b> confirmed finding(s); highest risk: <b>{data['risk_level']}</b>.</p>
 <h3>4.2 Vulnerability Severity Distribution</h3>
-<table><tr><th>Critical</th><th>High</th><th>Medium</th><th>Low</th></tr><tr>
-<td>{data['distribution'].get('Critical', 0)}</td><td>{data['distribution'].get('High', 0)}</td>
-<td>{data['distribution'].get('Medium', 0)}</td><td>{data['distribution'].get('Low', 0)}</td></tr></table>
-<h3>4.3 Vulnerability Reference Catalogue</h3>
-<table><thead><tr><th>Vulnerability Name</th><th>Severity</th><th>Detected</th><th>Impact Scope</th></tr></thead>
-<tbody>{catalogue_rows}</tbody></table>
-<h3>4.4 Confirmed Findings Summary</h3>
+{distribution_html}
+<h3>4.3 Confirmed Findings Summary</h3>
 <table><thead><tr><th>ID</th><th>Vulnerability</th><th>Unit</th><th>Line</th><th>Severity</th><th>Confidence</th><th>Evidence</th></tr></thead>
 <tbody>{findings_rows}</tbody></table>
+<h3>4.4 Candidate Findings</h3>
+<table><thead><tr><th>ID</th><th>Vulnerability</th><th>Unit</th><th>Line</th><th>Severity</th><th>Confidence</th><th>Sources</th></tr></thead>
+<tbody>{candidates_rows}</tbody></table>
 <h2>5. Detailed Analysis</h2><h3>5.1 Contract Name</h3><p>{html.escape(data['analyzed_object'])}</p>
 <h3>5.2 Source Code</h3><pre>{html.escape(data['original_code'])}</pre>
 <h3>5.3 Repair Suggestion</h3>{details or '<p>No confirmed vulnerability was available for remediation.</p>'}
@@ -863,6 +950,9 @@ generative repair agents, compilation, behavior-preservation checks, the securit
 <h2>6. Summary and Recommendations</h2><ul>{''.join(f'<li>{html.escape(str(item))}</li>' for item in data['recommendations'])}</ul>
 <div class="notice"><b>Limitations</b><ul>{''.join(f'<li>{html.escape(str(item))}</li>' for item in data['limitations'])}</ul></div>
 <h2>7. Disclaimer</h2><p>{html.escape(data['disclaimer'])}</p>
+<h2>8. Appendix: Vulnerability Reference Catalogue</h2>
+<table><thead><tr><th>Vulnerability Name</th><th>Severity</th><th>Detected</th><th>Impact Scope</th></tr></thead>
+<tbody>{catalogue_rows}</tbody></table>
 <footer>Generated by the LLM-BSCVM v13 Smart Contract Security Audit Studio.</footer>
 </body></html>"""
 
@@ -975,9 +1065,9 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
     paragraph(data["executive_summary"])
     heading("3. Methodology")
     paragraph(
-        "Static analysis, local SWC TF-IDF retrieval (11,869 cases), fine-tuned neural vulnerability detection "
-        "(Qwen2.5-Coder-14B v13 Quality-First), generative repair agents, solc compilation, behavior-preservation checks, "
-        "the security tool matrix, and deterministic reporting."
+        "Static analysis, local SWC TF-IDF retrieval, fine-tuned neural vulnerability detection, "
+        "generative repair agents, solc compilation, behavior-preservation checks, "
+        "and deterministic reporting."
     )
     phase_table = [["Phase", "Location", "Status"], *[[r["phase"], r["location"], r["status"]] for r in data["phase_rows"]]]
     table = Table(phase_table, repeatRows=1, colWidths=[92 * mm, 35 * mm, 43 * mm])
@@ -997,37 +1087,19 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
     paragraph(f"{len(data['findings'])} confirmed finding(s); highest risk: {data['risk_level']}.")
     heading("4.2 Vulnerability Severity Distribution", 2)
     dist = data["distribution"]
+    std_sevs = ["Critical", "High", "Medium", "Low"]
+    extra_sevs = [s for s in dist.keys() if s not in std_sevs and dist[s] > 0]
+    sev_cols = std_sevs + extra_sevs
+    col_w = 170.0 / len(sev_cols) * mm
     severity_table = [
-        ["Critical", "High", "Medium", "Low"],
-        [dist.get("Critical", 0), dist.get("High", 0), dist.get("Medium", 0), dist.get("Low", 0)],
+        sev_cols,
+        [dist.get(s, 0) for s in sev_cols],
     ]
-    table = Table(severity_table, colWidths=[42.5 * mm] * 4)
+    table = Table(severity_table, colWidths=[col_w] * len(sev_cols))
     table.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.5, colors.grey), ("ALIGN", (0, 0), (-1, -1), "CENTER")]))
     story.extend([table, Spacer(1, 4 * mm)])
-    heading("4.3 Vulnerability Reference Catalogue", 2)
-    cat_rows = [["Vulnerability", "Severity", "Detected", "Scope"]]
-    for row in data.get("reference_table", []):
-        cat_rows.append([
-            f"{row['name']} ({row['abbr']})",
-            row["severity"],
-            "✓" if row.get("detected") else "-",
-            row["impact"][:70] + "..." if len(row["impact"]) > 70 else row["impact"],
-        ])
-    table = Table(cat_rows, repeatRows=1, colWidths=[42 * mm, 20 * mm, 18 * mm, 90 * mm])
-    table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#26394d")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
-                ("FONTSIZE", (0, 0), (-1, -1), 7),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ]
-        )
-    )
-    story.extend([table, Spacer(1, 4 * mm)])
 
-    heading("4.4 Confirmed Findings Summary", 2)
+    heading("4.3 Confirmed Findings Summary", 2)
     rows = [["ID", "Vulnerability", "Unit", "Line", "Severity"]]
     rows.extend(
         [item["swc"], item["title"], item.get("unit_id") or "contract", str(item.get("line") or "-"), item["severity"]]
@@ -1036,6 +1108,34 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
     if len(rows) == 1:
         rows.append(["-", "No confirmed findings", "-", "-", "-"])
     table = Table(rows, repeatRows=1, colWidths=[22 * mm, 60 * mm, 45 * mm, 18 * mm, 25 * mm])
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#26394d")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+                ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ]
+        )
+    )
+    story.extend([table, Spacer(1, 4 * mm)])
+
+    heading("4.4 Candidate Findings", 2)
+    cand_rows = [["ID", "Vulnerability", "Unit", "Line", "Severity"]]
+    cand_rows.extend(
+        [
+            c.get("swc", "-"),
+            str(c.get("title", "-")),
+            c.get("unit_id") or "contract",
+            str(c.get("line") or "-"),
+            str(c.get("severity", "Unknown")),
+        ]
+        for c in data.get("candidate_findings", [])
+    )
+    if len(cand_rows) == 1:
+        cand_rows.append(["-", "No candidate findings below threshold", "-", "-", "-"])
+    table = Table(cand_rows, repeatRows=1, colWidths=[22 * mm, 60 * mm, 45 * mm, 18 * mm, 25 * mm])
     table.setStyle(
         TableStyle(
             [
@@ -1114,6 +1214,29 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
         paragraph(f"- {item}")
     heading("7. Disclaimer")
     paragraph(data["disclaimer"])
+
+    heading("8. Appendix: Vulnerability Reference Catalogue")
+    cat_rows = [["Vulnerability", "Severity", "Detected", "Scope"]]
+    for row in data.get("reference_table", []):
+        cat_rows.append([
+            f"{row['name']} ({row['abbr']})",
+            row["severity"],
+            "✓" if row.get("detected") else "-",
+            row["impact"][:70] + "..." if len(row["impact"]) > 70 else row["impact"],
+        ])
+    table = Table(cat_rows, repeatRows=1, colWidths=[42 * mm, 20 * mm, 18 * mm, 90 * mm])
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#26394d")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+                ("FONTSIZE", (0, 0), (-1, -1), 7),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ]
+        )
+    )
+    story.extend([table, Spacer(1, 4 * mm)])
 
     def footer(canvas, document) -> None:
         canvas.saveState()

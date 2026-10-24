@@ -889,3 +889,4 @@ def verify_security_tool_matrix(
             "verdict": slither_result.get("verdict", "Not run"),
         },
     }
+

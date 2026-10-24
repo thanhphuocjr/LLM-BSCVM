@@ -89,6 +89,20 @@ class SolidityContract:
     end: int
 
 
+@dataclass(frozen=True)
+class SolidityModifier:
+    """Lightweight modifier boundary used by access-control checks."""
+
+    name: str
+    params: str
+    header: str
+    body: str
+    start: int
+    body_start: int
+    end: int
+
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Bảng pattern toàn diện
 # Cấu trúc mỗi entry:
@@ -111,36 +125,29 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "type_weight": 0.30,
         "patterns": [
             # 1. Low-level call với ETH value trước khi cập nhật state
-            (r'\.call\s*\{[^}]*value\s*:', 0.45,
+            (r'\.call\s*\{[^}]*value\s*:', 0.50,
              "Low-level call gửi ETH - nguy cơ reentrancy kinh điển"),
-            # 2. transfer / send (ít nguy hiểm hơn nhưng vẫn cần kiểm tra)
-            (r'\.\s*transfer\s*\(', 0.20,
-             ".transfer() - vẫn có thể dẫn đến reentrancy nếu logic sai"),
-            (r'\.\s*send\s*\(', 0.20,
-             ".send() - trả về bool nhưng vẫn cần CEI pattern"),
-            # 3. External call không rõ giá trị
-            (r'\.call\s*\(', 0.35,
+            (r'\.call\s*\.\s*value\s*\(', 0.50,
+             "Low-level call.value() gửi ETH - nguy cơ reentrancy kinh điển (Solidity <0.7)"),
+            # 2. External call không rõ giá trị
+            (r'\.call\s*\(', 0.25,
              "External call - kiểm tra xem state có được cập nhật trước không"),
-            # 4. Cross-function reentrancy: gọi hàm external trong modifier/callback
+            # 3. Cross-function reentrancy: gọi hàm external trong modifier/callback
             (r'(function\s+\w+[^{]*\bexternal\b[^{]*\{[^}]*\.call)', 0.30,
              "External function thực hiện low-level call"),
-            # 5. Delegate call - cross-contract reentrancy
+            # 4. Delegate call - cross-contract reentrancy
             (r'\.delegatecall\s*\(', 0.40,
              "delegatecall - nguy cơ reentrancy và storage collision"),
-            # 6. Withdraw pattern thiếu kiểm soát
-            (r'function\s+withdraw[^{]*\{(?:(?!require|revert|nonReentrant).)*\.call', 0.50,
+            # 5. Withdraw pattern thiếu kiểm soát
+            (r'function\s+withdraw[^{]*\{(?:(?!require|revert|nonReentrant|\}).)*\.call', 0.50,
              "Hàm withdraw gọi external mà không có bảo vệ reentrancy"),
-            # 7. Thiếu ReentrancyGuard / nonReentrant modifier
-            # (pattern negative - sẽ được xử lý trong context check)
         ],
         "negative_patterns": [
-            # Nếu có những pattern này thì giảm score
             (r'nonReentrant', 0.40,      "Có modifier nonReentrant"),
             (r'ReentrancyGuard', 0.35,   "Kế thừa ReentrancyGuard"),
             (r'_status\s*==\s*_NOT_ENTERED', 0.25, "Kiểm tra reentrancy thủ công"),
         ],
         "context_checks": [
-            # Kiểm tra CEI pattern vi phạm: call trước khi update state
             "check_call_before_state_update",
         ],
     },
@@ -151,19 +158,22 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "risk_level": "Critical",
         "type_weight": 0.25,
         "patterns": [
-            (r'function\s+\w+[^{]*\bpublic\b[^{]*\{(?:(?!require|onlyOwner|modifier).)*selfdestruct',
+            (r'function\s+\w+[^{]*\bpublic\b[^{]*\{(?:(?!require|onlyOwner|modifier|\}).)*selfdestruct',
              0.60, "selfdestruct không được bảo vệ"),
             (r'\bselfdestruct\s*\(', 0.50,
              "Gọi selfdestruct - cần kiểm tra quyền truy cập"),
             (r'\bsuicide\s*\(', 0.50,
              "Gọi suicide (alias của selfdestruct) - deprecated"),
             # Hàm rút tiền công khai không có modifier
-            (r'function\s+(?:withdraw|drain|rescue)[^{]*\bpublic\b(?!\s+\bview\b)(?!\s+\bpure\b)[^{]*\{(?:(?!require|onlyOwner|onlyAdmin|modifier).){0,200}\.call',
+            (r'function\s+(?:withdraw|drain|rescue)[^{]*\bpublic\b(?!\s+\bview\b)(?!\s+\bpure\b)[^{]*\{(?:(?!require|onlyOwner|onlyAdmin|modifier|\}).){0,200}\.call',
              0.55, "Hàm rút tiền public không có kiểm soát truy cập"),
         ],
         "negative_patterns": [
-            (r'onlyOwner', 0.30, "Có kiểm soát onlyOwner"),
-            (r'require\s*\(\s*msg\.sender\s*==', 0.30, "Có kiểm tra msg.sender"),
+            (r'onlyOwner|onlyAdmin|onlyRole|onlyMinter|onlyFounder|oO\b|oOOrContract\b', 0.45, "Có access modifier"),
+            (r'require\s*\(\s*msg\.sender\s*==', 0.40, "Có kiểm tra msg.sender"),
+            (r'require\s*\(\s*[^;]*==\s*msg\.sender', 0.40, "Có kiểm tra msg.sender"),
+            (r'if\s*\([^)]*msg\.sender\s*!=[^)]*\)\s*(?:revert\b|throw\b)', 0.40, "Idiom 0.4 if msg.sender != revert"),
+            (r'\b(?:internal|private)\b', 0.45, "Visibility internal hoặc private"),
         ],
     },
 
@@ -179,7 +189,10 @@ VULNERABILITY_REGISTRY: List[Dict] = [
              "Hàm chứa selfdestruct"),
         ],
         "negative_patterns": [
-            (r'(?:onlyOwner|require\s*\(.*msg\.sender)', 0.35, "Có access control"),
+            (r'(?:onlyOwner|onlyAdmin|onlyRole|onlyFounder|oO\b|oOOrContract\b)', 0.45, "Có access control"),
+            (r'require\s*\(.*msg\.sender', 0.40, "Có kiểm tra msg.sender"),
+            (r'if\s*\([^)]*msg\.sender\s*!=[^)]*\)\s*(?:revert\b|throw\b)', 0.40, "Idiom 0.4 if msg.sender != revert"),
+            (r'\b(?:internal|private)\b', 0.45, "Visibility internal hoặc private"),
         ],
     },
 
@@ -204,8 +217,8 @@ VULNERABILITY_REGISTRY: List[Dict] = [
     {
         "vuln_id": "SWC-100",
         "vuln_type": "function_default_visibility",
-        "risk_level": "Critical",
-        "type_weight": 0.18,
+        "risk_level": "Low",
+        "type_weight": 0.05,
         "patterns": [
             # Hàm không có visibility specifier (Solidity < 0.5.0)
             (r'function\s+\w+\s*\([^)]*\)\s*(?:returns\s*\([^)]*\)\s*)?\{',
@@ -231,7 +244,7 @@ VULNERABILITY_REGISTRY: List[Dict] = [
             # Hàm nhạy cảm không có modifier bảo vệ
             (r'function\s+(?:setOwner|transferOwnership|updateOwner)\s*\([^)]*\)\s*(?:public|external)(?!\s+\w*[Oo]nly)',
              0.55, "Thay đổi owner không có access control"),
-            (r'function\s+(?:mint|burn|pause|unpause|upgrade)\s*\([^)]*\)\s*(?:public|external)(?:(?!onlyOwner|onlyAdmin|onlyRole|require).){0,100}\{',
+            (r'function\s+(?:mint|burn|pause|unpause|upgrade)\s*\([^)]*\)\s*(?:public|external)(?:(?!onlyOwner|onlyAdmin|onlyRole|require|\}).){0,100}\{',
              0.50, "Hàm đặc quyền (mint/burn/pause) có thể thiếu access control"),
             # Modifier rỗng hoặc luôn pass
             (r'modifier\s+\w+\s*\([^)]*\)\s*\{\s*_;\s*\}', 0.60,
@@ -243,9 +256,12 @@ VULNERABILITY_REGISTRY: List[Dict] = [
              "Kiểm tra hasRole ngược - logic sai tiềm ẩn"),
         ],
         "negative_patterns": [
-            (r'require\s*\(\s*msg\.sender\s*==\s*owner', 0.25, "Kiểm tra owner"),
-            (r'onlyOwner|onlyAdmin|onlyRole|onlyMinter', 0.30, "Có access modifier"),
+            (r'require\s*\(\s*msg\.sender\s*==', 0.40, "Kiểm tra msg.sender"),
+            (r'require\s*\(\s*[^;]*==\s*msg\.sender', 0.40, "Kiểm tra msg.sender"),
+            (r'if\s*\([^)]*msg\.sender\s*!=[^)]*\)\s*(?:revert\b|throw\b)', 0.40, "Idiom 0.4 if msg.sender != revert"),
+            (r'onlyOwner|onlyAdmin|onlyRole|onlyMinter|onlyFounder|oO\b|oOOrContract\b', 0.45, "Có access modifier"),
             (r'AccessControl|Ownable', 0.20, "Dùng thư viện access control"),
+            (r'\b(?:internal|private)\b', 0.45, "Visibility internal hoặc private"),
         ],
     },
 
@@ -566,7 +582,7 @@ VULNERABILITY_REGISTRY: List[Dict] = [
 
     {
         "vuln_id": "SWC-103",
-        "vuln_type": "outdated_compiler_version",
+        "vuln_type": "floating_pragma",
         "risk_level": "Low",
         "type_weight": 0.05,
         "patterns": [
@@ -905,6 +921,99 @@ def _iter_contracts(code: str) -> Iterator[SolidityContract]:
         )
 
 
+def _iter_modifiers(code: str) -> Iterator[SolidityModifier]:
+    """Yield modifier boundaries without requiring a Solidity compiler."""
+    clean = _clean_code(code)
+    pattern = re.compile(
+        r'\bmodifier\s+(?P<name>[A-Za-z_]\w*)\s*(?:\((?P<params>[^)]*)\))?(?P<header>[^;{}]*)\{',
+        re.DOTALL,
+    )
+    for match in pattern.finditer(clean):
+        open_pos = match.end() - 1
+        close_pos = _balanced_end(clean, open_pos)
+        if close_pos is None:
+            continue
+        yield SolidityModifier(
+            name=match.group("name"),
+            params=match.group("params") or "",
+            header=match.group("header") or "",
+            body=clean[open_pos + 1:close_pos],
+            start=match.start(),
+            body_start=open_pos + 1,
+            end=close_pos,
+        )
+
+
+def extract_guard_modifiers(code: str) -> set[str]:
+    """
+    Trích xuất tên các modifier có chức năng bảo vệ truy cập (guard modifier).
+    Nhận diện:
+      - Các tên thông dụng: onlyOwner, onlyAdmin, onlyRole, onlyMinter, onlyFounder, etc.
+      - Modifier tự đặt tên (như oO, oOOrContract) mà thân có:
+        * require(msg.sender == ...) hoặc require(... == msg.sender)
+        * require(msg.sender == ... || ...)
+        * if (msg.sender != ...) revert/throw
+        * if (... != msg.sender) revert/throw
+        * require(owners[msg.sender]...) hoặc require(isOwner[msg.sender]...)
+    """
+    clean = _clean_code(code)
+    guards: set[str] = set()
+    for m in re.finditer(r'\bmodifier\s+([A-Za-z0-9_]+)', clean):
+        name = m.group(1)
+        if re.match(r'^(?:only[A-Z]\w*|auth|authorized|restricted)$', name):
+            guards.add(name)
+    for mod in _iter_modifiers(code):
+        body = mod.body
+        if (
+            re.search(r'require\s*\([^;]*msg\.sender\s*==', body)
+            or re.search(r'require\s*\([^;]*==\s*msg\.sender', body)
+            or re.search(r'if\s*\([^)]*msg\.sender\s*!=[^)]*\)\s*(?:revert\b|throw\b)', body)
+            or re.search(r'if\s*\([^)]*!=\s*msg\.sender[^)]*\)\s*(?:revert\b|throw\b)', body)
+            or re.search(r'require\s*\([^;]*\[msg\.sender\]', body)
+            or re.search(r'require\s*\([^;]*(?:isOwner|hasRole|authorized)\s*\(', body)
+        ):
+            guards.add(mod.name)
+    return guards
+
+
+def is_function_guarded(
+    header: str,
+    body: str,
+    guard_modifiers: Optional[set[str]] = None,
+) -> bool:
+    """
+    Kiểm tra xem một hàm có được bảo vệ quyền truy cập hay không.
+    Trả về True nếu:
+      - Visibility là private hoặc internal
+      - Header hàm có chứa guard modifier (oO, oOOrContract, onlyOwner, ...)
+      - Thân hàm có inline guard check:
+        require(msg.sender == ...)
+        if (msg.sender != ...) revert/throw
+    """
+    if re.search(r'\b(?:private|internal)\b', header):
+        return True
+    active_guards = (guard_modifiers or set()) | {
+        "onlyOwner", "onlyAdmin", "onlyRole", "onlyMinter",
+        "onlyFounder", "authorized", "auth", "restricted"
+    }
+    for mod in active_guards:
+        if re.search(rf'\b{re.escape(mod)}\b', header):
+            return True
+    for token in re.findall(r'\b([A-Za-z0-9_]+)\b', header):
+        if token.startswith("only") and len(token) > 4:
+            return True
+    if (
+        re.search(r'require\s*\([^;]*msg\.sender\s*==', body)
+        or re.search(r'require\s*\([^;]*==\s*msg\.sender', body)
+        or re.search(r'if\s*\([^)]*msg\.sender\s*!=[^)]*\)\s*(?:revert\b|throw\b)', body)
+        or re.search(r'if\s*\([^)]*!=\s*msg\.sender[^)]*\)\s*(?:revert\b|throw\b)', body)
+        or re.search(r'require\s*\([^;]*\[msg\.sender\]', body)
+        or re.search(r'require\s*\([^;]*(?:isOwner|hasRole|authorized)\s*\(', body)
+    ):
+        return True
+    return False
+
+
 def _split_top_level_arguments(value: str) -> List[str]:
     """Split a Solidity argument list while respecting nested expressions."""
     arguments: List[str] = []
@@ -1207,6 +1316,8 @@ def _detect_bidirectional_controls(code: str) -> Optional[VulnerabilityFinding]:
 
 def _detect_incorrect_exponentiation(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
+    # Mask pragma statements to avoid false positives on caret version specifiers (e.g. pragma solidity ^0.4.25;)
+    clean = re.sub(r'pragma\s+solidity\s+[^;]+;', lambda m: ' ' * len(m.group(0)), clean)
     operand = r'(?:0x[0-9A-Fa-f]+|\d+|[A-Za-z_]\w*)'
     pattern = re.compile(
         rf'(?P<left>{operand})\s*\^(?!=)\s*(?P<right>{operand})'
@@ -2412,7 +2523,7 @@ class StaticAnalyzer:
     # Public API
     # ─────────────────────────────────────────────────────────────────────────
 
-    def analyze(self, contract_code: str) -> Dict:
+    def analyze(self, contract_code: str, guard_modifiers: Optional[set[str]] = None) -> Dict:
         """
         Phân tích contract_code và trả về dict:
         {
@@ -2426,16 +2537,25 @@ class StaticAnalyzer:
         }
         """
         clean = _clean_code(contract_code)
+        if guard_modifiers is None:
+            guard_modifiers = extract_guard_modifiers(contract_code)
+        functions = list(_iter_functions(clean))
 
         findings: Dict[str, VulnerabilityFinding] = {}
         total_score = 0.0
 
         for entry in self._registry:
-            finding = self._run_pattern_check(entry, clean, contract_code)
+            finding = self._run_pattern_check(
+                entry,
+                clean,
+                contract_code,
+                guard_modifiers=guard_modifiers,
+                functions=functions,
+            )
             if finding.matches:
                 # Áp dụng negative patterns để giảm score
                 neg_reduction = self._apply_negative_patterns(
-                    entry, clean, finding.raw_score
+                    entry, clean, finding.raw_score, guard_modifiers=guard_modifiers
                 )
                 finding.confirmed = (
                     finding.raw_score - neg_reduction
@@ -2503,6 +2623,8 @@ class StaticAnalyzer:
         entry: Dict,
         clean_code: str,
         original_code: str,
+        guard_modifiers: Optional[set[str]] = None,
+        functions: Optional[List[SolidityFunction]] = None,
     ) -> VulnerabilityFinding:
         finding = VulnerabilityFinding(
             vuln_id=entry["vuln_id"],
@@ -2511,11 +2633,45 @@ class StaticAnalyzer:
             type_weight=entry["type_weight"],
         )
 
+        vuln_id = entry.get("vuln_id")
+        is_access_sensitive = vuln_id in {"SWC-101", "SWC-105", "SWC-106"}
+
         for pat_tuple in entry.get("patterns", []):
             regex, weight, desc = pat_tuple
             try:
                 compiled = re.compile(regex, re.DOTALL | re.MULTILINE)
                 for m in compiled.finditer(clean_code):
+                    # Bỏ qua finding nếu nằm trong hàm được bảo vệ hoặc burn số dư chính mình
+                    if is_access_sensitive:
+                        m_pos = m.start()
+                        containing_func = (
+                            next((f for f in functions if f.start <= m_pos <= f.end), None)
+                            if functions
+                            else None
+                        )
+                        if containing_func:
+                            func_body = clean_code[containing_func.body_start:containing_func.end]
+                            if is_function_guarded(containing_func.header, func_body, guard_modifiers):
+                                continue
+                            if containing_func.name == "burn" and (
+                                "balances[msg.sender]" in func_body
+                                or "burner = msg.sender" in func_body
+                                or "require(_value <= balances[msg.sender])" in func_body
+                            ):
+                                continue
+                        elif not functions and clean_code.strip().startswith("function"):
+                            hdr_m = re.search(r'function\s+[^{]*\{', clean_code)
+                            if hdr_m:
+                                hdr = clean_code[:hdr_m.end()]
+                                bdy = clean_code[hdr_m.end():]
+                                if is_function_guarded(hdr, bdy, guard_modifiers):
+                                    continue
+                                if "function burn" in hdr and (
+                                    "balances[msg.sender]" in bdy
+                                    or "burner = msg.sender" in bdy
+                                ):
+                                    continue
+
                     line, col = _get_line_col(clean_code, m.start())
                     context = _extract_context(original_code, m.start())
                     finding.matches.append(PatternMatch(
@@ -2536,6 +2692,7 @@ class StaticAnalyzer:
         entry: Dict,
         clean_code: str,
         raw_score: float,
+        guard_modifiers: Optional[set[str]] = None,
     ) -> float:
         """
         Áp dụng negative patterns và trả về lượng giảm trừ cho raw_score.
@@ -2548,6 +2705,13 @@ class StaticAnalyzer:
                     reduction += weight
             except re.error:
                 pass
+
+        if guard_modifiers and entry.get("vuln_id") in {"SWC-101", "SWC-105", "SWC-106"}:
+            for mod in guard_modifiers:
+                if re.search(rf'\b{re.escape(mod)}\b', clean_code):
+                    reduction += 0.45
+                    break
+
         return min(raw_score, reduction)
 
     def _get_max_risk(self, findings: Dict[str, VulnerabilityFinding]) -> str:
@@ -2610,7 +2774,10 @@ class StaticAnalyzer:
 # Standalone runner (dùng để test nhanh)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run_static_analysis(contract_code: str) -> Dict:
+def run_static_analysis(
+    contract_code: str,
+    guard_modifiers: Optional[set[str]] = None,
+) -> Dict:
     """
     Convenience wrapper cho Detector Agent.
 
@@ -2626,7 +2793,8 @@ def run_static_analysis(contract_code: str) -> Dict:
         }
     """
     analyzer = StaticAnalyzer()
-    return analyzer.analyze(contract_code)
+    return analyzer.analyze(contract_code, guard_modifiers=guard_modifiers)
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────

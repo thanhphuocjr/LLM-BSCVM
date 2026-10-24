@@ -22,6 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 E2E_ROOT = PROJECT_ROOT / "E2E"
 RUNS_DIR = E2E_ROOT / "runs"
 EXAMPLES_DIR = E2E_ROOT / "examples"
+RUNTIME_DATA_DIR = E2E_ROOT / "data" / "runtime"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 app = FastAPI(
@@ -58,6 +59,148 @@ class AuditRequest(BaseModel):
     backend: str = Field(default="server_gpu", description="Backend: server_gpu, local_fast, local, kaggle, ollama")
     detector_threshold: float = Field(default=0.700, description="Detector threshold (default 0.700 for v13)")
     tools: str = Field(default="slither", description="Security tools: slither or all")
+
+
+class PrepareRequest(BaseModel):
+    code: str = Field(..., description="Solidity smart contract code to decompose")
+    file_name: str = Field(default="Contract.sol", description="Contract filename")
+
+
+def prepare_contract_context(code: str, file_name: str = "Contract.sol") -> Dict[str, Any]:
+    """Phase 0 Prepare: Decomposes full contract into individual functions and extracts contract skeleton context."""
+    from E2E.shared.function_parser import parse_code_units
+
+    if not code.strip():
+        return {
+            "status": "empty",
+            "file_name": file_name,
+            "contract_name": "Contract",
+            "pragmas": [],
+            "imports": [],
+            "contracts": [],
+            "state_variables": [],
+            "modifiers": [],
+            "events": [],
+            "code_units": [],
+            "total_units": 0,
+            "total_lines": 0,
+            "skeleton": "",
+        }
+
+    lines = code.splitlines()
+    total_lines = len(lines)
+
+    # 1. Extract AST code units
+    units = parse_code_units(code)
+
+    # 2. Extract Pragma, Imports, Contracts, Modifiers, Events
+    pragmas = [line.strip() for line in re.findall(r"pragma\s+[^;]+;", code)]
+    imports = [line.strip() for line in re.findall(r"import\s+[^;]+;", code)]
+    contracts = re.findall(r"\b(?:abstract\s+)?(?:contract|library|interface)\s+([A-Za-z_$][\w$]*)", code)
+    primary_contract = contracts[0] if contracts else Path(file_name).stem
+
+    modifiers_declared = re.findall(r"\bmodifier\s+([A-Za-z_$][\w$]*)", code)
+    events_declared = re.findall(r"\bevent\s+([A-Za-z_$][\w$]*)", code)
+
+    # State variables
+    state_variables = []
+    for line in lines:
+        st = line.strip()
+        if (
+            st.startswith(("mapping", "address", "uint", "int", "bool", "bytes", "string"))
+            and ";" in st
+            and "(" not in st.split(";")[0].split("=")[0]
+        ):
+            state_variables.append(st)
+
+    # Process each unit with enriched metadata
+    processed_units = []
+    for u in units:
+        u_dict = u.to_dict()
+        u_code = u.code.strip()
+        u_lines = u_code.splitlines()
+        first_line = u_lines[0] if u_lines else ""
+
+        # Determine visibility
+        vis = "public"
+        for v in ("external", "public", "internal", "private"):
+            if re.search(rf"\b{v}\b", first_line):
+                vis = v
+                break
+
+        # Determine mutability
+        mut = "nonpayable"
+        for m in ("pure", "view", "payable"):
+            if re.search(rf"\b{m}\b", first_line):
+                mut = m
+                break
+
+        # Modifiers applied
+        applied_mods = []
+        for mod in modifiers_declared:
+            if re.search(rf"\b{re.escape(mod)}\b", first_line):
+                applied_mods.append(mod)
+
+        # Signature header (up to '{' or ';')
+        sig_match = re.search(r"^(.*?)(?:\{|;)", u_code, re.DOTALL)
+        signature = sig_match.group(1).strip() if sig_match else first_line.strip()
+        signature = re.sub(r"\s+", " ", signature)
+
+        u_dict.update({
+            "line_count": u.end_line - u.start_line + 1,
+            "signature": signature,
+            "visibility": vis,
+            "mutability": mut,
+            "modifiers": applied_mods,
+        })
+        processed_units.append(u_dict)
+
+    # Generate Contract Skeleton (context without function bodies)
+    unit_line_ranges = set()
+    for u in units:
+        for l_idx in range(u.start_line, u.end_line + 1):
+            unit_line_ranges.add(l_idx)
+
+    skeleton_lines = []
+    for idx, line in enumerate(lines, 1):
+        if idx in unit_line_ranges:
+            continue
+        skeleton_lines.append(line)
+    skeleton = "\n".join(skeleton_lines).strip()
+    if skeleton and not skeleton.endswith("}"):
+        skeleton += "\n}"
+
+    contract_ctx = {
+        "primary_contract": primary_contract,
+        "pragma": pragmas[0] if pragmas else "solc >=0.8.0",
+        "pragmas": pragmas,
+        "imports": imports,
+        "contracts": contracts,
+        "state_variables": state_variables,
+        "modifiers": modifiers_declared,
+        "events": events_declared,
+        "enclosing_skeleton": skeleton,
+        "total_lines": total_lines,
+    }
+
+    return {
+        "status": "success",
+        "file_name": file_name,
+        "contract_name": primary_contract,
+        "pragmas": pragmas,
+        "imports": imports,
+        "contracts": contracts,
+        "state_variables": state_variables,
+        "modifiers": modifiers_declared,
+        "events": events_declared,
+        "code_units": processed_units,
+        "units": processed_units,
+        "contract_context": contract_ctx,
+        "total_units": len(processed_units),
+        "total_lines": total_lines,
+        "skeleton": skeleton,
+        "enclosing_skeleton": skeleton,
+    }
 
 
 def read_json_safe(path: Path) -> Any:
@@ -101,7 +244,7 @@ def get_system_status() -> Dict[str, Any]:
     # Check Dedicated GPU Server (RTX 4070 Ti SUPER v13)
     server_gpu_online = False
     server_gpu_info = {}
-    server_url = os.environ.get("SERVER_GPU_URL", "http://192.168.91.176:6868").rstrip("/")
+    server_url = os.environ.get("SERVER_GPU_URL", "http://100.122.153.35:6868").rstrip("/")
     try:
         import urllib.request
         req = urllib.request.Request(f"{server_url}/api/v1/health", headers={"User-Agent": "LLM-BSCVM-Webapp"})
@@ -110,14 +253,27 @@ def get_system_status() -> Dict[str, Any]:
                 raw_info = json.loads(resp.read().decode("utf-8"))
                 server_gpu_online = raw_info.get("status") == "ready"
                 # Bảo mật: Không để lộ IP/Port ra bên ngoài client
+                used_mb = raw_info.get("vram_used_mb")
+                allocated_gb = round(used_mb / 1024, 2) if used_mb is not None else raw_info.get("vram_allocated_gb")
                 server_gpu_info = {
                     "status": raw_info.get("status"),
                     "gpu_device": raw_info.get("gpu_device", "NVIDIA GeForce RTX 4070 Ti SUPER"),
-                    "model": raw_info.get("model", "qwen25-v13-14b-detector-final"),
-                    "vram_allocated_gb": raw_info.get("vram_allocated_gb"),
+                    "model": raw_info.get("model_name") or raw_info.get("model", "qwen25-v13-14b-detector-final"),
+                    "model_name": raw_info.get("model_name") or raw_info.get("model", "qwen25-v13-14b-detector-final"),
+                    "vram_used_mb": used_mb,
+                    "vram_total_mb": raw_info.get("vram_total_mb"),
+                    "vram_allocated_gb": allocated_gb,
                 }
     except Exception:
         server_gpu_online = False
+
+    kb_file = RUNTIME_DATA_DIR / "knowledge_items.json"
+    kb_count = 0
+    if kb_file.exists():
+        try:
+            kb_count = len(json.loads(kb_file.read_text(encoding="utf-8")))
+        except Exception:
+            kb_count = 0
 
     return {
         "model_version": threshold_cfg.get("model_name", "qwen25-v13-14b-detector-final"),
@@ -129,12 +285,19 @@ def get_system_status() -> Dict[str, Any]:
         "lora_alpha": threshold_cfg.get("lora_alpha", 128),
         "adapter_present": (adapter_path / "adapter_model.safetensors").exists(),
         "adapter_size_bytes": (adapter_path / "adapter_model.safetensors").stat().st_size if (adapter_path / "adapter_model.safetensors").exists() else 0,
-        "knowledge_store_cases": 11869,
+        "knowledge_store_cases": kb_count,
         "server_gpu_online": server_gpu_online,
         "server_gpu_info": server_gpu_info,
         "kaggle_cli_installed": kaggle_available,
         "python_env": sys.executable,
     }
+
+
+@app.get("/api/phases")
+def get_pipeline_phases() -> List[Dict[str, Any]]:
+    """Single Source of Truth cho các Phase của pipeline."""
+    from E2E.shared.phases import PHASES
+    return PHASES
 
 
 @app.get("/api/contracts/examples")
@@ -162,6 +325,15 @@ def get_example_contracts() -> List[Dict[str, Any]]:
                 "line_count": len(code.splitlines()),
             })
     return examples
+
+
+@app.post("/api/contract/prepare")
+def prepare_contract_endpoint(req: PrepareRequest) -> Dict[str, Any]:
+    """Phase 0 Prepare: Immediately decomposes contract into individual functions and extracts contract skeleton context."""
+    try:
+        return prepare_contract_context(req.code, req.file_name)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to prepare contract AST: {str(e)}")
 
 
 @app.post("/api/audit/submit")
@@ -195,7 +367,7 @@ def submit_audit(req: AuditRequest) -> Dict[str, Any]:
         "--detector-threshold",
         str(req.detector_threshold),
         "--max-fix-attempts",
-        "1",
+        "3",
     ]
     if req.tools:
         cmd.extend(["--tools", req.tools])
@@ -435,6 +607,14 @@ def get_run_detail(run_id: str) -> Dict[str, Any]:
         ))
         diff_text = "".join(diff_lines)
 
+    code_units = phase0.get("code_units", [])
+    if not code_units and original_code:
+        try:
+            prep = prepare_contract_context(original_code, contract_name)
+            code_units = prep.get("code_units", [])
+        except Exception:
+            code_units = []
+
     return {
         "run_id": run_id,
         "status": status,
@@ -444,8 +624,15 @@ def get_run_detail(run_id: str) -> Dict[str, Any]:
         "original_code": original_code,
         "fixed_code": fixed_code,
         "diff": diff_text,
+        "code_units": code_units,
+        "contract_context": {
+            "pragmas": [p.strip() for p in re.findall(r"pragma\s+[^;]+;", original_code)],
+            "contracts": re.findall(r"\b(?:abstract\s+)?(?:contract|library|interface)\s+([A-Za-z_$][\w$]*)", original_code),
+            "modifiers": re.findall(r"\bmodifier\s+([A-Za-z_$][\w$]*)", original_code),
+            "total_units": len(code_units),
+        },
         "phases": {
-            "phase0_input": bool(phase0),
+            "phase0_input": phase0 if phase0 else bool(phase0),
             "phase1a_static": static,
             "phase1b_rag": rag,
             "phase1c_llm": {"status": "pending" if is_awaiting_kaggle else "ok"},
@@ -582,8 +769,6 @@ def cancel_run(run_id: str) -> Dict[str, Any]:
                     return {"status": "cancelled", "run_id": run_id}
                 except Exception as e:
                     raise HTTPException(status_code=500, detail=f"Failed to cancel process: {e}")
-    return {"status": "not_running", "run_id": run_id}
-
 
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

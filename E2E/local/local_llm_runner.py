@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import re
@@ -59,11 +60,11 @@ def _derive_findings(request: dict[str, Any]) -> list[dict[str, Any]]:
     for src in ("static", "rag", "provisional_fusion"):
         for f in local_p1.get(src, {}).get("findings", []):
             findings.append(dict(f))
-    # Deduplicate findings by finding_id or (swc, unit_id)
+    # Deduplicate findings by (swc, unit_id) - bỏ line để tránh RAG và Static nhân đôi finding
     seen = set()
     unique_findings = []
     for f in findings:
-        key = (f.get("swc"), f.get("unit_id"), f.get("line"))
+        key = (f.get("swc"), f.get("unit_id"))
         if key not in seen:
             seen.add(key)
             unique_findings.append(f)
@@ -239,7 +240,26 @@ def _generate_advisor_section(
         except Exception:
             pass
 
-    llm_calls = 0
+    # 1. Query Advisor LLM for findings sorted by severity
+    llm_advisor_results = {}
+    if agent is not None and findings:
+        risk_weights = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "Info": 0}
+        findings.sort(key=lambda item: risk_weights.get(item.get("severity", "Medium"), 0), reverse=True)
+        findings_to_query = findings
+
+        def _call_advisor(finding_dict):
+            f_key = finding_dict.get("finding_id") or f"{finding_dict.get('swc')}:{finding_dict.get('unit_id')}"
+            try:
+                res = agent.advise_one(code, finding_dict)
+                return f_key, res
+            except Exception:
+                return f_key, None
+
+        for finding_dict in findings_to_query:
+            f_key, res = _call_advisor(finding_dict)
+            if res and not res.error:
+                llm_advisor_results[f_key] = res
+
     for f in findings:
         swc = f.get("swc", "SWC-100")
         unit_id = f.get("unit_id") or "contract"
@@ -249,31 +269,32 @@ def _generate_advisor_section(
         fixed_code = f.get("fixed_code") or ""
         vulnerable_code = f.get("vulnerable_code") or ""
         checklist = list(f.get("checklist") or ([remediation] if remediation else []))
+        fid = f.get("finding_id") or f"{swc}:{unit_id}"
 
-        # 1. Try LLM generation if enabled (configurable cap, defaults to 5)
-        if agent is not None and llm_calls < MAX_LLM_ADVISOR_CALLS:
-            try:
-                item_sug = agent.advise_one(code, f)
-                llm_calls += 1
-                if item_sug.root_cause and not item_sug.error:
-                    suggestions.append({
-                        "finding_id": f.get("finding_id") or f"{swc}:{unit_id}",
-                        "swc": swc,
-                        "unit_id": unit_id,
-                        "title": item_sug.vulnerability_name or title,
-                        "severity": item_sug.severity or f.get("severity", "Medium"),
-                        "root_cause": item_sug.root_cause,
-                        "impact": item_sug.impact,
-                        "repair_steps": item_sug.repair_steps or [remediation],
-                        "fixed_code": item_sug.fixed_code or fixed_code,
-                        "vulnerable_code": vulnerable_code,
-                        "checklist": item_sug.prevention or checklist,
-                        "prevention": item_sug.prevention or checklist,
-                        "recommendations": [remediation],
-                    })
-                    continue
-            except Exception:
-                pass
+        # 1. Check if LLM result succeeded
+        item_sug = llm_advisor_results.get(fid)
+        if item_sug:
+            if not item_sug.is_true_positive:
+                # Filtered out by Advisor as false positive
+                continue
+            suggestions.append({
+                "finding_id": fid,
+                "swc": swc,
+                "unit_id": unit_id,
+                "title": item_sug.vulnerability_name or title,
+                "severity": item_sug.severity or f.get("severity", "Medium"),
+                "root_cause": item_sug.root_cause,
+                "impact": item_sug.impact,
+                "repair_steps": item_sug.repair_steps or [remediation],
+                "fixed_code": item_sug.fixed_code or fixed_code,
+                "vulnerable_code": vulnerable_code,
+                "checklist": item_sug.prevention or checklist,
+                "prevention": item_sug.prevention or checklist,
+                "recommendations": [remediation],
+                "fix_strategy": item_sug.fix_strategy,
+                "is_true_positive": True,
+            })
+            continue
 
         # 2. Grounded generation via RepairKnowledgeBase
         retrieved_rems = []
@@ -364,31 +385,57 @@ def _generate_assessor_section(
             if sug.get("impact") and not f_enriched.get("impact"):
                 f_enriched["impact"] = sug["impact"]
 
-        # 1. Try LLM risk assessment if enabled (configurable cap, defaults to 5)
-        if agent is not None and llm_calls < MAX_LLM_ASSESSOR_CALLS:
+    # 1. Parallelize LLM risk assessments for top findings
+    llm_assessor_results = {}
+    if agent is not None and findings:
+        findings_to_query = findings[:MAX_LLM_ASSESSOR_CALLS]
+        def _call_assessor(finding_dict):
+            f_key = finding_dict.get("finding_id") or f"{finding_dict.get('swc')}:{finding_dict.get('unit_id')}"
+            f_enr = dict(finding_dict)
+            s = suggestions_by_id.get(finding_dict.get("finding_id")) or suggestions_by_swc.get(finding_dict.get("swc")) or {}
+            if s:
+                if s.get("root_cause") and not f_enr.get("root_cause"):
+                    f_enr["root_cause"] = s["root_cause"]
+                if s.get("impact") and not f_enr.get("impact"):
+                    f_enr["impact"] = s["impact"]
             try:
-                res = agent.assess_one(code, f_enriched)
-                llm_calls += 1
-                if res.cvss_score > 0 and not res.error:
-                    assessments.append({
-                        "finding_id": f.get("finding_id") or f"{swc}:{unit_id}",
-                        "swc": swc,
-                        "unit_id": unit_id,
-                        "title": title,
-                        "severity": res.risk_level or severity,
-                        "risk_level": res.risk_level or severity,
-                        "impact": f"High risk of unauthorized state modification or asset drain via {title}.",
-                        "cvss_score": res.cvss_score,
-                        "cvss_vector": res.cvss_vector,
-                        "likelihood": res.likelihood,
-                        "impact_rating": res.impact_rating,
-                        "funds_at_risk": res.funds_at_risk,
-                        "justification": res.justification,
-                        "repair_priority": res.repair_priority or 1,
-                    })
-                    continue
+                res = agent.assess_one(code, f_enr)
+                return f_key, res
             except Exception:
-                pass
+                return f_key, None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(findings_to_query), 4)) as executor:
+            for f_key, res in executor.map(_call_assessor, findings_to_query):
+                if res and getattr(res, "cvss_score", 0) > 0 and not getattr(res, "error", None):
+                    llm_assessor_results[f_key] = res
+
+    for f in findings:
+        swc = f.get("swc", "SWC-100")
+        unit_id = f.get("unit_id") or "contract"
+        title = f.get("title") or f"Vulnerability {swc}"
+        severity = f.get("severity") or ("High" if swc in {"SWC-107", "SWC-105", "SWC-115"} else "Medium")
+        fid = f.get("finding_id") or f"{swc}:{unit_id}"
+
+        # 1. Check if parallel LLM risk assessment succeeded
+        res = llm_assessor_results.get(fid)
+        if res:
+            assessments.append({
+                "finding_id": fid,
+                "swc": swc,
+                "unit_id": unit_id,
+                "title": title,
+                "severity": res.risk_level or severity,
+                "risk_level": res.risk_level or severity,
+                "impact": res.justification or f.get("impact") or f.get("description") or f"Risk evaluated with CVSS score {res.cvss_score} ({res.risk_level}).",
+                "cvss_score": res.cvss_score,
+                "cvss_vector": res.cvss_vector,
+                "likelihood": res.likelihood,
+                "impact_rating": res.impact_rating,
+                "funds_at_risk": res.funds_at_risk,
+                "justification": res.justification,
+                "repair_priority": res.repair_priority or 1,
+            })
+            continue
 
         # 2. Grounded CVSS calculation based on calibrated SWC standard
         cvss_meta = get_cvss_defaults(swc, severity)
@@ -459,7 +506,20 @@ def _apply_heuristic_security_patch(
                         None,
                     )
                     if target_unit:
-                        unit_obj = target_unit if isinstance(target_unit, CodeUnit) else CodeUnit(**target_unit)
+                        if isinstance(target_unit, CodeUnit):
+                            unit_obj = target_unit
+                        else:
+                            unit_obj = CodeUnit(
+                                unit_id=target_unit.get("unit_id", "unknown"),
+                                kind=target_unit.get("kind", "function"),
+                                name=target_unit.get("name", "func"),
+                                contract_name=target_unit.get("contract_name", "Contract"),
+                                start_offset=target_unit.get("start_offset", 0),
+                                end_offset=target_unit.get("end_offset", len(target_unit.get("code", ""))),
+                                start_line=target_unit.get("start_line", 1),
+                                end_line=target_unit.get("end_line", 10),
+                                code=target_unit.get("code", ""),
+                            )
                         norm_u = re.sub(r"\s+", " ", unit_obj.code).strip()
                         if norm_v == norm_u or norm_v in norm_u:
                             updated_code, unit_outcomes = apply_unit_patches(
@@ -553,6 +613,7 @@ def run_local_llm_pipeline(
     ollama_model: str = DEFAULT_OLLAMA_MODEL,
 ) -> dict[str, Any]:
     """Runs the complete CodeLlama / Local LLM pipeline on Mac M2."""
+    started_at = time.perf_counter()
     run_id = request.get("run_id", "local-run")
     source_code = request.get("source", {}).get("code", "")
     code_units = request.get("code_units", [])
@@ -561,24 +622,22 @@ def run_local_llm_pipeline(
         request.get("execution", {}).get("detector_threshold") or DEFAULT_DETECTOR_THRESHOLD
     )
 
-    # 1. Detector results on Code Units
+    # 1. Detector results on Code Units - Local Ollama / heuristic backend does not run neural detector
     unit_results = []
     for unit in code_units:
         unit_id = unit.get("unit_id", "unknown")
-        # Check if unit overlaps with findings
-        is_vuln = any(f.get("unit_id") == unit_id for f in findings)
-        prob = 0.88 if is_vuln else 0.05
         unit_results.append({
             "unit_id": unit_id,
-            "label": "Vulnerable" if is_vuln else "Safe",
-            "vulnerability_probability": prob,
+            "label": "NotRun",
+            "status": "not_run",
+            "vulnerability_probability": None,
             "threshold": detector_threshold,
             "start_line": unit.get("start_line"),
             "end_line": unit.get("end_line"),
         })
 
-    is_contract_vuln = any(u["label"] == "Vulnerable" for u in unit_results) or len(findings) > 0
-    print(f"[{time.strftime('%H:%M:%S')}] [PHASE 1C] Completed: Local neural heuristic detection finished.", flush=True)
+    is_contract_vuln = len(findings) > 0
+    print(f"[{time.strftime('%H:%M:%S')}] [PHASE 1C] Neural detector not run on local heuristic backend (detector: not_run).", flush=True)
     print(f"[{time.strftime('%H:%M:%S')}] [PHASE 1 FUSED] Synchronizing multi-modal detection signals...", flush=True)
 
     # Truy xuất cơ sở tri thức lỗ hổng (11,869 cases + 37 SWC registry) theo LLM-BSCVM
@@ -670,26 +729,18 @@ def run_local_llm_pipeline(
 
     phases = {
         "detector": {
-            "status": "ok",
+            "status": "not_run",
             "original": {
-                "verdict": "Vulnerable" if is_contract_vuln else "Safe",
-                "vulnerability_probability": 0.88 if is_contract_vuln else 0.05,
+                "verdict": "Inconclusive",
+                "vulnerability_probability": None,
                 "threshold": detector_threshold,
                 "unit_results": unit_results,
             },
             "fixed": {
-                "verdict": "Safe",
-                "vulnerability_probability": 0.05,
+                "verdict": "Inconclusive",
+                "vulnerability_probability": None,
                 "threshold": detector_threshold,
-                "unit_results": [
-                    {
-                        "unit_id": u["unit_id"],
-                        "label": "Safe",
-                        "vulnerability_probability": 0.04,
-                        "threshold": detector_threshold,
-                    }
-                    for u in unit_results
-                ],
+                "unit_results": unit_results,
             },
         },
         "advisor": advisor,
@@ -722,6 +773,7 @@ def run_local_llm_pipeline(
         },
     }
 
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
     return {
         "schema_version": "1.0.0",
         "pipeline_version": "1.0.0",
@@ -731,8 +783,8 @@ def run_local_llm_pipeline(
         "source_sha256": request.get("source", {}).get("sha256", ""),
         "phases": phases,
         "timings": {
-            "total_ms": 120,
-            "detector_ms": 40,
-            "fixer_ms": 50,
+            "total_ms": elapsed_ms,
+            "detector_ms": 0.0,
+            "fixer_ms": elapsed_ms,
         },
     }

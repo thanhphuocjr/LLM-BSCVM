@@ -19,6 +19,7 @@ Cổng mặc định: 8000
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import json
 import logging
@@ -307,13 +308,26 @@ def detect_vulnerability(req: DetectRequest):
         prob_vuln = float(probs[1].item())
         prob_safe = float(probs[0].item())
 
-        # Line scores nếu có line_head
+        # Line scores nếu có line_head: gộp theo dòng của code gốc (chưa normalize) - Task B7
         line_scores = None
         if CONTAINER.line_head is not None:
             try:
                 line_logits = CONTAINER.line_head(hidden_states.float()).squeeze(-1)
-                line_probs = torch.sigmoid(line_logits)[0].tolist()
-                line_scores = [round(float(p), 4) for p in line_probs]
+                token_probs = torch.sigmoid(line_logits)[0].tolist()
+                prefix_tokens = len(CONTAINER.tokenizer(INSTRUCTION_PROMPT, add_special_tokens=False)["input_ids"])
+                code_token_probs = token_probs[prefix_tokens : last_token_idx[0].item() + 1]
+                code_lines = req.code.splitlines()
+                num_lines = max(1, len(code_lines))
+                if code_token_probs and num_lines > 0:
+                    tokens_per_line = len(code_token_probs) / num_lines
+                    line_scores = []
+                    for i in range(num_lines):
+                        st = int(i * tokens_per_line)
+                        en = int((i + 1) * tokens_per_line) if i < num_lines - 1 else len(code_token_probs)
+                        chunk = code_token_probs[st:en]
+                        line_scores.append(round(float(max(chunk)), 4) if chunk else 0.0)
+                else:
+                    line_scores = [0.0] * num_lines
             except Exception as e:
                 logger.warning(f"Line head error: {e}")
 
@@ -351,15 +365,26 @@ def generate_text(req: ChatRequest):
         add_generation_prompt=True,
     )
 
+    prompt_tokens = CONTAINER.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+    if len(prompt_tokens) > 4096:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Prompt context length exceeded: {len(prompt_tokens)} tokens > 4096. Client must budget contract context (Task B3).",
+        )
+
     inputs = CONTAINER.tokenizer(
         prompt_text,
         return_tensors="pt",
-        truncation=True,
-        max_length=4096,
+        truncation=False,
     ).to(CONTAINER.device)
 
     input_len = inputs["input_ids"].shape[1]
-    with torch.no_grad():
+    disable_adapter_ctx = (
+        CONTAINER.causal_model.disable_adapter()
+        if hasattr(CONTAINER.causal_model, "disable_adapter")
+        else contextlib.nullcontext()
+    )
+    with torch.no_grad(), disable_adapter_ctx:
         output_ids = CONTAINER.causal_model.generate(
             **inputs,
             max_new_tokens=req.max_tokens or 1500,
@@ -394,15 +419,26 @@ def openai_chat_completions(req: OpenAIChatRequest):
         add_generation_prompt=True,
     )
 
+    prompt_tokens = CONTAINER.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+    if len(prompt_tokens) > 4096:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Prompt context length exceeded: {len(prompt_tokens)} tokens > 4096. Client must budget contract context (Task B3).",
+        )
+
     inputs = CONTAINER.tokenizer(
         prompt_text,
         return_tensors="pt",
-        truncation=True,
-        max_length=4096,
+        truncation=False,
     ).to(CONTAINER.device)
 
     input_len = inputs["input_ids"].shape[1]
-    with torch.no_grad():
+    disable_adapter_ctx = (
+        CONTAINER.causal_model.disable_adapter()
+        if hasattr(CONTAINER.causal_model, "disable_adapter")
+        else contextlib.nullcontext()
+    )
+    with torch.no_grad(), disable_adapter_ctx:
         output_ids = CONTAINER.causal_model.generate(
             **inputs,
             max_new_tokens=req.max_tokens or 1500,

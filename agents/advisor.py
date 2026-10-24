@@ -43,43 +43,33 @@ DEFAULT_KNOWLEDGE_DIR = (
     else PROJECT_ROOT / "rag" / "knowledge_store"
 )
 
-# Structured-output schema (OpenAPI subset) — guarantees Gemini returns valid,
-# parseable JSON even when fixed_code contains quotes / newlines / special chars.
+# Structured-output schema (OpenAPI subset)
 REPAIR_RESPONSE_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
-        "vulnerability_name": {"type": "string"},
+        "is_true_positive": {"type": "boolean"},
+        "evidence_lines": {"type": "array", "items": {"type": "integer"}},
         "root_cause": {"type": "string"},
-        "impact": {"type": "string"},
-        "repair_steps": {"type": "array", "items": {"type": "string"}},
-        "fixed_code": {"type": "string"},
-        "prevention": {"type": "array", "items": {"type": "string"}},
+        "attack_scenario": {"type": "string"},
+        "preconditions": {"type": "array", "items": {"type": "string"}},
+        "fix_strategy": {"type": "string"},
     },
     "required": [
-        "vulnerability_name",
+        "is_true_positive",
+        "evidence_lines",
         "root_cause",
-        "impact",
-        "repair_steps",
-        "fixed_code",
-        "prevention",
-    ],
-    "propertyOrdering": [
-        "vulnerability_name",
-        "root_cause",
-        "impact",
-        "repair_steps",
-        "fixed_code",
-        "prevention",
+        "attack_scenario",
+        "preconditions",
+        "fix_strategy",
     ],
 }
 
 ADVISOR_SYSTEM_INSTRUCTION = (
     "You are a senior smart-contract security auditor specialising in Solidity. "
-    "Your task is to produce a precise, actionable repair suggestion for a single "
-    "confirmed vulnerability in the provided contract. Ground your answer in the "
-    "supplied contract code and the retrieved security knowledge. Be concrete and "
-    "specific to THIS contract — never give generic advice. Return ONLY valid JSON "
-    "matching the requested schema."
+    "Your task is to audit candidate vulnerability findings. Candidate findings may be false positives. "
+    "Carefully verify whether the finding is a genuine, exploitable vulnerability (true positive) "
+    "or an invalid/guarded false positive. Ground your verdict and evidence strictly in the supplied "
+    "function code and contract context. Return ONLY valid JSON matching the requested schema."
 )
 
 
@@ -98,6 +88,11 @@ class RepairSuggestion:
     prevention: List[str]
     knowledge_sources: List[str] = field(default_factory=list)
     error: str | None = None
+    is_true_positive: bool = True
+    evidence_lines: List[int] = field(default_factory=list)
+    fix_strategy: str = ""
+    attack_scenario: str = ""
+    preconditions: List[str] = field(default_factory=list)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -459,47 +454,66 @@ class AdvisorAgent:
         swc = vulnerability.get("swc") or "Unknown"
         title = vulnerability.get("title") or "Unknown vulnerability"
         severity = vulnerability.get("severity") or "Unknown"
-        description = str(vulnerability.get("description") or "").strip()
-        related_code = self._related_code_block(vulnerability)
 
-        schema = (
+        target_code = (
+            vulnerability.get("unit_code")
+            or vulnerability.get("vulnerable_code")
+            or vulnerability.get("matched_text")
+            or ""
+        )
+        start_line = vulnerability.get("start_line") or vulnerability.get("line") or 1
+        end_line = vulnerability.get("end_line") or (start_line + target_code.count("\n"))
+
+        sol_match = re.search(r"pragma\s+solidity\s+([^;]+);", code)
+        compiler_note = sol_match.group(1).strip() if sol_match else "0.4.x"
+
+        context_str = ""
+        try:
+            from E2E.shared.function_parser import build_contract_context
+            unit_info = {
+                "name": vulnerability.get("name") or vulnerability.get("unit_id") or "target",
+                "contract_name": vulnerability.get("contract_name") or "Contract",
+                "code": target_code,
+            }
+            context_str = build_contract_context(unit_info, code, budget_tokens=1500)
+        except Exception:
+            context_str = ""
+
+        schema_str = (
             "{\n"
-            '  "vulnerability_name": string,\n'
-            '  "root_cause": string,            // why this contract is vulnerable\n'
-            '  "impact": string,                // what an attacker can achieve\n'
-            '  "repair_steps": [string],        // concrete ordered steps\n'
-            '  "fixed_code": string,            // corrected Solidity for the affected function(s)\n'
-            '  "prevention": [string]           // preventive measures / best practices\n'
+            '  "is_true_positive": bool,         // true if genuinely exploitable, false if false positive or guarded\n'
+            '  "evidence_lines": [int],          // line numbers within <TargetFunction> exhibiting the flaw\n'
+            '  "root_cause": string,             // detailed technical explanation of the flaw or why it is false positive\n'
+            '  "attack_scenario": string,        // concrete step-by-step exploit scenario (or "None" if false positive)\n'
+            '  "preconditions": [string],        // prerequisites for exploitation\n'
+            '  "fix_strategy": string            // high-level conceptual remediation strategy for Fixer\n'
             "}"
         )
 
         sections = [
-            "Analyze the detected vulnerability and provide a repair suggestion.",
+            "You are auditing ONE candidate finding. It may be a false positive.",
+            f"Candidate: {title} ({swc}) - Severity: {severity}",
+            f"Solidity version: {compiler_note}",
             "",
-            "<DetectedVulnerability>",
-            f"SWC: {swc}",
-            f"Name: {title}",
-            f"Severity: {severity}",
-            f"Detector note: {description[:600]}" if description else "Detector note: (none)",
-            "</DetectedVulnerability>",
+            "Return ONLY valid JSON matching this schema:",
+            schema_str,
             "",
+            "Rules:",
+            "1. Cite only lines that exist in <TargetFunction>.",
+            "2. If the function is protected by an authorization modifier (e.g. onlyOwner, oO) or by `if (msg.sender != ...) revert/throw`, an access-control finding is a FALSE POSITIVE (`is_true_positive: false`).",
+            "3. If this candidate is a false positive, set `is_true_positive: false` and describe the protective guard in `root_cause`.",
+            "",
+            f'<TargetFunction lines="{start_line}-{end_line}">',
+            target_code if target_code else code[:2000],
+            "</TargetFunction>",
+            "",
+            "<Context>",
+            context_str if context_str else "No additional context",
+            "</Context>",
+            "",
+            "<Knowledge>",
             knowledge_block,
-            "",
-            "<AffectedCode>",
-            related_code if related_code else "(specific lines not isolated — use the full contract below)",
-            "</AffectedCode>",
-            "",
-            "<FullContract>",
-            "```solidity",
-            code.strip()[:12000],
-            "```",
-            "</FullContract>",
-            "",
-            "Return ONLY a JSON object with exactly this schema:",
-            schema,
-            "Rules: repair_steps and prevention are arrays of short strings. "
-            "fixed_code must be valid Solidity specific to this contract. "
-            "Do not wrap the JSON in markdown fences.",
+            "</Knowledge>",
         ]
         return "\n".join(sections)
 
@@ -539,6 +553,9 @@ class AdvisorAgent:
                 prevention=[],
                 knowledge_sources=sources,
                 error=f"{type(error).__name__}: {error}",
+                is_true_positive=True,
+                evidence_lines=[],
+                fix_strategy="",
             )
 
         def as_list(value: Any) -> List[str]:
@@ -547,16 +564,41 @@ class AdvisorAgent:
             text = str(value or "").strip()
             return [text] if text else []
 
+        is_true_positive = bool(data.get("is_true_positive", True))
+        raw_lines = data.get("evidence_lines", [])
+        evidence_lines = []
+        if isinstance(raw_lines, list):
+            for x in raw_lines:
+                try:
+                    evidence_lines.append(int(x))
+                except (ValueError, TypeError):
+                    pass
+
+        st_line = vulnerability.get("start_line")
+        end_line = vulnerability.get("end_line")
+        if st_line is not None and end_line is not None and evidence_lines:
+            evidence_lines = [ln for ln in evidence_lines if st_line <= ln <= end_line]
+
+        root_cause = str(data.get("root_cause") or "").strip()
+        fix_strategy = str(data.get("fix_strategy") or "").strip()
+        attack_scenario = str(data.get("attack_scenario") or "").strip()
+        preconditions = as_list(data.get("preconditions"))
+
         return RepairSuggestion(
             swc=swc,
             vulnerability_name=str(data.get("vulnerability_name") or title).strip(),
             severity=severity,
-            root_cause=str(data.get("root_cause") or "").strip(),
-            impact=str(data.get("impact") or "").strip(),
-            repair_steps=as_list(data.get("repair_steps")),
-            fixed_code=str(data.get("fixed_code") or "").strip(),
-            prevention=as_list(data.get("prevention")),
+            root_cause=root_cause,
+            impact=attack_scenario or str(data.get("impact") or "").strip(),
+            repair_steps=[fix_strategy] if fix_strategy else [],
+            fixed_code="",
+            prevention=preconditions,
             knowledge_sources=sources,
+            is_true_positive=is_true_positive,
+            evidence_lines=evidence_lines,
+            fix_strategy=fix_strategy,
+            attack_scenario=attack_scenario,
+            preconditions=preconditions,
         )
 
     # ── batch over a detection result ───────────────────────────────────────

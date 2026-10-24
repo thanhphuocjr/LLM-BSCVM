@@ -369,7 +369,7 @@ class OllamaClient:
 # ──────────────────────────────────────────────────────────────────────────────
 # Server GPU backend (Dedicated RTX 4070 Ti SUPER v13 API)
 # ──────────────────────────────────────────────────────────────────────────────
-DEFAULT_SERVER_GPU_URL = "http://192.168.91.176:6868"
+DEFAULT_SERVER_GPU_URL = "http://100.122.153.35:6868"
 
 
 class ServerGPUClient:

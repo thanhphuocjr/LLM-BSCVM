@@ -54,45 +54,94 @@ def normalize_level(level: object, cvss_score: float | None = None) -> str:
     return "Medium"
 
 
+def compute_cvss_31_base_score(
+    av: str = "N",
+    ac: str = "L",
+    pr: str = "N",
+    ui: str = "N",
+    s: str = "U",
+    c: str = "N",
+    i: str = "H",
+    a: str = "H",
+) -> tuple[float, str]:
+    """Calculate CVSS v3.1 base score algorithmically from metrics according to FIRST spec."""
+    import math
+
+    av_weights = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.20}
+    ac_weights = {"L": 0.77, "H": 0.44}
+    pr_weights_u = {"N": 0.85, "L": 0.62, "H": 0.27}
+    pr_weights_c = {"N": 0.85, "L": 0.68, "H": 0.50}
+    ui_weights = {"N": 0.85, "R": 0.62}
+    c_weights = {"N": 0.0, "L": 0.22, "H": 0.56}
+    i_weights = {"N": 0.0, "L": 0.22, "H": 0.56}
+    a_weights = {"N": 0.0, "L": 0.22, "H": 0.56}
+
+    av_val = av_weights.get(av.upper(), 0.85)
+    ac_val = ac_weights.get(ac.upper(), 0.77)
+    scope_changed = s.upper() == "C"
+    pr_val = (pr_weights_c if scope_changed else pr_weights_u).get(pr.upper(), 0.85)
+    ui_val = ui_weights.get(ui.upper(), 0.85)
+
+    c_val = c_weights.get(c.upper(), 0.0)
+    i_val = i_weights.get(i.upper(), 0.56)
+    a_val = a_weights.get(a.upper(), 0.56)
+
+    iss = 1.0 - ((1.0 - c_val) * (1.0 - i_val) * (1.0 - a_val))
+    if not scope_changed:
+        impact = 6.42 * iss
+    else:
+        impact = 7.52 * (iss - 0.029) - 3.25 * ((iss - 0.02) ** 15)
+
+    exploitability = 8.22 * av_val * ac_val * pr_val * ui_val
+
+    if impact <= 0:
+        base_score = 0.0
+    else:
+        if not scope_changed:
+            raw_score = min(impact + exploitability, 10.0)
+        else:
+            raw_score = min(1.08 * (impact + exploitability), 10.0)
+        base_score = math.ceil(raw_score * 10.0) / 10.0
+
+    vector = f"CVSS:3.1/AV:{av.upper()}/AC:{ac.upper()}/PR:{pr.upper()}/UI:{ui.upper()}/S:{'C' if scope_changed else 'U'}/C:{c.upper()}/I:{i.upper()}/A:{a.upper()}"
+    return round(base_score, 1), vector
+
+
 ASSESSOR_SYSTEM_INSTRUCTION = (
     "You are a smart-contract security risk analyst. For a single confirmed "
-    "vulnerability, assess its risk using the CVSS v3.1 base-score standard and "
-    "classify it into a four-level system: Critical, High, Medium, or Low. "
-    "Base your judgement on exploitability (attack vector, complexity, privileges, "
-    "user interaction) and impact (funds at risk, confidentiality, integrity, "
-    "availability) for THIS specific contract. Return ONLY valid JSON matching the "
-    "requested schema."
+    "vulnerability, select each CVSS v3.1 metric based on the specific smart-contract context: "
+    "AV (Attack Vector), AC (Attack Complexity), PR (Privileges Required), UI (User Interaction), "
+    "S (Scope), C (Confidentiality), I (Integrity), A (Availability). "
+    "The final CVSS score will be computed algorithmically from your metric selections. "
+    "Return ONLY valid JSON matching the requested schema."
 )
 
-# Structured-output schema — guarantees a parseable, well-typed response.
+# Structured-output schema
 RISK_RESPONSE_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
-        "risk_level": {"type": "string", "enum": list(RISK_LEVELS)},
-        "cvss_score": {"type": "number"},
-        "cvss_vector": {"type": "string"},
-        "likelihood": {"type": "string", "enum": ["High", "Medium", "Low"]},
-        "impact_rating": {"type": "string", "enum": ["High", "Medium", "Low"]},
-        "justification": {"type": "string"},
+        "attack_vector": {"type": "string", "enum": ["N", "A", "L", "P"]},
+        "attack_complexity": {"type": "string", "enum": ["L", "H"]},
+        "privileges_required": {"type": "string", "enum": ["N", "L", "H"]},
+        "user_interaction": {"type": "string", "enum": ["N", "R"]},
+        "scope": {"type": "string", "enum": ["U", "C"]},
+        "confidentiality": {"type": "string", "enum": ["N", "L", "H"]},
+        "integrity": {"type": "string", "enum": ["N", "L", "H"]},
+        "availability": {"type": "string", "enum": ["N", "L", "H"]},
         "funds_at_risk": {"type": "boolean"},
+        "justification": {"type": "string"},
     },
     "required": [
-        "risk_level",
-        "cvss_score",
-        "cvss_vector",
-        "likelihood",
-        "impact_rating",
-        "justification",
+        "attack_vector",
+        "attack_complexity",
+        "privileges_required",
+        "user_interaction",
+        "scope",
+        "confidentiality",
+        "integrity",
+        "availability",
         "funds_at_risk",
-    ],
-    "propertyOrdering": [
-        "risk_level",
-        "cvss_score",
-        "cvss_vector",
-        "likelihood",
-        "impact_rating",
         "justification",
-        "funds_at_risk",
     ],
 }
 
@@ -166,13 +215,16 @@ class AssessorAgent:
 
         schema = (
             "{\n"
-            '  "risk_level": "Critical|High|Medium|Low",\n'
-            '  "cvss_score": number,            // CVSS v3.1 base score 0.0-10.0\n'
-            '  "cvss_vector": string,           // e.g. CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:H\n'
-            '  "likelihood": "High|Medium|Low", // exploitation likelihood\n'
-            '  "impact_rating": "High|Medium|Low",\n'
-            '  "justification": string,         // why this level, grounded in the contract\n'
-            '  "funds_at_risk": boolean\n'
+            '  "attack_vector": "N|A|L|P",      // N: callable via any blockchain tx, A: adjacent, L: local, P: physical\n'
+            '  "attack_complexity": "L|H",      // L: standard tx exploit, H: requires front-running/race condition/miner\n'
+            '  "privileges_required": "N|L|H",  // N: public permissionless, L: regular caller, H: contract owner/admin\n'
+            '  "user_interaction": "N|R",       // N: direct exploit, R: requires victim transaction / approve\n'
+            '  "scope": "U|C",                  // U: this contract only, C: impacts external tokens / protocols\n'
+            '  "confidentiality": "N|L|H",      // information disclosure\n'
+            '  "integrity": "N|L|H",            // unauthorized token transfer, state corruption\n'
+            '  "availability": "N|L|H",         // frozen ether, contract bricked, locked balances\n'
+            '  "funds_at_risk": boolean,        // true if assets or token balances can be drained or frozen\n'
+            '  "justification": string          // technical rationale for metric choices\n'
             "}"
         )
 
@@ -199,8 +251,7 @@ class AssessorAgent:
             "",
             "Return ONLY a JSON object with exactly this schema:",
             schema,
-            "Use the standard CVSS v3.1 base-score-to-severity bands "
-            "(0.1-3.9 Low, 4.0-6.9 Medium, 7.0-8.9 High, 9.0-10.0 Critical). "
+            "Carefully evaluate smart-contract exploitability (front-running, owner privileges) and impact. "
             "Do not wrap the JSON in markdown fences.",
         ])
         return "\n".join(sections)
@@ -210,6 +261,20 @@ class AssessorAgent:
         swc = item.get("swc") or "Unknown"
         name = item.get("vulnerability_name") or item.get("title") or "Unknown vulnerability"
         detector_severity = item.get("severity") or "Unknown"
+
+        if item.get("is_true_positive") is False:
+            return RiskAssessment(
+                swc=swc,
+                vulnerability_name=name,
+                detector_severity="Low",
+                risk_level="Low",
+                cvss_score=0.0,
+                cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N",
+                likelihood="Low",
+                impact_rating="Low",
+                funds_at_risk=False,
+                justification="Advisor filtered this finding as a false positive.",
+            )
 
         risk_guidance = item.get("risk_guidance")
         if not risk_guidance and getattr(self, "knowledge_base", None):
@@ -240,23 +305,39 @@ class AssessorAgent:
                 error=f"{type(error).__name__}: {error}",
             )
 
-        try:
-            cvss_score = round(float(data.get("cvss_score") or 0.0), 1)
-        except (TypeError, ValueError):
-            cvss_score = 0.0
-        cvss_score = max(0.0, min(10.0, cvss_score))
+        cvss_score, cvss_vector = compute_cvss_31_base_score(
+            av=str(data.get("attack_vector") or "N"),
+            ac=str(data.get("attack_complexity") or "L"),
+            pr=str(data.get("privileges_required") or "N"),
+            ui=str(data.get("user_interaction") or "N"),
+            s=str(data.get("scope") or "U"),
+            c=str(data.get("confidentiality") or "N"),
+            i=str(data.get("integrity") or "H"),
+            a=str(data.get("availability") or "H"),
+        )
+        risk_level = cvss_to_level(cvss_score)
+        funds_at_risk = bool(data.get("funds_at_risk"))
+        justification = str(data.get("justification") or "").strip()
+
+        ac = str(data.get("attack_complexity") or "L").upper()
+        pr = str(data.get("privileges_required") or "N").upper()
+        likelihood = "High" if (ac == "L" and pr == "N") else ("Low" if (ac == "H" or pr == "H") else "Medium")
+
+        i_metric = str(data.get("integrity") or "H").upper()
+        a_metric = str(data.get("availability") or "H").upper()
+        impact_rating = "High" if (i_metric == "H" or a_metric == "H" or funds_at_risk) else ("Low" if (i_metric == "N" and a_metric == "N") else "Medium")
 
         return RiskAssessment(
             swc=swc,
             vulnerability_name=str(data.get("vulnerability_name") or name).strip(),
             detector_severity=detector_severity,
-            risk_level=normalize_level(data.get("risk_level"), cvss_score),
+            risk_level=risk_level,
             cvss_score=cvss_score,
-            cvss_vector=str(data.get("cvss_vector") or "").strip(),
-            likelihood=str(data.get("likelihood") or "").strip(),
-            impact_rating=str(data.get("impact_rating") or "").strip(),
-            funds_at_risk=bool(data.get("funds_at_risk")),
-            justification=str(data.get("justification") or "").strip(),
+            cvss_vector=cvss_vector,
+            likelihood=likelihood,
+            impact_rating=impact_rating,
+            funds_at_risk=funds_at_risk,
+            justification=justification,
         )
 
     # ── input adaptation ────────────────────────────────────────────────────

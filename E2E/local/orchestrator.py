@@ -18,12 +18,12 @@ from E2E.config import (
 )
 from E2E.local.behavior_verifier import verify_patch_behavior
 from E2E.local.rag_runner import run_rag
-from E2E.local.report import apply_verification_to_report, build_report_data, write_reports
+from E2E.local.report import apply_verification_to_report, build_report_data, render_markdown, write_reports
 from E2E.local.static_runner import run_static
 from E2E.local.tool_verifier import verify_security_tool_matrix
 from E2E.shared.function_parser import parse_code_units
 from E2E.shared.fusion import fuse_detection
-from E2E.shared.io_utils import read_json, sha256_text, utc_now, write_json
+from E2E.shared.io_utils import read_json, sha256_text, utc_now, write_json, write_text
 
 
 MAX_FIX_ATTEMPTS = 3
@@ -171,8 +171,8 @@ def _llm_vulnerability_reason(
     ]
     if vulnerable_units:
         details = ", ".join(f"{unit_id} ({probability:.3f})" for unit_id, probability in vulnerable_units)
-        return f"The CodeLlama binary detector still flags: {details}."
-    return str(detector.get("error") or "The CodeLlama verification did not return a Safe verdict.")
+        return f"The neural detector still flags: {details}."
+    return str(detector.get("error") or "The neural detector verification did not return a Safe verdict.")
 
 
 def build_repair_feedback(
@@ -246,6 +246,10 @@ def build_tool_repair_feedback(
     *,
     attempt: int,
     max_attempts: int = MAX_FIX_ATTEMPTS,
+    static_result: dict[str, Any] | None = None,
+    rag_result: dict[str, Any] | None = None,
+    detector_fixed: dict[str, Any] | None = None,
+    verifier: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     components: dict[str, Any] = {}
     for tool_name, result in tool_result.get("tools", {}).items():
@@ -264,6 +268,20 @@ def build_tool_repair_feedback(
             "reason": result.get("detail"),
             "error": result.get("error"),
         }
+    channel_passed = True
+    if any([static_result, rag_result, detector_fixed, verifier]):
+        channel_feedback = build_repair_feedback(
+            static_result or {},
+            rag_result or {},
+            detector_fixed,
+            verifier,
+            attempt=attempt,
+            max_attempts=max_attempts,
+        )
+        for ch_name, ch_data in channel_feedback.get("components", {}).items():
+            components[ch_name] = ch_data
+        channel_passed = channel_feedback.get("passed", True)
+
     compile_info = tool_result.get("compile", {})
     compile_status = compile_info.get("status", "unknown")
     compile_passed = compile_status == "passed"
@@ -298,6 +316,7 @@ def build_tool_repair_feedback(
         "attempt": attempt,
         "max_attempts": min(max(1, max_attempts), MAX_FIX_ATTEMPTS),
         "passed": tool_result.get("policy_verdict") == "passed" and compile_passed,
+        "channel_passed": channel_passed,
         "policy_verdict": tool_result.get("policy_verdict", "inconclusive"),
         "policy_reason": tool_result.get("policy_reason", ""),
         "compile_passed": compile_passed,
@@ -432,6 +451,10 @@ def run_kaggle_repair_loop(
             tool_result,
             attempt=attempt_number,
             max_attempts=limit,
+            static_result=current_request.get("local_phase1", {}).get("static"),
+            rag_result=current_request.get("local_phase1", {}).get("rag"),
+            detector_fixed=remote.get("phases", {}).get("detector", {}).get("fixed"),
+            verifier=remote.get("phases", {}).get("verifier"),
         )
         attempt_result = {
             "attempt": attempt_number,
@@ -575,7 +598,10 @@ def run_pipeline(
         write_json(run_dir / f"phase{number}_{phase_name}.json", payload)
 
     fixed_code = remote.get("phases", {}).get("fixer", {}).get("fixed_code") or code
-    if remote:
+    patch_outcomes = remote.get("phases", {}).get("fixer", {}).get("patch_outcomes", []) if remote else []
+    patch_applied = any(item.get("status") == "applied" for item in patch_outcomes)
+
+    if remote and remote.get("status") in {"ok", "partial"} and fixed_code and fixed_code != code:
         print(f"[{time.strftime('%H:%M:%S')}] [PHASE 5] Verifying patch integrity & compiler behavioral matrix...", flush=True)
         tool_result = safe_run(
             "tool_verification",
@@ -590,44 +616,42 @@ def run_pipeline(
                 use_smartbugs=use_smartbugs,
             ),
         )
+        behavioral_result = safe_run(
+            "behavioral_verification",
+            lambda: verify_patch_behavior(
+                code,
+                fixed_code,
+                patch_outcomes,
+                tool_result,
+            ),
+        )
     else:
         tool_result = {
             "component": "tool_verification",
-            "status": "pending",
-            "policy_verdict": "pending",
-            "policy_reason": "Patch has not been generated yet.",
-            "compile": {"status": "skipped", "reason": "patch pending"},
-            "smartbugs": {"status": "skipped", "reason": "patch pending"},
+            "status": "inconclusive",
+            "policy_verdict": "inconclusive",
+            "policy_reason": "Patch execution incomplete or remote runner did not finish.",
+            "compile": {"status": "skipped", "reason": "remote runner incomplete"},
+            "smartbugs": {"status": "skipped", "reason": "remote runner incomplete"},
             "tools": {},
             "summary": {"pass": 0, "fail": 0, "warn": 0, "error": 0},
             "slither": {"status": "skipped", "findings": [], "verdict": "Not run"},
         }
-    remote_verifier = remote.get("phases", {}).get("verifier", {})
-    patch_outcomes = remote.get("phases", {}).get("fixer", {}).get("patch_outcomes", [])
-    patch_applied = any(item.get("status") == "applied" for item in patch_outcomes)
-    behavioral_result = verify_patch_behavior(
-        code,
-        fixed_code,
-        patch_outcomes,
-        tool_result,
-    )
+        behavioral_result = {
+            "status": "inconclusive",
+            "findings": [],
+            "checks": ["Patch execution incomplete: behavioral verification skipped."],
+        }
+
     tool_result["behavioral"] = behavioral_result
     compile_status = tool_result.get("compile", {}).get("status")
     matrix_verdict = tool_result.get("policy_verdict", "inconclusive")
-    final_feedback = build_tool_repair_feedback(
-        tool_result,
-        attempt=len(remote.get("repair_attempts", [])) or 1,
-        max_attempts=MAX_FIX_ATTEMPTS,
-    )
-    if not remote:
-        overall_verdict = "Patch verification pending Kaggle result"
-    elif (
-        fused["verdict"] == "Safe"
-        and not patch_applied
-        and fixed_code == code
-    ):
+
+    if not remote or remote.get("status") in {"pending", "crashed", "awaiting_kaggle"}:
+        overall_verdict = "Inconclusive: patch execution incomplete"
+    elif fused.get("verdict") == "Safe" and not patch_applied and fixed_code == code:
         overall_verdict = "No patch required: original detection reported Safe"
-    elif behavioral_result["status"] == "failed":
+    elif behavioral_result.get("status") == "failed":
         overall_verdict = "Patch rejected: behavioral regression detected"
     elif compile_status in {"failed", "unavailable"}:
         overall_verdict = "Patch rejected: fixed code does not compile"
@@ -638,45 +662,86 @@ def run_pipeline(
     elif matrix_verdict == "passed":
         overall_verdict = "Patch accepted by security tool matrix"
     else:
-        overall_verdict = "Patch inconclusive: security tool matrix did not complete enough checks"
-    fixed_detection = {
-        "component": "security_tool_matrix",
-        "status": tool_result.get("status", "partial"),
-        "verdict": (
-            "Safe"
-            if matrix_verdict == "passed"
-            else "Vulnerable" if matrix_verdict == "failed" else "Inconclusive"
-        ),
-        "score": 0.0 if matrix_verdict == "passed" else float(fused.get("score") or 0.0),
-        "risk_level": "None" if matrix_verdict == "passed" else fused.get("risk_level", "Unknown"),
-        "policy_reason": tool_result.get("policy_reason", ""),
-        "summary": tool_result.get("summary", {}),
-    }
+        overall_verdict = "Inconclusive: security tool matrix did not complete enough checks"
+
+    # Fixed detection & risk delta: KHÔNG bịa điểm số 0.0/0.8 (Task A1)
+    remote_fixed = remote.get("phases", {}).get("detector", {}).get("fixed") if remote else None
+    if remote_fixed and remote_fixed.get("score") is not None:
+        fixed_detection = remote_fixed
+        fixed_score = float(remote_fixed["score"])
+        risk_delta = round(float(fused.get("score") or 0.0) - fixed_score, 6)
+    elif matrix_verdict == "passed" and behavioral_result.get("status") == "passed":
+        fixed_detection = {
+            "component": "security_tool_matrix",
+            "status": "ok",
+            "verdict": "Safe",
+            "score": 0.0,
+            "risk_level": "None",
+            "policy_reason": tool_result.get("policy_reason", ""),
+            "summary": tool_result.get("summary", {}),
+        }
+        risk_delta = round(float(fused.get("score") or 0.0), 6)
+    else:
+        fixed_detection = {
+            "component": "verification",
+            "status": "inconclusive",
+            "verdict": overall_verdict,
+            "score": None,
+            "risk_level": "Unknown",
+            "policy_reason": "Verification inconclusive or incomplete.",
+            "summary": {},
+        }
+        risk_delta = None
+
+    v_info = remote.get("phases", {}).get("verifier", {}) if remote else {}
+    final_feedback = build_tool_repair_feedback(
+        tool_result,
+        attempt=len(remote.get("repair_attempts", [])) if remote else 1,
+        max_attempts=MAX_FIX_ATTEMPTS,
+        static_result=request.get("local_phase1", {}).get("static"),
+        rag_result=request.get("local_phase1", {}).get("rag"),
+        detector_fixed=remote_fixed,
+        verifier=v_info,
+    )
     verification = {
         "status": (
             "complete"
             if matrix_verdict in {"passed", "failed"} and tool_result.get("status") in {"ok", "partial"}
-            else "partial"
+            else "inconclusive" if not remote or remote.get("status") != "ok" else "partial"
         ),
+        "verification_model": v_info.get("verification_model", "Multi-Tier AST & Security Tool Matrix"),
         "original_detection": fused,
         "fixed_detection": fixed_detection,
         "tool_verification": tool_result,
         "behavioral_verification": behavioral_result,
-        "llm_verifier": {"status": "ignored", "original": remote_verifier},
-        "verification_channels": final_feedback["components"],
-        "repair_attempts": remote.get("repair_attempts", []),
-        "risk_delta": round(float(fused["score"]) - float(fixed_detection["score"]), 6),
+        "verifications": v_info.get("verifications", []),
+        "verification_channels": final_feedback.get("components", {}),
+        "repair_attempts": remote.get("repair_attempts", []) or v_info.get("attempts", []),
+        "attempts_count": v_info.get("attempts_count", len(remote.get("repair_attempts", [])) or 1) if remote else 0,
+        "max_attempts": v_info.get("max_attempts", 3),
+        "attempts": v_info.get("attempts", []),
+        "fixed_unit_results": v_info.get("fixed_unit_results", []),
+        "vulnerability_probability": v_info.get("vulnerability_probability"),
+        "risk_delta": risk_delta,
         "overall_verdict": overall_verdict,
+        "notes": f"Phase 5 verification finished with verdict: {overall_verdict}.",
     }
     write_json(run_dir / "phase5_verification.json", verification)
     if remote:
         print(f"[{time.strftime('%H:%M:%S')}] [PHASE 5] Completed: Verification verdict: {overall_verdict}.", flush=True)
         print(f"[{time.strftime('%H:%M:%S')}] [PHASE 6] Generating multi-format audit reports (HTML, PDF, Markdown)...", flush=True)
+        report_data = build_report_data(request, fused, remote, tool_result)
+        apply_verification_to_report(report_data, verification)
+        write_json(run_dir / "phase6_report_data.json", report_data)
+        report_paths = write_reports(report_data, run_dir)
+    else:
+        # Local Phase 1 preview only - do not emit phase6 full reports before phase 2-5 run
+        report_data = build_report_data(request, fused, None, tool_result)
+        preview_md = render_markdown(report_data)
+        preview_path = run_dir / "phase1_preview.md"
+        write_text(preview_path, preview_md)
+        report_paths = {"markdown_preview": str(preview_path)}
 
-    report_data = build_report_data(request, fused, remote, tool_result)
-    apply_verification_to_report(report_data, verification)
-    write_json(run_dir / "phase6_report_data.json", report_data)
-    report_paths = write_reports(report_data, run_dir)
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "pipeline_version": PIPELINE_VERSION,
@@ -686,9 +751,9 @@ def run_pipeline(
             if (
                 remote.get("status") == "ok"
                 and fused["status"] == "complete"
-                and verification["status"] == "complete"
+                and verification["status"] in {"complete", "ok"}
             )
-            else "awaiting_kaggle" if not remote else "partial"
+            else "pending_remote" if not remote else "partial"
         ),
         "request_path": str(request_path),
         "run_dir": str(run_dir),
@@ -706,9 +771,9 @@ def run_pipeline(
         },
         "reports": report_paths,
         "next_action": (
-            "Submit request.json to the private Kaggle CodeLlama notebook and rerun with --remote-result."
+            "Run server_gpu_runner or local_llm_runner with request.json to complete Phase 2-5."
             if not remote
-            else "Review findings, generated patch, compiler output, behavioral checks, and the 9-tool security matrix."
+            else "Review findings, generated patch, compiler output, and behavioral verification checks."
         ),
         "completed_at": utc_now(),
     }
@@ -867,7 +932,15 @@ def main() -> None:
             v_path = run_dir / "phase5_verification.json"
             v_data = read_json(v_path) if v_path.exists() else {}
             tool_data = v_data.get("tool_verification", {})
-            feedback = build_tool_repair_feedback(tool_data, attempt=attempt, max_attempts=limit)
+            feedback = build_tool_repair_feedback(
+                tool_data,
+                attempt=attempt,
+                max_attempts=limit,
+                static_result=request_obj.get("local_phase1", {}).get("static"),
+                rag_result=request_obj.get("local_phase1", {}).get("rag"),
+                detector_fixed=manifest.get("verification", {}).get("fixed_detection"),
+                verifier=v_data.get("verifier"),
+            )
             request_obj["repair_feedback"] = feedback
     elif args.backend in {"local", "ollama", "gemini", "local_fast", "auto"} and not remote and not args.submit_kaggle:
         from E2E.local.fast_agent_runner import run_fast_local_pipeline

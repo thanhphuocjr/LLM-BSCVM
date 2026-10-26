@@ -10,9 +10,9 @@ import urllib.request
 from typing import Any
 
 from E2E.config import DEFAULT_DETECTOR_THRESHOLD
-from E2E.shared.function_parser import CodeUnit, apply_unit_patches
+from E2E.shared.function_parser import CodeUnit, apply_unit_patches, parse_code_units, validate_observable_behavior
 from agents.advisor import AdvisorAgent, RepairKnowledgeBase
-from agents.assessor import AssessorAgent
+from agents.assessor import AssessorAgent, compute_cvss_31_base_score, cvss_to_level
 
 
 OLLAMA_ENDPOINT = "http://localhost:11434/api/generate"
@@ -52,6 +52,14 @@ def _query_ollama(
             f"Failed to connect to local Ollama service at {OLLAMA_ENDPOINT} ({exc}). "
             "Please ensure Ollama is running (`ollama serve`)."
         ) from exc
+
+
+def finding_key(finding: dict[str, Any]) -> str:
+    """Stable identifier shared by fusion, Advisor, Assessor and Verifier outputs."""
+    return str(
+        finding.get("finding_id")
+        or f"{finding.get('swc') or 'SWC-100'}:{finding.get('unit_id') or 'contract'}"
+    )
 
 
 def _derive_findings(request: dict[str, Any]) -> list[dict[str, Any]]:
@@ -165,7 +173,18 @@ SWC_CVSS_MAP: dict[str, dict[str, Any]] = {
 }
 
 
+def _with_computed_score(meta: dict[str, Any]) -> dict[str, Any]:
+    """Derive the CVSS v3.1 base score and its qualitative rating from the vector itself."""
+    metrics = dict(part.split(":", 1) for part in meta["cvss_vector"].split("/")[1:])
+    score, vector = compute_cvss_31_base_score(**{key.lower(): value for key, value in metrics.items()})
+    return {**meta, "cvss_score": score, "cvss_vector": vector, "severity": cvss_to_level(score)}
+
+
 def get_cvss_defaults(swc: str, severity: str = "Medium") -> dict[str, Any]:
+    return _with_computed_score(_cvss_template(swc, severity))
+
+
+def _cvss_template(swc: str, severity: str = "Medium") -> dict[str, Any]:
     if swc in SWC_CVSS_MAP:
         return SWC_CVSS_MAP[swc]
     sev = str(severity or "Medium").capitalize()
@@ -242,13 +261,17 @@ def _generate_advisor_section(
 
     # 1. Query Advisor LLM for findings sorted by severity
     llm_advisor_results = {}
+    false_positives: list[str] = []
     if agent is not None and findings:
         risk_weights = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "Info": 0}
-        findings.sort(key=lambda item: risk_weights.get(item.get("severity", "Medium"), 0), reverse=True)
-        findings_to_query = findings
+        findings_to_query = sorted(
+            findings,
+            key=lambda item: risk_weights.get(item.get("severity", "Medium"), 0),
+            reverse=True,
+        )[:MAX_LLM_ADVISOR_CALLS]
 
         def _call_advisor(finding_dict):
-            f_key = finding_dict.get("finding_id") or f"{finding_dict.get('swc')}:{finding_dict.get('unit_id')}"
+            f_key = finding_key(finding_dict)
             try:
                 res = agent.advise_one(code, finding_dict)
                 return f_key, res
@@ -269,13 +292,14 @@ def _generate_advisor_section(
         fixed_code = f.get("fixed_code") or ""
         vulnerable_code = f.get("vulnerable_code") or ""
         checklist = list(f.get("checklist") or ([remediation] if remediation else []))
-        fid = f.get("finding_id") or f"{swc}:{unit_id}"
+        fid = finding_key(f)
 
         # 1. Check if LLM result succeeded
         item_sug = llm_advisor_results.get(fid)
         if item_sug:
             if not item_sug.is_true_positive:
-                # Filtered out by Advisor as false positive
+                # Advisor triage: the caller must drop this finding from repair and reporting.
+                false_positives.append(fid)
                 continue
             suggestions.append({
                 "finding_id": fid,
@@ -327,7 +351,7 @@ def _generate_advisor_section(
             ]
 
         suggestions.append({
-            "finding_id": f.get("finding_id") or f"{swc}:{unit_id}",
+            "finding_id": fid,
             "swc": swc,
             "unit_id": unit_id,
             "title": title,
@@ -345,6 +369,7 @@ def _generate_advisor_section(
     return {
         "status": "ok",
         "suggestions": suggestions,
+        "false_positives": false_positives,
         "recommendations": recommendations,
     }
 
@@ -369,28 +394,12 @@ def _generate_assessor_section(
     suggestions_by_id = {s.get("finding_id"): s for s in (advisor_suggestions or []) if s.get("finding_id")}
     suggestions_by_swc = {s.get("swc"): s for s in (advisor_suggestions or []) if s.get("swc")}
 
-    llm_calls = 0
-    for f in findings:
-        swc = f.get("swc", "SWC-100")
-        unit_id = f.get("unit_id") or "contract"
-        title = f.get("title") or f"Vulnerability {swc}"
-        severity = f.get("severity") or ("High" if swc in {"SWC-107", "SWC-105", "SWC-115"} else "Medium")
-
-        # Enrich finding with Advisor root cause and impact
-        f_enriched = dict(f)
-        sug = suggestions_by_id.get(f.get("finding_id")) or suggestions_by_swc.get(swc) or {}
-        if sug:
-            if sug.get("root_cause") and not f_enriched.get("root_cause"):
-                f_enriched["root_cause"] = sug["root_cause"]
-            if sug.get("impact") and not f_enriched.get("impact"):
-                f_enriched["impact"] = sug["impact"]
-
     # 1. Parallelize LLM risk assessments for top findings
     llm_assessor_results = {}
     if agent is not None and findings:
         findings_to_query = findings[:MAX_LLM_ASSESSOR_CALLS]
         def _call_assessor(finding_dict):
-            f_key = finding_dict.get("finding_id") or f"{finding_dict.get('swc')}:{finding_dict.get('unit_id')}"
+            f_key = finding_key(finding_dict)
             f_enr = dict(finding_dict)
             s = suggestions_by_id.get(finding_dict.get("finding_id")) or suggestions_by_swc.get(finding_dict.get("swc")) or {}
             if s:
@@ -414,7 +423,7 @@ def _generate_assessor_section(
         unit_id = f.get("unit_id") or "contract"
         title = f.get("title") or f"Vulnerability {swc}"
         severity = f.get("severity") or ("High" if swc in {"SWC-107", "SWC-105", "SWC-115"} else "Medium")
-        fid = f.get("finding_id") or f"{swc}:{unit_id}"
+        fid = finding_key(f)
 
         # 1. Check if parallel LLM risk assessment succeeded
         res = llm_assessor_results.get(fid)
@@ -440,7 +449,7 @@ def _generate_assessor_section(
         # 2. Grounded CVSS calculation based on calibrated SWC standard
         cvss_meta = get_cvss_defaults(swc, severity)
         assessments.append({
-            "finding_id": f.get("finding_id") or f"{swc}:{unit_id}",
+            "finding_id": fid,
             "swc": swc,
             "unit_id": unit_id,
             "title": title,
@@ -466,142 +475,169 @@ def _generate_assessor_section(
     }
 
 
+def _to_code_unit(unit: Any) -> CodeUnit | None:
+    if isinstance(unit, CodeUnit):
+        return unit
+    if not isinstance(unit, dict):
+        return None
+    code = str(unit.get("code") or "")
+    return CodeUnit(
+        unit_id=unit.get("unit_id", "unknown"),
+        kind=unit.get("kind", "function"),
+        name=unit.get("name", "func"),
+        contract_name=unit.get("contract_name", "Contract"),
+        start_offset=unit.get("start_offset", 0),
+        end_offset=unit.get("end_offset", len(code)),
+        start_line=unit.get("start_line", 1),
+        end_line=unit.get("end_line", 1),
+        code=code,
+        has_body=unit.get("has_body", True),
+        is_view_or_pure=unit.get("is_view_or_pure", False),
+        visibility=unit.get("visibility", "public"),
+    )
+
+
+def _changed_unit_outcomes(original: str, candidate: str) -> list[dict[str, Any]]:
+    """Describe a whole-contract rewrite as per-unit outcomes so Phase 5 can verify each unit."""
+    before = {unit.unit_id: unit.code for unit in parse_code_units(original)}
+    after = {unit.unit_id: unit.code for unit in parse_code_units(candidate)}
+    outcomes = []
+    for unit_id, code in before.items():
+        if unit_id not in after:
+            outcomes.append({"finding_id": f"LLM:{unit_id}", "unit_id": unit_id, "status": "applied",
+                             "engine": "llm_whole_contract", "reason": f"Model rewrite removed {unit_id}."})
+        elif re.sub(r"\s+", "", after[unit_id]) != re.sub(r"\s+", "", code):
+            outcomes.append({"finding_id": f"LLM:{unit_id}", "unit_id": unit_id, "status": "applied",
+                             "engine": "llm_whole_contract", "reason": f"Model rewrite changed {unit_id}."})
+    return outcomes
+
+
+def _normalize_ws(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+# A knowledge-base snippet shorter than this is too generic to be trusted as an exact match.
+MIN_EMPIRICAL_SNIPPET_CHARS = 40
+
+
 def _apply_heuristic_security_patch(
     code: str,
     findings: list[dict[str, Any]],
     code_units: list[Any] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Generates precise, compiler-compliant security patch based on verified AST patterns and RAG empirical patches."""
-    fixed_code = code
-    patch_outcomes = []
+    """Deterministic fallback used when the generative fixer produced no applicable patch.
 
-    # 0. Direct verified patch from RAG empirical case match
+    1. Empirical RAG patch: only when the knowledge-base vulnerable snippet matches the
+       contract text exactly, or the whole unit; a replacement function must keep the
+       unit's name and pass the observable-behaviour guard.
+    2. Advisor fixed code for a unit (same guard).
+    3. Rule-based fallback for two textbook patterns. These outcomes are tagged
+       `engine=rule_based_fallback` so reports never present them as model output.
+    """
+    units = [unit for unit in (_to_code_unit(item) for item in code_units or []) if unit is not None]
+    units_by_id = {unit.unit_id: unit for unit in units}
+    fixed_code = code
+    patch_outcomes: list[dict[str, Any]] = []
+    patched_units: set[str] = set()
+
+    def splice(unit: CodeUnit, replacement: str, summary: str) -> bool:
+        nonlocal fixed_code
+        if unit.unit_id in patched_units or unit.name not in replacement:
+            return False
+        if re.sub(r"\s+", "", replacement) == re.sub(r"\s+", "", unit.code):
+            return False
+        try:
+            validate_observable_behavior(unit.code, replacement)
+        except ValueError:
+            return False
+        updated, outcomes = apply_unit_patches(
+            fixed_code,
+            [unit],
+            [{"unit_id": unit.unit_id, "replacement": replacement, "summary": summary}],
+        )
+        if not any(item.get("status") == "applied" for item in outcomes):
+            return False
+        fixed_code = updated
+        patched_units.add(unit.unit_id)
+        return True
+
     for f in findings:
         v_code = str(f.get("vulnerable_code") or "").strip()
         f_code = str(f.get("fixed_code") or "").strip()
-        if v_code and f_code and v_code != f_code:
-            # Exact substring match
-            if v_code in fixed_code:
-                fixed_code = fixed_code.replace(v_code, f_code)
+        uid = f.get("unit_id")
+        unit = units_by_id.get(uid) if uid else None
+        if not f_code or v_code == f_code:
+            continue
+        if v_code:
+            if len(v_code) >= MIN_EMPIRICAL_SNIPPET_CHARS and v_code in fixed_code:
+                fixed_code = fixed_code.replace(v_code, f_code, 1)
                 patch_outcomes.append({
-                    "finding_id": f.get("finding_id") or f"{f.get('swc')}:{f.get('unit_id')}",
+                    "finding_id": finding_key(f),
+                    "unit_id": uid,
                     "status": "applied",
+                    "engine": "rag_empirical_patch",
                     "reason": f"Applied verified RAG patch from knowledge item {f.get('best_match_id', '')} ({f.get('swc', '')}).",
                 })
-            else:
-                # Normalized whitespace match
-                norm_v = re.sub(r"\s+", " ", v_code).strip()
-                norm_curr = re.sub(r"\s+", " ", fixed_code).strip()
-                if norm_v in norm_curr and norm_v == norm_curr:
-                    fixed_code = f_code
+            elif unit is not None and _normalize_ws(v_code) == _normalize_ws(unit.code):
+                if splice(unit, f_code, f"RAG patch for {uid}"):
                     patch_outcomes.append({
-                        "finding_id": f.get("finding_id") or f"{f.get('swc')}:{f.get('unit_id')}",
+                        "finding_id": finding_key(f),
+                        "unit_id": uid,
                         "status": "applied",
-                        "reason": f"Applied verified RAG patch from knowledge item {f.get('best_match_id', '')} ({f.get('swc', '')}).",
+                        "engine": "rag_empirical_patch",
+                        "reason": f"Applied unit-level RAG patch for {uid}.",
                     })
-                elif code_units:
-                    uid = f.get("unit_id")
-                    target_unit = next(
-                        (u for u in code_units if getattr(u, "unit_id", "") == uid or (isinstance(u, dict) and u.get("unit_id") == uid)),
-                        None,
-                    )
-                    if target_unit:
-                        if isinstance(target_unit, CodeUnit):
-                            unit_obj = target_unit
-                        else:
-                            unit_obj = CodeUnit(
-                                unit_id=target_unit.get("unit_id", "unknown"),
-                                kind=target_unit.get("kind", "function"),
-                                name=target_unit.get("name", "func"),
-                                contract_name=target_unit.get("contract_name", "Contract"),
-                                start_offset=target_unit.get("start_offset", 0),
-                                end_offset=target_unit.get("end_offset", len(target_unit.get("code", ""))),
-                                start_line=target_unit.get("start_line", 1),
-                                end_line=target_unit.get("end_line", 10),
-                                code=target_unit.get("code", ""),
-                            )
-                        norm_u = re.sub(r"\s+", " ", unit_obj.code).strip()
-                        if norm_v == norm_u or norm_v in norm_u:
-                            updated_code, unit_outcomes = apply_unit_patches(
-                                fixed_code,
-                                [unit_obj],
-                                [{"unit_id": uid, "replacement": f_code, "summary": f"RAG patch for {uid}"}],
-                            )
-                            if any(uo.get("status") == "applied" for uo in unit_outcomes):
-                                fixed_code = updated_code
-                                patch_outcomes.append({
-                                    "finding_id": f.get("finding_id") or f"{f.get('swc')}:{uid}",
-                                    "status": "applied",
-                                    "reason": f"Applied unit-spliced RAG patch for {uid}.",
-                                })
-        elif f_code and f_code != fixed_code and not patch_outcomes:
-            uid = f.get("unit_id")
-            if uid and code_units:
-                target_unit = next(
-                    (u for u in code_units if getattr(u, "unit_id", "") == uid or (isinstance(u, dict) and u.get("unit_id") == uid)),
-                    None,
-                )
-                if target_unit:
-                    unit_obj = target_unit if isinstance(target_unit, CodeUnit) else CodeUnit(**target_unit)
-                    if re.sub(r"\s+", "", f_code) != re.sub(r"\s+", "", unit_obj.code) and (not unit_obj.name or unit_obj.name in f_code):
-                        updated_code, unit_outcomes = apply_unit_patches(
-                            fixed_code,
-                            [unit_obj],
-                            [{"unit_id": uid, "replacement": f_code, "summary": f"Remediation patch for {uid}"}],
-                        )
-                        if any(uo.get("status") == "applied" for uo in unit_outcomes):
-                            fixed_code = updated_code
-                            patch_outcomes.append({
-                                "finding_id": f.get("finding_id") or f"{f.get('swc')}:{uid}",
-                                "status": "applied",
-                                "reason": f"Applied verified remediation patch for {uid}.",
-                            })
+        elif unit is not None and splice(unit, f_code, f"Advisor patch for {uid}"):
+            patch_outcomes.append({
+                "finding_id": finding_key(f),
+                "unit_id": uid,
+                "status": "applied",
+                "engine": "advisor_fixed_code",
+                "reason": f"Applied Advisor remediation patch for {uid}.",
+            })
 
-    # If already patched from validated RAG empirical case, return immediately
     if patch_outcomes:
         return fixed_code, patch_outcomes
 
-    # 1. Missing Access Control patch
-    if any(f.get("swc") in {"SWC-105", "SWC-100"} or "access_control" in str(f.get("swc_category", "")).lower() for f in findings):
-        matching_f = next((f for f in findings if f.get("swc") in {"SWC-105", "SWC-100"}), {})
-        uid = matching_f.get("unit_id") or "setOwner"
+    def unit_named(name: str) -> CodeUnit | None:
+        matches = [unit for unit in units if unit.name == name]
+        return matches[0] if len(matches) == 1 else None
+
+    # Rule-based fallback 1: missing onlyOwner on setOwner.
+    if any(f.get("swc") in {"SWC-105", "SWC-100"} for f in findings):
         if "onlyOwner" in code and "address public owner;" in code:
-            # Look for unprotected setOwner or withdraw
-            if re.search(r"function\s+setOwner\s*\([^)]*\)\s*public\s*\{", fixed_code):
-                fixed_code = re.sub(
-                    r"function\s+setOwner\s*\(([^)]*)\)\s*public\s*\{",
-                    r"function setOwner(\1) public onlyOwner {",
-                    fixed_code,
-                )
+            pattern = r"function\s+setOwner\s*\(([^)]*)\)\s*public\s*\{"
+            if re.search(pattern, fixed_code):
+                fixed_code = re.sub(pattern, r"function setOwner(\1) public onlyOwner {", fixed_code)
+                unit = unit_named("setOwner")
                 patch_outcomes.append({
-                    "finding_id": f"SWC-105:{uid}",
-                    "unit_id": uid,
+                    "finding_id": f"SWC-105:{unit.unit_id if unit else 'setOwner'}",
+                    "unit_id": unit.unit_id if unit else None,
                     "status": "applied",
-                    "reason": "Added onlyOwner modifier to setOwner function.",
+                    "engine": "rule_based_fallback",
+                    "reason": "Rule-based fallback: added onlyOwner modifier to setOwner.",
                 })
 
-    # 2. Reentrancy Checks-Effects-Interactions patch
-    if any(f.get("swc") == "SWC-107" or "reentrancy" in str(f.get("swc_category", "")).lower() for f in findings):
-        matching_f = next((f for f in findings if f.get("swc") == "SWC-107"), {})
-        uid = matching_f.get("unit_id") or "withdraw"
-        # Match low-level call before state deduction or balance zeroing
+    # Rule-based fallback 2: checks-effects-interactions for a value call followed by a balance update.
+    if any(f.get("swc") == "SWC-107" for f in findings):
         pattern = re.compile(
             r"(\((?:bool\s+[A-Za-z_]\w*|)\s*,\s*(?:bytes\s+memory\s+[A-Za-z_]\w*|)\)\s*=\s*msg\.sender\.call\{value:\s*[^}]+\}\([^)]*\);\s*require\([^;]+\);)(\s*)(balances\[msg\.sender\]\s*(?:-=\s*[^;]+|=\s*0);)",
             re.MULTILINE,
         )
-        if pattern.search(fixed_code):
+        match = pattern.search(fixed_code)
+        if match:
             fixed_code = pattern.sub(r"\3\2\1", fixed_code)
+            unit = next(
+                (u for u in units if u.start_offset <= match.start() < u.end_offset),
+                None,
+            )
             patch_outcomes.append({
-                "finding_id": f"SWC-107:{uid}",
-                "unit_id": uid,
+                "finding_id": f"SWC-107:{unit.unit_id if unit else 'contract'}",
+                "unit_id": unit.unit_id if unit else None,
                 "status": "applied",
-                "reason": "Reordered state deduction before external call to follow Checks-Effects-Interactions.",
+                "engine": "rule_based_fallback",
+                "reason": "Rule-based fallback: moved the balance update before the external call (CEI).",
             })
-
-    # 3. Signature Replay Protection patch (nonce check)
-    if any(f.get("swc") in {"SWC-114", "SWC-115"} or "signature" in str(f.get("title", "")).lower() for f in findings):
-        if "mapping(uint256 => bool) public executed;" in code or "nonce" in code:
-            pass  # Already has nonce mechanism
 
     return fixed_code, patch_outcomes
 
@@ -706,26 +742,27 @@ def run_local_llm_pipeline(
             if "contract " in llm_response and ("{" in llm_response and "}" in llm_response):
                 # Extract code block if formatted with markdown
                 match = re.search(r"```solidity\s*([\s\S]*?)\s*```", llm_response)
-                if match:
-                    fixed_code = match.group(1).strip()
+                if match and "contract " in match.group(1):
+                    candidate = match.group(1).strip()
+                    llm_outcomes = _changed_unit_outcomes(source_code, candidate)
+                    if llm_outcomes:
+                        fixed_code = candidate
+                        patch_outcomes = llm_outcomes
         except Exception:
             pass  # Fall back gracefully to verified AST patch
 
-    verifier_items = []
-    for f in findings:
-        swc = f.get("swc") or "Unknown"
-        fid = f.get("finding_id") or f"{swc}:{f.get('unit_id')}"
-        checklist = f.get("checklist") or []
-        check_notes = f"Verified: Patch addresses root cause for {swc}."
-        if checklist:
-            check_notes += f" Criteria satisfied: {checklist[0]}"
-        verifier_items.append({
-            "finding_id": fid,
-            "status": "Verified",
-            "residual_risk": "",
-            "verification_notes": check_notes,
-            "checklist": checklist[:3],
-        })
+    # The local backend has no detector re-scan: verification is left to Phase 5
+    # (compiler, security tools, behaviour guard) instead of being asserted here.
+    verifier_items = [
+        {
+            "finding_id": finding_key(f),
+            "status": "NOT_VERIFIED",
+            "residual_risk": "Unknown: no neural re-scan on the local backend",
+            "verification_notes": "Deferred to Phase 5 deterministic verification.",
+            "checklist": (f.get("checklist") or [])[:3],
+        }
+        for f in findings
+    ]
 
     phases = {
         "detector": {
@@ -760,8 +797,8 @@ def run_local_llm_pipeline(
         "verifier": {
             "status": "ok",
             "verifications": verifier_items,
-            "verdict": "Safe" if not findings or patch_outcomes else "Vulnerable",
-            "overall_verdict": "Local CodeLlama security pass completed on Apple Silicon M2.",
+            "verdict": "Not verified",
+            "overall_verdict": "NOT_VERIFIED",
         },
         "reporter": {
             "status": "ok",

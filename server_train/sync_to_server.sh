@@ -7,8 +7,8 @@
 set -e
 
 SERVER_USER="ai"
-SERVER_IP="192.168.91.176"
-SERVER_PORT="2225"
+SERVER_IP="${SERVER_IP:-192.168.91.176}"
+SERVER_PORT="${SERVER_PORT:-2225}"
 REMOTE_DIR="~/server_train"
 LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

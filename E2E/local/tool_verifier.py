@@ -49,7 +49,7 @@ SEVERITY_ORDER = {
 
 SWC_CATEGORY_ALIASES = {
     "SWC-100": {"visibility", "access_control"},
-    "SWC-101": {"arithmetic", "overflow", "underflow", "access_control"},
+    "SWC-101": {"arithmetic", "overflow", "underflow"},
     "SWC-104": {"unchecked_low_level_calls", "unchecked_call", "low_level_call"},
     "SWC-105": {"prodigal", "unprotected_withdrawal", "ether_withdrawal"},
     "SWC-106": {"suicidal", "selfdestruct"},
@@ -217,6 +217,33 @@ def _copy_source_tree(
     return source_path, dependency_count
 
 
+_ERROR_LOCATION_RE = re.compile(r"(-->\s*\S+:\d+:\d+:?|\S+\.sol:\d+:\d+:?)")
+
+
+def _error_lines(text: str) -> set[str]:
+    return {
+        _ERROR_LOCATION_RE.sub("", line).strip()
+        for line in (text or "").splitlines()
+        if "Error" in line
+    }
+
+
+def _compile_source(
+    solc: Path,
+    code: str,
+    file_name: str,
+    source_root: str | Path | None,
+) -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="e2e-compile-") as temp_dir:
+        source_path, dependency_count = _copy_source_tree(Path(temp_dir), code, file_name, source_root)
+        result = _run([str(solc), "--ast-compact-json", str(source_path)])
+    result.pop("stdout", None)  # the AST is large and not needed here
+    result["compiler"] = str(solc)
+    result["host_architecture"] = platform.machine()
+    result["copied_solidity_dependencies"] = dependency_count
+    return result
+
+
 def _normalise_severity(value: Any) -> str:
     text = str(value or "Unknown").strip()
     if not text:
@@ -229,15 +256,6 @@ def _normalise_severity(value: Any) -> str:
 
 def _severity_rank(value: Any) -> int:
     return SEVERITY_ORDER.get(str(value or "unknown").strip().lower(), 0)
-
-
-def _tokenise(value: Any) -> set[str]:
-    text = str(value or "").lower()
-    return {
-        token
-        for token in re.split(r"[^a-z0-9_]+", text)
-        if token and len(token) > 2
-    }
 
 
 def _classify_category(*parts: Any) -> str:
@@ -268,28 +286,66 @@ def _target_categories(target_findings: list[dict[str, Any]] | None) -> set[str]
         swc = str(finding.get("swc") or finding.get("vuln_id") or "").upper()
         categories.update(SWC_CATEGORY_ALIASES.get(swc, set()))
         categories.add(_classify_category(finding.get("title"), finding.get("description"), swc))
-        categories.update(_tokenise(finding.get("title")))
     categories.discard("other")
     return categories
 
 
-def _finding_matches_target(finding: dict[str, Any], targets: set[str]) -> bool:
+def _finding_lines(finding: dict[str, Any]) -> set[int]:
+    value = finding.get("line") if finding.get("line") is not None else finding.get("lines")
+    if isinstance(value, int):
+        return {value}
+    if isinstance(value, (list, tuple, set)):
+        return {item for item in value if isinstance(item, int)}
+    if isinstance(value, str) and value.strip().isdigit():
+        return {int(value.strip())}
+    return set()
+
+
+def _target_line_ranges(fixed_code: str, target_findings: list[dict[str, Any]] | None) -> set[int]:
+    """Lines of the patched source that belong to the units the findings targeted."""
+    from E2E.shared.function_parser import parse_code_units
+
+    unit_ids = {str(item.get("unit_id")) for item in target_findings or [] if item.get("unit_id")}
+    lines: set[int] = set()
+    for unit in parse_code_units(fixed_code):
+        if unit.unit_id in unit_ids:
+            lines.update(range(unit.start_line, unit.end_line + 1))
+    return lines
+
+
+def _finding_matches_target(
+    finding: dict[str, Any],
+    targets: set[str],
+    target_lines: set[int] | None = None,
+) -> bool:
+    """A tool finding is residual when its category is a target category and, if the
+    finding carries line information, it lies inside a targeted (patched) unit."""
     if not targets:
         return False
     category = str(finding.get("category") or "").lower()
-    if category in targets:
-        return True
-    text_tokens = set()
-    for field in ("name", "check", "message", "description", "swc"):
-        text_tokens.update(_tokenise(finding.get(field)))
-    return bool(text_tokens & targets)
+    if category == "other" or not category:
+        category = _classify_category(finding.get("name"), finding.get("check"), finding.get("message"))
+    if category not in targets:
+        return False
+    lines = _finding_lines(finding)
+    if target_lines and lines:
+        return bool(lines & target_lines)
+    return True
+
+
+# Source paths (temporary directories differ per run) and line references.
+_LOCATION_IN_MESSAGE_RE = re.compile(r"(\S*\.sol(?:#\d+(?:-\d+)?|:\d+(?::\d+)?)?|#\d+(?:-\d+)?|\blines?\s+\d+(?:-\d+)?)")
 
 
 def _finding_signature(finding: dict[str, Any]) -> tuple[str, str, str]:
+    """Location-independent identity of a tool finding: a patch that shifts line numbers
+    must not make every pre-existing finding look newly introduced."""
+    message = str(finding.get("message") or finding.get("description") or "")
+    message = _LOCATION_IN_MESSAGE_RE.sub("", message)
     return (
         str(finding.get("category") or "other").lower(),
         str(finding.get("name") or finding.get("check") or "").strip().lower(),
-        str(finding.get("message") or finding.get("description") or "").strip().lower()[:160],
+        re.sub(r"\s+", " ", message).strip().lower()[:160],
     )
 
 
@@ -386,10 +442,12 @@ def _evaluate_tool_result(
     original_findings: list[dict[str, Any]],
     target_categories: set[str],
     error: str | None = None,
+    target_lines: set[int] | None = None,
 ) -> dict[str, Any]:
     original_signatures = {_finding_signature(item) for item in original_findings}
     residual = [
-        item for item in fixed_findings if _finding_matches_target(item, target_categories)
+        item for item in fixed_findings
+        if _finding_matches_target(item, target_categories, target_lines)
     ]
     introduced = [
         item
@@ -436,7 +494,11 @@ def _evaluate_tool_result(
     }
 
 
-def _policy_verdict(tool_results: dict[str, dict[str, Any]], policy: str = "balanced") -> dict[str, Any]:
+def _policy_verdict(
+    tool_results: dict[str, dict[str, Any]],
+    policy: str = "balanced",
+    require_applicable: bool = False,
+) -> dict[str, Any]:
     failed = [name for name, result in tool_results.items() if result.get("verdict") == "FAIL"]
     errors = [name for name, result in tool_results.items() if result.get("verdict") == "ERROR"]
     completed = [
@@ -464,6 +526,11 @@ def _policy_verdict(tool_results: dict[str, dict[str, Any]], policy: str = "bala
         return {
             "verdict": "inconclusive",
             "reason": "No security tools completed analysis.",
+        }
+    if require_applicable and not any(tool_results[name].get("applicable") for name in completed):
+        return {
+            "verdict": "inconclusive",
+            "reason": "No completed tool covers the targeted vulnerability category; a clean run is not evidence of a fix.",
         }
     return {
         "verdict": "passed",
@@ -766,20 +833,20 @@ def verify_security_tool_matrix(
     if solc is None:
         compile_result = {"status": "unavailable", "reason": selection_reason}
     else:
-        with tempfile.TemporaryDirectory(prefix="e2e-compile-fixed-") as temp_dir:
-            source_path, dependency_count = _copy_source_tree(
-                Path(temp_dir),
-                fixed_code,
-                file_name,
-                source_root,
-            )
-            compile_result = _run([str(solc), "--ast-compact-json", str(source_path)])
-            compile_result["compiler"] = str(solc)
-            compile_result["selection_reason"] = selection_reason
-            compile_result["host_architecture"] = platform.machine()
-            compile_result["copied_solidity_dependencies"] = dependency_count
+        compile_result = _compile_source(solc, fixed_code, file_name, source_root)
+        compile_result["selection_reason"] = selection_reason
+        if compile_result["status"] != "passed":
+            baseline = _compile_source(solc, original_code, file_name, source_root)
+            compile_result["baseline_status"] = baseline["status"]
+            if baseline["status"] != "passed":
+                new_errors = _error_lines(compile_result.get("stderr", "")) - _error_lines(baseline.get("stderr", ""))
+                if not new_errors:
+                    # The original itself does not compile here (e.g. unresolved imports):
+                    # the patch cannot be blamed, but nothing can be verified either.
+                    compile_result["status"] = "baseline_failed"
 
     target_categories = _target_categories(target_findings)
+    target_lines = _target_line_ranges(fixed_code, target_findings)
     if use_smartbugs:
         smartbugs_executable, smartbugs_reason = _smartbugs_executable(smartbugs_home)
     else:
@@ -817,6 +884,7 @@ def verify_security_tool_matrix(
             list(original_run.get("findings", [])),
             target_categories,
             str(fixed_run.get("error") or original_run.get("error") or "") or None,
+            target_lines,
         )
         evaluated["elapsed_ms"] = round(
             float(original_run.get("elapsed_ms") or 0.0)
@@ -835,11 +903,21 @@ def verify_security_tool_matrix(
             tool_name, evaluated = future.result()
             tool_results[tool_name] = evaluated
 
-    policy_result = (
-        {"verdict": "failed", "reason": "Fixed source does not compile."}
-        if compile_result.get("status") != "passed"
-        else _policy_verdict(tool_results, policy)
-    )
+    compile_status = compile_result.get("status")
+    if compile_status == "passed":
+        policy_result = _policy_verdict(tool_results, policy, require_applicable=bool(target_categories))
+    elif compile_status == "failed":
+        policy_result = {"verdict": "failed", "reason": "Fixed source does not compile."}
+    elif compile_status == "baseline_failed":
+        policy_result = {
+            "verdict": "inconclusive",
+            "reason": "The original source does not compile standalone either; security tools could not run.",
+        }
+    else:
+        policy_result = {
+            "verdict": "inconclusive",
+            "reason": f"Compiler unavailable ({compile_result.get('reason') or compile_status}).",
+        }
     summary = {
         "pass": sum(1 for item in tool_results.values() if item.get("verdict") == "PASS"),
         "fail": sum(1 for item in tool_results.values() if item.get("verdict") == "FAIL"),

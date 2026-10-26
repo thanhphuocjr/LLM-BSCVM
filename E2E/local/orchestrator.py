@@ -224,6 +224,42 @@ def build_repair_feedback(
     }
 
 
+def rerun_local_channels(fixed_code: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Static and RAG evidence for the *patched* source (verification channels must not reuse
+    the original contract's Phase 1 results)."""
+    units = parse_code_units(fixed_code)
+    return (
+        safe_run("static", lambda: run_static(fixed_code, units)),
+        safe_run("rag", lambda: run_rag(fixed_code, units)),
+    )
+
+
+def scope_to_targets(result: dict[str, Any], target_findings: list[dict[str, Any]]) -> dict[str, Any]:
+    """Keep only residual findings that match an original target (same SWC in the same unit).
+
+    Unrelated pre-existing findings elsewhere in the contract are not evidence that the
+    patch failed, so they must not block verification.
+    """
+    targets = {
+        (str(item.get("swc")), str(item.get("unit_id")))
+        for item in target_findings
+        if item.get("swc") and item.get("swc") != "UNMAPPED"
+    }
+    if result.get("status") != "ok":
+        return result
+    residual = [
+        item for item in result.get("findings", [])
+        if (str(item.get("swc")), str(item.get("unit_id"))) in targets
+    ]
+    return {
+        **result,
+        "findings": residual,
+        "verdict": "Vulnerable" if residual else "Safe",
+        "final_verdict": "Vulnerable" if residual else "Safe",
+        "scope": "original target findings",
+    }
+
+
 def _compact_tool_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     fields = (
         "tool",
@@ -447,12 +483,13 @@ def run_kaggle_repair_loop(
                 use_smartbugs=use_smartbugs,
             ),
         )
+        fixed_static, fixed_rag = rerun_local_channels(fixed_code)
         feedback = build_tool_repair_feedback(
             tool_result,
             attempt=attempt_number,
             max_attempts=limit,
-            static_result=current_request.get("local_phase1", {}).get("static"),
-            rag_result=current_request.get("local_phase1", {}).get("rag"),
+            static_result=scope_to_targets(fixed_static, target_findings),
+            rag_result=scope_to_targets(fixed_rag, target_findings),
             detector_fixed=remote.get("phases", {}).get("detector", {}).get("fixed"),
             verifier=remote.get("phases", {}).get("verifier"),
         )
@@ -465,9 +502,10 @@ def run_kaggle_repair_loop(
         attempts.append(attempt_result)
         write_json(attempt_dir / "verification_feedback.json", attempt_result)
 
-        # Retry only if the candidate fixed code failed compilation
-        compile_status = tool_result.get("compile", {}).get("status")
-        if compile_status != "passed" and attempt_number < limit:
+        # Kaggle attempts cost 15-35 minutes each, so this backend only retries when the
+        # candidate fails to compile; residual findings are reported, not re-submitted.
+        # (The server_gpu backend runs the full three-channel retry loop itself.)
+        if tool_result.get("compile", {}).get("status") == "failed" and attempt_number < limit:
             current_request = copy.deepcopy(original_request)
             current_request["repair_feedback"] = feedback
             current_request["repair"] = {
@@ -501,6 +539,8 @@ def run_pipeline(
     skip_reporter_llm: bool = True,
     skip_detector_explanation: bool = True,
     deterministic_advisor_assessor: bool = False,
+    max_fix_attempts: int = MAX_FIX_ATTEMPTS,
+    local_phase1: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     actual_run_id = validated_run_id(run_id or make_run_id(file_name, code))
     run_dir = Path(runs_dir) / actual_run_id
@@ -530,11 +570,16 @@ def run_pipeline(
     if not remote_result:
         print(f"[{time.strftime('%H:%M:%S')}] [PHASE 1A] Running static vulnerability rules (Slither / Regex AST)...", flush=True)
         print(f"[{time.strftime('%H:%M:%S')}] [PHASE 1B] Running RAG empirical vulnerability retrieval...", flush=True)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        future_static = executor.submit(safe_run, "static", lambda: run_static(code, units))
-        future_rag = executor.submit(safe_run, "rag", lambda: run_rag(code, units))
-        static_result = future_static.result()
-        rag_result = future_rag.result()
+    if local_phase1 and local_phase1.get("static") and local_phase1.get("rag"):
+        # Re-entry after the remote/GPU phases: Phase 1A/1B already ran on this exact source.
+        static_result = local_phase1["static"]
+        rag_result = local_phase1["rag"]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            future_static = executor.submit(safe_run, "static", lambda: run_static(code, units))
+            future_rag = executor.submit(safe_run, "rag", lambda: run_rag(code, units))
+            static_result = future_static.result()
+            rag_result = future_rag.result()
 
     write_json(run_dir / "phase1a_static.json", static_result)
     if not remote_result:
@@ -562,7 +607,7 @@ def run_pipeline(
             "detector_threshold": resolve_detector_threshold(detector_threshold),
             "repair": {
                 "attempt": 1,
-                "max_attempts": MAX_FIX_ATTEMPTS,
+                "max_attempts": min(max(1, max_fix_attempts), MAX_FIX_ATTEMPTS),
             },
             "generation": {
                 "temperature": 0.0,
@@ -603,6 +648,15 @@ def run_pipeline(
 
     if remote and remote.get("status") in {"ok", "partial"} and fixed_code and fixed_code != code:
         print(f"[{time.strftime('%H:%M:%S')}] [PHASE 5] Verifying patch integrity & compiler behavioral matrix...", flush=True)
+        # Residual checks only concern the functions that were actually patched; unrelated
+        # pre-existing findings elsewhere in the contract are not evidence against the patch.
+        patched_units = {
+            item.get("unit_id") for item in patch_outcomes
+            if item.get("status") == "applied" and item.get("unit_id")
+        }
+        patch_targets = [
+            item for item in fused.get("findings", []) if item.get("unit_id") in patched_units
+        ] or fused.get("findings", [])
         tool_result = safe_run(
             "tool_verification",
             lambda: verify_security_tool_matrix(
@@ -610,7 +664,7 @@ def run_pipeline(
                 fixed_code,
                 file_name=file_name,
                 source_root=source_root,
-                target_findings=fused.get("findings", []),
+                target_findings=patch_targets,
                 results_dir=run_dir / "security_tool_matrix",
                 tools=tools,
                 use_smartbugs=use_smartbugs,
@@ -625,7 +679,13 @@ def run_pipeline(
                 tool_result,
             ),
         )
+        fixed_static, fixed_rag = rerun_local_channels(fixed_code)
+        fixed_static = scope_to_targets(fixed_static, patch_targets)
+        fixed_rag = scope_to_targets(fixed_rag, patch_targets)
+        write_json(run_dir / "phase5_fixed_static.json", fixed_static)
+        write_json(run_dir / "phase5_fixed_rag.json", fixed_rag)
     else:
+        fixed_static = fixed_rag = None
         tool_result = {
             "component": "tool_verification",
             "status": "inconclusive",
@@ -647,25 +707,40 @@ def run_pipeline(
     compile_status = tool_result.get("compile", {}).get("status")
     matrix_verdict = tool_result.get("policy_verdict", "inconclusive")
 
+    remote_fixed = remote.get("phases", {}).get("detector", {}).get("fixed") if remote else None
+    detector_still_flags = bool(remote_fixed) and remote_fixed.get("verdict") == "Vulnerable"
+    local_residual = [
+        name
+        for name, result in (("static", fixed_static), ("rag", fixed_rag))
+        if result and result.get("status") == "ok" and result.get("findings")
+    ]
+
     if not remote or remote.get("status") in {"pending", "crashed", "awaiting_kaggle"}:
         overall_verdict = "Inconclusive: patch execution incomplete"
     elif fused.get("verdict") == "Safe" and not patch_applied and fixed_code == code:
         overall_verdict = "No patch required: original detection reported Safe"
+    elif fused.get("verdict") != "Vulnerable" and not patch_applied and fixed_code == code:
+        overall_verdict = "Inconclusive: detection incomplete and no patch was generated"
     elif behavioral_result.get("status") == "failed":
         overall_verdict = "Patch rejected: behavioral regression detected"
-    elif compile_status in {"failed", "unavailable"}:
+    elif compile_status == "failed":
         overall_verdict = "Patch rejected: fixed code does not compile"
     elif not patch_applied or fixed_code == code:
         overall_verdict = "Patch rejected: no effective patch was applied"
     elif matrix_verdict == "failed":
         overall_verdict = "Patch rejected: security tool matrix found residual or introduced vulnerabilities"
+    elif local_residual:
+        overall_verdict = f"Patch rejected: {'/'.join(local_residual)} still detect the targeted vulnerability"
+    elif compile_status in {"unavailable", "baseline_failed"}:
+        overall_verdict = "Inconclusive: fixed code could not be compiled in isolation"
     elif matrix_verdict == "passed":
+        # The binary detector is known to over-flag safe functions, so its disagreement does
+        # not block acceptance; it is surfaced as `detector_disagreement` instead.
         overall_verdict = "Patch accepted by security tool matrix"
     else:
         overall_verdict = "Inconclusive: security tool matrix did not complete enough checks"
 
-    # Fixed detection & risk delta: KHÔNG bịa điểm số 0.0/0.8 (Task A1)
-    remote_fixed = remote.get("phases", {}).get("detector", {}).get("fixed") if remote else None
+    # Fixed detection & risk delta: chỉ dùng điểm thật, không bịa điểm số (Task A1)
     if remote_fixed and remote_fixed.get("score") is not None:
         fixed_detection = remote_fixed
         fixed_score = float(remote_fixed["score"])
@@ -675,12 +750,12 @@ def run_pipeline(
             "component": "security_tool_matrix",
             "status": "ok",
             "verdict": "Safe",
-            "score": 0.0,
+            "score": None,
             "risk_level": "None",
             "policy_reason": tool_result.get("policy_reason", ""),
             "summary": tool_result.get("summary", {}),
         }
-        risk_delta = round(float(fused.get("score") or 0.0), 6)
+        risk_delta = None
     else:
         fixed_detection = {
             "component": "verification",
@@ -698,8 +773,8 @@ def run_pipeline(
         tool_result,
         attempt=len(remote.get("repair_attempts", [])) if remote else 1,
         max_attempts=MAX_FIX_ATTEMPTS,
-        static_result=request.get("local_phase1", {}).get("static"),
-        rag_result=request.get("local_phase1", {}).get("rag"),
+        static_result=fixed_static,
+        rag_result=fixed_rag,
         detector_fixed=remote_fixed,
         verifier=v_info,
     )
@@ -723,6 +798,7 @@ def run_pipeline(
         "fixed_unit_results": v_info.get("fixed_unit_results", []),
         "vulnerability_probability": v_info.get("vulnerability_probability"),
         "risk_delta": risk_delta,
+        "detector_disagreement": detector_still_flags and overall_verdict.startswith("Patch accepted"),
         "overall_verdict": overall_verdict,
         "notes": f"Phase 5 verification finished with verdict: {overall_verdict}.",
     }
@@ -848,7 +924,7 @@ def parse_args() -> argparse.Namespace:
         "--max-fix-attempts",
         type=int,
         default=MAX_FIX_ATTEMPTS,
-        help="Deprecated compatibility option; the pipeline now runs exactly one fix attempt.",
+        help="Maximum repair attempts (1-3) for the selected backend's single repair loop.",
     )
     parser.add_argument(
         "--tools",
@@ -886,12 +962,9 @@ def main() -> None:
         or bool(args.tools and any(t != "slither" for t in args.tools))
     )
 
-    manifest = run_pipeline(
-        code,
+    common = dict(
         file_name=args.code_file.name,
-        run_id=args.run_id,
         runs_dir=args.runs_dir,
-        remote_result=remote,
         execution_mode=args.mode,
         detector_threshold=args.detector_threshold,
         source_root=args.solidity_root or args.code_file.parent,
@@ -902,66 +975,37 @@ def main() -> None:
         skip_reporter_llm=not args.llm_reporter,
         skip_detector_explanation=not args.llm_detector_explanation,
         deterministic_advisor_assessor=args.fast_agents,
+        max_fix_attempts=args.max_fix_attempts,
     )
+    manifest = run_pipeline(code, run_id=args.run_id, remote_result=remote, **common)
 
-    if args.backend == "server_gpu" and not remote and not args.submit_kaggle:
+    def finish(result: dict[str, Any], request_obj: dict[str, Any]) -> dict[str, Any]:
+        return run_pipeline(
+            code,
+            run_id=manifest["run_id"],
+            remote_result=result,
+            local_phase1=request_obj.get("local_phase1"),
+            **common,
+        )
+
+    if remote:
+        pass  # --remote-result: the supplied result was already merged above.
+    elif args.backend == "server_gpu" and not args.submit_kaggle:
         from E2E.local.server_gpu_runner import run_server_gpu_pipeline
 
-        limit = min(max(1, args.max_fix_attempts), MAX_FIX_ATTEMPTS)
+        # The GPU runner owns the single repair loop (compiler + detector + static/RAG
+        # feedback, at most MAX_FIX_ATTEMPTS attempts); no outer retry loop here.
         request_obj = read_json(manifest["request_path"])
-        for attempt in range(1, limit + 1):
-            if attempt > 1:
-                request_obj["repair"] = {"attempt": attempt, "max_attempts": limit}
-            server_result = run_server_gpu_pipeline(request_obj)
-            manifest = run_pipeline(
-                code,
-                file_name=args.code_file.name,
-                run_id=manifest["run_id"],
-                runs_dir=args.runs_dir,
-                remote_result=server_result,
-                execution_mode=args.mode,
-                detector_threshold=args.detector_threshold,
-                source_root=args.solidity_root or args.code_file.parent,
-                tools=selected_tools,
-                use_smartbugs=use_smartbugs,
-            )
-            v_verdict = manifest.get("verification", {}).get("overall_verdict", "")
-            if not v_verdict.startswith("Patch rejected") or attempt >= limit:
-                break
-            run_dir = Path(manifest["run_dir"])
-            v_path = run_dir / "phase5_verification.json"
-            v_data = read_json(v_path) if v_path.exists() else {}
-            tool_data = v_data.get("tool_verification", {})
-            feedback = build_tool_repair_feedback(
-                tool_data,
-                attempt=attempt,
-                max_attempts=limit,
-                static_result=request_obj.get("local_phase1", {}).get("static"),
-                rag_result=request_obj.get("local_phase1", {}).get("rag"),
-                detector_fixed=manifest.get("verification", {}).get("fixed_detection"),
-                verifier=v_data.get("verifier"),
-            )
-            request_obj["repair_feedback"] = feedback
-    elif args.backend in {"local", "ollama", "gemini", "local_fast", "auto"} and not remote and not args.submit_kaggle:
+        manifest = finish(run_server_gpu_pipeline(request_obj), request_obj)
+    elif args.backend in {"local", "ollama", "gemini", "local_fast", "auto"} and not args.submit_kaggle:
         from E2E.local.fast_agent_runner import run_fast_local_pipeline
 
         request_obj = read_json(manifest["request_path"])
-        fast_result = run_fast_local_pipeline(request_obj, backend=args.backend)
-        manifest = run_pipeline(
-            code,
-            file_name=args.code_file.name,
-            run_id=manifest["run_id"],
-            runs_dir=args.runs_dir,
-            remote_result=fast_result,
-            execution_mode=args.mode,
-            detector_threshold=args.detector_threshold,
-            source_root=args.solidity_root or args.code_file.parent,
-            tools=selected_tools,
-            use_smartbugs=use_smartbugs,
-        )
-    elif (args.submit_kaggle or args.backend == "kaggle") and not remote:
+        manifest = finish(run_fast_local_pipeline(request_obj, backend=args.backend), request_obj)
+    elif args.submit_kaggle or args.backend == "kaggle":
         from E2E.local.kaggle_job_client import KaggleJobClient
 
+        request_obj = read_json(manifest["request_path"])
         client = KaggleJobClient(kernel_id=args.kernel_id, poll_seconds=args.poll_seconds)
         repair_result = run_kaggle_repair_loop(
             manifest["request_path"],
@@ -972,18 +1016,7 @@ def main() -> None:
             tools=selected_tools,
             use_smartbugs=use_smartbugs,
         )
-        manifest = run_pipeline(
-            code,
-            file_name=args.code_file.name,
-            run_id=manifest["run_id"],
-            runs_dir=args.runs_dir,
-            remote_result=repair_result["result"],
-            execution_mode=args.mode,
-            detector_threshold=args.detector_threshold,
-            source_root=args.solidity_root or args.code_file.parent,
-            tools=selected_tools,
-            use_smartbugs=use_smartbugs,
-        )
+        manifest = finish(repair_result["result"], request_obj)
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
 
 

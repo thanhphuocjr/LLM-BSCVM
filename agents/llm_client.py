@@ -396,6 +396,13 @@ class ServerGPUClient:
         )
         self.timeout = timeout
 
+    def _headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        api_key = os.environ.get("SERVER_GPU_API_KEY", "").strip()
+        if api_key:
+            headers["X-API-Key"] = api_key
+        return headers
+
     def generate(
         self,
         prompt: str,
@@ -416,7 +423,7 @@ class ServerGPUClient:
         req = self._urllib.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers=self._headers(),
         )
         try:
             with self._urllib.urlopen(req, timeout=self.timeout) as resp:
@@ -453,7 +460,7 @@ class ServerGPUClient:
         req = self._urllib.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers=self._headers(),
         )
         try:
             with self._urllib.urlopen(req, timeout=self.timeout) as resp:

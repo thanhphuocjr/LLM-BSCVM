@@ -29,12 +29,12 @@ SLITHER_CHECK_TO_SWC: dict[str, tuple[str, str, str]] = {
     "reentrancy-no-eth": ("SWC-107", "Reentrancy", "Medium"),
     "arbitrary-send-eth": ("SWC-105", "Unprotected Ether Withdrawal", "Critical"),
     "suicidal": ("SWC-106", "Unprotected Selfdestruct", "Critical"),
-    "unprotected-upgrade": ("SWC-101", "Access Control", "Critical"),
+    "unprotected-upgrade": ("SWC-105", "Unprotected Upgrade (Access Control)", "Critical"),
     "unchecked-transfer": ("SWC-104", "Unchecked Low Level Calls", "Medium"),
     "unchecked-lowlevel": ("SWC-104", "Unchecked Low Level Calls", "Medium"),
     "calls-loop": ("SWC-113", "Dos Gas Limit", "Medium"),
     "timestamp": ("SWC-116", "Timestamp Dependence", "Low"),
-    "solc-version": ("SWC-103", "Floating Pragma", "Low"),
+    "solc-version": ("SWC-102", "Outdated Compiler Version", "Low"),
 }
 
 

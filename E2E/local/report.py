@@ -332,7 +332,7 @@ def apply_verification_to_report(
     verdict = str(verification.get("overall_verdict") or "Not complete")
     report_data["patch_verdict"] = verdict
     report_data["verification_verdict"] = verdict
-    report_data["risk_delta"] = verification.get("risk_delta", 0.0)
+    report_data["risk_delta"] = verification.get("risk_delta")
     report_data["solc_version"] = (
         verification.get("tool_verification", {}).get("compile", {}).get("compiler_version")
         or verification.get("tool_verification", {}).get("solc_version")
@@ -344,7 +344,7 @@ def apply_verification_to_report(
         if row.get("phase") == "5 Verifier":
             row["status"] = verification.get("status", "partial")
 
-    if not verdict.startswith(("Patch rejected", "Patch inconclusive")):
+    if not verdict.startswith(("Patch rejected", "Patch inconclusive", "Inconclusive")):
         return
 
     report_data["model_executive_summary"] = report_data.get("executive_summary", "")
@@ -357,17 +357,27 @@ def apply_verification_to_report(
         else ""
     )
     outcome = "rejected" if verdict.startswith("Patch rejected") else "not accepted"
-    report_data["executive_summary"] = (
-        f"The audit identified {finding_count} finding(s). A patch was generated but {outcome} "
-        f"by deterministic verification: {verdict}.{detail} The patch must not be deployed; "
-        "the original finding remains open until a behavior-preserving patch passes compilation, "
-        "the security tool matrix, and project tests."
+    no_patch = any(
+        marker in verdict
+        for marker in ("no patch was generated", "patch execution incomplete")
     )
+    if no_patch:
+        report_data["executive_summary"] = (
+            f"The audit identified {finding_count} finding(s). Verification is inconclusive: "
+            f"{verdict}. The findings remain open and require manual review."
+        )
+    else:
+        report_data["executive_summary"] = (
+            f"The audit identified {finding_count} finding(s). A patch was generated but {outcome} "
+            f"by deterministic verification: {verdict}.{detail} The patch must not be deployed; "
+            "the original finding remains open until a behavior-preserving patch passes compilation, "
+            "the security tool matrix, and project tests."
+        )
     for finding in report_data.get("findings", []):
         finding["verification_status"] = (
             "Rejected by deterministic verifier"
             if verdict.startswith("Patch rejected")
-            else "Inconclusive due to detector disagreement"
+            else verdict
         )
         finding["residual_risk"] = verdict
     rejection_recommendation = (

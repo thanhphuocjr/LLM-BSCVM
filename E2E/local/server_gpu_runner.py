@@ -18,26 +18,33 @@ from __future__ import annotations
 import json
 import os
 import re
-import textwrap
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
-from E2E.config import DEFAULT_DETECTOR_THRESHOLD
+from E2E.config import DEFAULT_DETECTOR_THRESHOLD, RISK_ORDER
 from E2E.local.local_llm_runner import (
     _apply_heuristic_security_patch,
-    _derive_findings,
     _generate_advisor_section,
     _generate_assessor_section,
+    finding_key,
 )
+from E2E.local.rag_runner import run_rag
+from E2E.local.static_runner import run_static
 from E2E.shared.function_parser import (
     CodeUnit,
     apply_unit_patches,
+    build_contract_context,
     extract_declaration_body,
+    lenient_json_string_field,
+    parse_code_units,
     validate_observable_behavior,
 )
+from E2E.shared.fusion import fuse_findings
+from E2E.shared.solc import check_compilation_with_baseline
+
+MAX_VERIFICATION_ATTEMPTS = 3
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -67,12 +74,19 @@ def get_server_url(server_url: str | None = None) -> str:
 DEFAULT_SERVER_URL = get_server_url()
 
 
+def _auth_headers() -> dict[str, str]:
+    """Optional shared secret for the GPU server (set SERVER_GPU_API_KEY on both sides)."""
+    _load_env_file()
+    api_key = os.environ.get("SERVER_GPU_API_KEY", "").strip()
+    return {"X-API-Key": api_key} if api_key else {}
+
+
 def _post_json(url: str, payload: dict[str, Any], timeout: int = 60) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **_auth_headers()},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
@@ -83,7 +97,7 @@ def check_server_health(server_url: str | None = None, timeout: int = 3) -> dict
     actual_url = get_server_url(server_url)
     url = f"{actual_url}/api/v1/health"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "LLM-BSCVM-Local"})
+        req = urllib.request.Request(url, headers={"User-Agent": "LLM-BSCVM-Local", **_auth_headers()})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
@@ -199,592 +213,859 @@ def _build_rag_knowledge_section(
     )
 
 
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Unit helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def _as_code_unit(unit: CodeUnit | dict[str, Any]) -> CodeUnit:
+    if isinstance(unit, CodeUnit):
+        return unit
+    code = str(unit.get("code") or "")
+    return CodeUnit(
+        unit_id=unit.get("unit_id", "unknown"),
+        kind=unit.get("kind", "function"),
+        name=unit.get("name", "func"),
+        contract_name=unit.get("contract_name", "Contract"),
+        start_offset=unit.get("start_offset", 0),
+        end_offset=unit.get("end_offset", len(code)),
+        start_line=unit.get("start_line", 1),
+        end_line=unit.get("end_line", 1),
+        code=code,
+        has_body=unit.get("has_body", True),
+        is_view_or_pure=unit.get("is_view_or_pure", False),
+        visibility=unit.get("visibility", "public"),
+    )
+
+
+def _find_unit(units: list[CodeUnit], target: CodeUnit) -> CodeUnit | None:
+    """Locate `target` in a re-parsed source: by unit_id, else by a unique name match."""
+    by_id = next((unit for unit in units if unit.unit_id == target.unit_id), None)
+    if by_id is not None:
+        return by_id
+    same_name = [
+        unit for unit in units
+        if unit.name == target.name and unit.contract_name == target.contract_name
+    ]
+    return same_name[0] if len(same_name) == 1 else None
+
+
+def _splice_unit(code: str, target: CodeUnit, replacement: str, summary: str) -> str:
+    current = _find_unit(parse_code_units(code), target)
+    if current is None:
+        raise ValueError(f"Unit {target.unit_id} could not be located in the current source")
+    updated, outcomes = apply_unit_patches(
+        code,
+        [current],
+        [{"unit_id": current.unit_id, "replacement": replacement, "summary": summary}],
+    )
+    if not any(item.get("status") == "applied" for item in outcomes):
+        reason = outcomes[0].get("reason") if outcomes else "patch was not applied"
+        raise ValueError(str(reason))
+    return updated
+
+
+def score_units_via_server(
+    units: list[CodeUnit],
+    threshold: float,
+    server_url: str | None = None,
+) -> list[dict[str, Any]]:
+    """Score every unit with a body. A failed request is recorded as an error, never as a probability."""
+    results: list[dict[str, Any]] = []
+    for unit in units:
+        if not unit.has_body:
+            continue
+        base = {
+            "unit_id": unit.unit_id,
+            "threshold": threshold,
+            "start_line": unit.start_line,
+            "end_line": unit.end_line,
+        }
+        try:
+            response = detect_via_server(unit.code, threshold=threshold, server_url=server_url)
+            probability = float(response["vulnerable_probability"])
+        except Exception as error:
+            results.append({
+                **base,
+                "status": "error",
+                "label": "Inconclusive",
+                "vulnerability_probability": None,
+                "error": f"{type(error).__name__}: {error}",
+            })
+            continue
+        results.append({
+            **base,
+            "status": "ok",
+            "label": "Vulnerable" if probability >= threshold else "Safe",
+            "vulnerability_probability": round(probability, 4),
+            "line_scores": response.get("line_scores"),
+        })
+    return results
+
+
+def summarize_detector(unit_results: list[dict[str, Any]], threshold: float) -> dict[str, Any]:
+    """Contract-level detector summary that stays honest about failed units."""
+    scored = [item for item in unit_results if item.get("vulnerability_probability") is not None]
+    errored = [item for item in unit_results if item.get("status") == "error"]
+    if errored and not scored:
+        status = "error"
+    elif errored:
+        status = "partial"
+    else:
+        status = "ok"
+    max_probability = max((float(item["vulnerability_probability"]) for item in scored), default=None)
+    if any(item.get("label") == "Vulnerable" for item in scored):
+        verdict = "Vulnerable"
+    elif status == "ok":
+        verdict = "Safe"
+    else:
+        verdict = "Inconclusive"
+    summary = {
+        "status": status,
+        "verdict": verdict,
+        "vulnerability_probability": round(max_probability, 4) if max_probability is not None else None,
+        "score": round(max_probability, 4) if max_probability is not None else None,
+        "threshold": threshold,
+        "unit_results": unit_results,
+    }
+    if errored:
+        summary["error"] = f"{len(errored)}/{len(unit_results)} unit(s) could not be scored by the detector"
+    return summary
+
+
+def _feedback_from_request(repair_feedback: dict[str, Any] | None) -> str:
+    """Turn an externally supplied repair_feedback object into prompt text."""
+    if not repair_feedback:
+        return ""
+    parts: list[str] = []
+    if repair_feedback.get("compiler_error"):
+        parts.append(f"Previous compilation error:\n{repair_feedback['compiler_error']}")
+    for channel_name, channel in (repair_feedback.get("components") or {}).items():
+        if channel.get("passed", True):
+            continue
+        channel_findings = channel.get("findings") or channel.get("residual_target_findings") or []
+        if channel_findings:
+            details = "; ".join(
+                str(item.get("message") or item.get("name") or item.get("title") or "")
+                for item in channel_findings
+                if item
+            )
+            parts.append(f"Verification channel [{channel_name}] flagged issues: {details}")
+        elif channel.get("reason") or channel.get("error"):
+            parts.append(f"Verification channel [{channel_name}] reported: {channel.get('reason') or channel.get('error')}")
+    return "\n".join(parts)
+
+
+def _min_pragma_version(source_code: str) -> tuple[int, int, int] | None:
+    """Lowest compiler version allowed by the pragma (the patch must compile with it)."""
+    match = re.search(r"pragma\s+solidity\s+([^;]+);", source_code)
+    if not match:
+        return None
+    versions = [
+        tuple(int(part) for part in found)
+        for found in re.findall(r"(\d+)\.(\d+)\.(\d+)", match.group(1))
+    ]
+    return min(versions) if versions else None
+
+
+def _version_rules(source_code: str) -> str:
+    version = _min_pragma_version(source_code)
+    if version is None or version >= (0, 6, 0):
+        return ""
+    spec = re.search(r"pragma\s+solidity\s+([^;]+);", source_code).group(1).strip()
+    rules = [f"   - TARGET SOLIDITY COMPILER: pragma solidity {spec} (legacy {version[0]}.{version[1]}.{version[2]})."]
+    if version < (0, 4, 22):
+        rules.append("     * DO NOT pass a message string to require(); only `require(condition);` is valid.")
+        rules.append("     * DO NOT use the `constructor` keyword; constructors are functions named after the contract.")
+    else:
+        rules.append("     * Keep the declaration kind unchanged: a `constructor(...)` stays a `constructor(...)`.")
+    if version < (0, 4, 21):
+        rules.append("     * DO NOT use the `emit` keyword; trigger events directly via `EventName(...)`.")
+    if version < (0, 5, 0):
+        rules.append("     * Keep pre-0.5 syntax (no `address payable`, no `calldata`, `.call.value(x)()` style).")
+    rules.append(
+        "     * Preserve return semantics: if the original returns a boolean (e.g. `return false;`), do NOT change it to `revert()`."
+    )
+    return "\n".join(rules) + "\n"
+
+
+def _build_fixer_prompt(
+    unit: CodeUnit,
+    unit_findings: list[dict[str, Any]],
+    unit_suggestions: list[dict[str, Any]],
+    source_code: str,
+    feedback_note: str,
+    rag_section: str,
+) -> str:
+    finding_lines = [f"  * [{item.get('swc', '')}] {item.get('title', '')}" for item in unit_findings]
+    for suggestion in unit_suggestions:
+        # Suggestions without `is_true_positive` come from the knowledge-base fallback and describe
+        # a different contract's case; feeding them as this function's diagnosis misleads the fixer.
+        if not suggestion.get("is_true_positive"):
+            continue
+        if suggestion.get("fix_strategy"):
+            finding_lines.append(f"  * Fix Strategy: {suggestion['fix_strategy']}")
+        elif suggestion.get("root_cause"):
+            finding_lines.append(f"  * Root cause: {suggestion['root_cause']}")
+    findings_text = "\n".join(finding_lines) if finding_lines else "Security vulnerability detected."
+    context = build_contract_context(unit, source_code, budget_tokens=1500)
+    return (
+        "You are an expert Solidity smart contract security researcher.\n"
+        f"Target vulnerable function: `{unit.name}`\n"
+        f"Identified Vulnerabilities & Diagnoses:\n{findings_text}\n\n"
+        f"Original declaration:\n```solidity\n{unit.code}\n```\n\n"
+        f"Contract Context & Invariants:\n```solidity\n{context}\n```\n"
+        f"{rag_section}\n"
+        f"{feedback_note}\n\n"
+        "INSTRUCTIONS:\n"
+        f"1. Generate a MINIMAL DIFF security repair for `{unit.name}`.\n"
+        f"{_version_rules(source_code)}"
+        "2. All state write statements and event emissions from the original function MUST be preserved.\n"
+        "3. Return ONLY a single valid JSON object with format:\n"
+        "{\n"
+        f'  "replacement": "full replacement code beginning with function {unit.name} and ending at its closing brace",\n'
+        '  "changed_lines": [1, 2],\n'
+        '  "why": "brief rationale"\n'
+        "}\n"
+        "Do NOT include explanations or text outside the JSON."
+    )
+
+
+def patch_unit(
+    code: str,
+    unit: CodeUnit,
+    *,
+    unit_findings: list[dict[str, Any]],
+    unit_suggestions: list[dict[str, Any]],
+    source_code: str,
+    feedback_note: str,
+    rag_section: str,
+    attempt: int,
+    server_url: str | None,
+    single_pass: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    """Patch one unit with the generative model, falling back to the Advisor's fixed code.
+
+    single_pass: the fixer's reply is the result. The behaviour guard only annotates it
+    (`guard_warning`), an unchanged reply is reported as `unchanged`, and no fallback runs.
+    """
+    label = f"attempt {attempt}"
+    stage = "prepare"
+    llm_error = ""
+    guard_warning = ""
+    rationale = ""
+    try:
+        prompt = _build_fixer_prompt(unit, unit_findings, unit_suggestions, source_code, feedback_note, rag_section)
+        stage = "generate"
+        reply = generate_via_server(
+            prompt,
+            system_prompt="You are a Solidity security auditor. Output strictly valid JSON with the requested schema.",
+            temperature=0.0,
+            server_url=server_url,
+        )
+        stage = "extract"
+        rationale = (lenient_json_string_field(reply, "why") or "").strip()
+        candidate = extract_declaration_body(reply, target_name=unit.name)
+        if not candidate or unit.name not in candidate:
+            raise ValueError(f"Extracted patch does not define expected function {unit.name}")
+        if single_pass and re.sub(r"\s+", "", candidate) == re.sub(r"\s+", "", unit.code):
+            return code, {
+                "finding_id": f"LLM:Qwen14B:{unit.unit_id}",
+                "unit_id": unit.unit_id,
+                "status": "unchanged",
+                "stage": "unchanged",
+                "engine": "llm_fixer",
+                "fixed_code": candidate,
+                "attempt": attempt,
+                "rationale": rationale,
+                "reason": "The fixer returned the function unchanged.",
+            }
+        stage = "guard"
+        try:
+            validate_observable_behavior(unit.code, candidate)
+        except ValueError as error:
+            if not single_pass:
+                raise
+            guard_warning = str(error)
+        stage = "apply"
+        updated = _splice_unit(code, unit, candidate, f"Qwen-14B patch for {unit.unit_id} ({label})")
+        return updated, {
+            "finding_id": f"LLM:Qwen14B:{unit.unit_id}",
+            "unit_id": unit.unit_id,
+            "status": "applied",
+            "stage": "applied",
+            "engine": "llm_fixer",
+            "fixed_code": candidate,
+            "patched_code": candidate,
+            "attempt": attempt,
+            "guard_warning": guard_warning,
+            "rationale": rationale,
+            "reason": f"Applied neural unit patch for {unit.unit_id} ({label}).",
+        }
+    except Exception as error:
+        llm_error = f"{type(error).__name__}: {error}"
+
+    advisor_error = ""
+    for suggestion in ([] if single_pass else unit_suggestions):
+        suggested = str(suggestion.get("fixed_code") or "").strip()
+        if not suggested:
+            continue
+        candidate = extract_declaration_body(suggested, target_name=unit.name)
+        if not candidate or unit.name not in candidate:
+            continue
+        if re.sub(r"\s+", "", candidate) == re.sub(r"\s+", "", unit.code):
+            continue
+        try:
+            validate_observable_behavior(unit.code, candidate)
+            updated = _splice_unit(code, unit, candidate, f"Advisor patch for {unit.unit_id}")
+        except Exception as error:
+            advisor_error = f"{type(error).__name__}: {error}"
+            continue
+        return updated, {
+            "finding_id": suggestion.get("finding_id") or f"Advisor:{unit.unit_id}",
+            "unit_id": unit.unit_id,
+            "status": "applied",
+            "stage": "applied",
+            "engine": "advisor_fallback",
+            "fixed_code": candidate,
+            "patched_code": candidate,
+            "attempt": attempt,
+            "reason": f"LLM fixer failed at stage '{stage}'; applied the Advisor's patch for {unit.unit_id}.",
+        }
+
+    reason = f"Patch rejected at stage '{stage}': {llm_error}"
+    if advisor_error:
+        reason += f"; advisor fallback rejected: {advisor_error}"
+    return code, {
+        "finding_id": f"LLM:Qwen14B:{unit.unit_id}",
+        "unit_id": unit.unit_id,
+        "status": "rejected",
+        "stage": stage,
+        "attempt": attempt,
+        "error": llm_error,
+        "rationale": rationale,
+        "reason": reason,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Verification of one candidate patch
+# ──────────────────────────────────────────────────────────────────────────────
+_ERROR_LOCATION_RE = re.compile(r"(-->\s*\S+:\d+:\d+:?|/\S+\.sol:\d+:\d+:?)")
+
+
+def _compiler_error_signatures(text: str) -> set[str]:
+    signatures = set()
+    for line in (text or "").splitlines():
+        if "Error" not in line:
+            continue
+        signatures.add(_ERROR_LOCATION_RE.sub("", line).strip())
+    return signatures
+
+
+def evaluate_compilation(original_code: str, fixed_code: str) -> dict[str, Any]:
+    """Compile against the original as a baseline.
+
+    - skipped:        no compiler available (not a failure of the patch)
+    - not_applicable: the original does not compile standalone (e.g. unresolved imports)
+                      and the patch introduced no new compiler error
+    """
+    result = check_compilation_with_baseline(original_code, fixed_code)
+    fixed = result.get("fixed") or {}
+    baseline = result.get("baseline") or {}
+    if fixed.get("passed") is None:
+        state = "skipped"
+    elif fixed.get("passed"):
+        state = "passed"
+    elif result.get("baseline_failed"):
+        new_errors = _compiler_error_signatures(fixed.get("error", "")) - _compiler_error_signatures(
+            baseline.get("error", "")
+        )
+        state = "failed" if new_errors else "not_applicable"
+    else:
+        state = "failed"
+    return {
+        "state": state,
+        "failed": state == "failed",
+        "compiler": result.get("compiler"),
+        "selection_reason": result.get("selection_reason"),
+        "baseline_failed": result.get("baseline_failed", False),
+        "error": fixed.get("error", "") if state == "failed" else "",
+        "passed": {"passed": True, "failed": False}.get(state),
+        "status": state,
+    }
+
+
+_ERROR_LINE_RE = re.compile(r"\S+?\.sol:(\d+):\d+")  # `--> a.sol:12:5` (>=0.5) and `a.sol:12:5: Error` (0.4)
+
+
+def units_with_compiler_errors(candidate_code: str, error_text: str) -> set[str]:
+    """Map solc error locations (`--> file:LINE:COL`) to the units that contain them."""
+    lines = {int(value) for value in _ERROR_LINE_RE.findall(error_text or "")}
+    return {
+        unit.unit_id
+        for unit in parse_code_units(candidate_code)
+        if any(unit.start_line <= line <= unit.end_line for line in lines)
+    }
+
+
+def _finding_pairs(findings: list[dict[str, Any]]) -> set[tuple[str, str]]:
+    return {
+        (str(item.get("swc")), str(item.get("unit_id")))
+        for item in findings
+        if item.get("swc") and item.get("unit_id")
+    }
+
+
+def verify_candidate(
+    source_code: str,
+    candidate_code: str,
+    *,
+    patched_unit_ids: set[str],
+    target_unit_ids: set[str],
+    original_unit_results: list[dict[str, Any]],
+    target_pairs: set[tuple[str, str]],
+    known_pairs: set[tuple[str, str]],
+    threshold: float,
+    server_url: str | None,
+) -> dict[str, Any]:
+    """Three-channel verification of a candidate: compiler, neural detector, static + RAG re-run."""
+    compile_info = evaluate_compilation(source_code, candidate_code)
+    fixed_units = parse_code_units(candidate_code)
+    fixed_by_id = {unit.unit_id: unit for unit in fixed_units}
+
+    # Neural detector: re-score patched units only; other units keep their original score.
+    rescored: list[dict[str, Any]] = []
+    for original in original_unit_results:
+        unit_id = original["unit_id"]
+        if unit_id not in patched_unit_ids:
+            rescored.append(dict(original))
+            continue
+        fixed_unit = fixed_by_id.get(unit_id)
+        if fixed_unit is None:
+            rescored.append({**original, "status": "error", "label": "Inconclusive",
+                             "vulnerability_probability": None,
+                             "error": "patched unit not found in candidate source"})
+            continue
+        rescored.extend(score_units_via_server([fixed_unit], threshold, server_url))
+    detector_failing = sorted(
+        item["unit_id"] for item in rescored
+        if item["unit_id"] in target_unit_ids and item.get("label") == "Vulnerable"
+    )
+    unverified = sorted(
+        item["unit_id"] for item in rescored
+        if item["unit_id"] in target_unit_ids and item.get("vulnerability_probability") is None
+    )
+
+    # Static + RAG re-run on the candidate source.
+    channel_errors: dict[str, str] = {}
+    fixed_local: list[dict[str, Any]] = []
+    for name, runner in (("static", run_static), ("rag", run_rag)):
+        try:
+            fixed_local.extend(runner(candidate_code, fixed_units).get("findings", []))
+        except Exception as error:
+            channel_errors[name] = f"{type(error).__name__}: {error}"
+    residual = [item for item in fixed_local if (str(item.get("swc")), str(item.get("unit_id"))) in target_pairs]
+    introduced = [
+        item for item in fixed_local
+        if str(item.get("unit_id")) in patched_unit_ids
+        and (str(item.get("swc")), str(item.get("unit_id"))) not in known_pairs
+        and RISK_ORDER.get(str(item.get("severity")), 0) >= RISK_ORDER["High"]
+    ]
+
+    compile_culprits = (
+        units_with_compiler_errors(candidate_code, compile_info.get("error", ""))
+        if compile_info["failed"]
+        else set()
+    )
+    failing_units = set(detector_failing) | set(unverified) | (compile_culprits & patched_unit_ids)
+    failing_units.update(str(item.get("unit_id")) for item in residual + introduced if item.get("unit_id"))
+    passed = (
+        not compile_info["failed"]
+        and not failing_units
+        and not channel_errors
+    )
+    scored_targets = [
+        float(item["vulnerability_probability"]) for item in rescored
+        if item["unit_id"] in target_unit_ids and item.get("vulnerability_probability") is not None
+    ]
+    return {
+        "passed": passed,
+        "compilation": compile_info,
+        "unit_results": rescored,
+        "detector_failing_units": detector_failing,
+        "unverified_units": unverified,
+        "residual_findings": residual,
+        "introduced_findings": introduced,
+        "channel_errors": channel_errors,
+        "failing_units": sorted(failing_units),
+        "compile_culprit_units": sorted(compile_culprits),
+        "max_vulnerability_probability": round(max(scored_targets), 4) if scored_targets else None,
+    }
+
+
+def _verification_feedback(attempt: int, max_attempts: int, verification: dict[str, Any]) -> str:
+    parts = [f"\n\n[CRITICAL RESIDUAL ERROR FEEDBACK - ATTEMPT {attempt}/{max_attempts}]"]
+    compile_info = verification["compilation"]
+    if compile_info["failed"]:
+        error_lines = [
+            line for line in compile_info.get("error", "").splitlines()
+            if "Error" in line
+        ]
+        clean = "\n".join(error_lines[:8]) or compile_info.get("error", "")[:400]
+        parts.append(
+            f"Solidity compiler ({compile_info.get('compiler')}) failed with error:\n{clean}\n"
+            "Your patch broke compilation. You MUST fix this compiler error."
+        )
+    if verification["detector_failing_units"]:
+        parts.append(
+            "The neural detector re-evaluated your patch and STILL FLAGGED it as Vulnerable: "
+            f"{', '.join(verification['detector_failing_units'])}."
+        )
+    for label, key in (("still present", "residual_findings"), ("newly introduced", "introduced_findings")):
+        for item in verification[key]:
+            parts.append(
+                f"Static/RAG finding {label}: [{item.get('swc')}] {item.get('title', '')} "
+                f"in {item.get('unit_id')} (line {item.get('line')})."
+            )
+    return "\n".join(parts)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pipeline
+# ──────────────────────────────────────────────────────────────────────────────
+def _log(message: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
 def run_server_gpu_pipeline(
     request: dict[str, Any],
     *,
     server_url: str | None = None,
 ) -> dict[str, Any]:
-    """Thực thi toàn bộ pipeline 6 phase thông qua dịch vụ AI trên GPU Server."""
+    """Thực thi pipeline phase 1C-5 thông qua dịch vụ AI trên GPU Server.
+
+    Vòng sửa lỗi duy nhất của backend server_gpu (tối đa 3 attempt). Mỗi attempt được
+    kiểm tra bởi ba kênh: compiler (so với baseline), neural detector trên unit đã vá,
+    và static + RAG chạy lại trên code đã vá.
+    """
     started_at = time.perf_counter()
     server_url = get_server_url(server_url)
     run_id = request.get("run_id", "server-gpu-run")
     source_code = request.get("source", {}).get("code", "")
-    code_units = request.get("code_units", [])
-    findings = _derive_findings(request)
-    detector_threshold = float(
-        request.get("execution", {}).get("detector_threshold") or DEFAULT_DETECTOR_THRESHOLD
+    unit_objs = [_as_code_unit(unit) for unit in request.get("code_units", [])]
+    units_by_id = {unit.unit_id: unit for unit in unit_objs}
+    execution = request.get("execution", {})
+    detector_threshold = float(execution.get("detector_threshold") or DEFAULT_DETECTOR_THRESHOLD)
+    # single_pass: one fixer call per target unit, no Phase 5; the model's patch is the result.
+    single_pass = bool((execution.get("repair") or {}).get("single_pass"))
+    max_attempts = 1 if single_pass else min(
+        max(1, int((execution.get("repair") or {}).get("max_attempts") or MAX_VERIFICATION_ATTEMPTS)),
+        MAX_VERIFICATION_ATTEMPTS,
     )
+    local_phase1 = request.get("local_phase1", {})
+    static_p1 = local_phase1.get("static", {}) or request.get("static", {})
+    rag_p1 = local_phase1.get("rag", {}) or request.get("rag", {})
+    rag_context = rag_p1.get("retrieved_context", [])
 
-    # Trích xuất RAG context từ Phase 1B (top items từ 11,869 cases)
-    rag_context = (
-        request.get("local_phase1", {}).get("rag", {}).get("retrieved_context", [])
-        or request.get("rag", {}).get("retrieved_context", [])
-    )
-    if not rag_context and source_code:
-        try:
-            from E2E.rag.retriever import LocalRAGRetriever
-            rag_context = LocalRAGRetriever().retrieve_context(source_code, top_k=5)
-        except Exception:
-            rag_context = []
-
-    # 1. Kiểm tra kết nối tới Server
     health = check_server_health(server_url)
     if health.get("status") != "ready":
         raise ConnectionError(
             f"GPU Server tại {server_url} chưa sẵn sàng (trạng thái: {health.get('status')}). "
-            f"Vui lòng đảm bảo bạn đã khởi chạy `bash run_api_server.sh` trên server."
+            "Vui lòng đảm bảo bạn đã khởi chạy `bash run_api_server.sh` trên server."
         )
 
-    # 2. Phase 1: Chạy Detector v13 trên từng function unit và full contract
-    unit_results = []
-    max_prob = 0.0
-    det_start = time.perf_counter()
-    print(f"[{time.strftime('%H:%M:%S')}] [PHASE 1C] Running Neural Detector v13 on RTX 4070 Ti SUPER GPU server ({len(code_units)} code unit(s))...", flush=True)
-
-    for unit in code_units:
-        # Bỏ qua các khai báo interface hoặc abstract không có thân hàm (Task B8, R-08)
-        has_body = unit.get("has_body", True) if isinstance(unit, dict) else getattr(unit, "has_body", True)
-        if not has_body:
-            continue
-
-        unit_id = unit.get("unit_id", "unknown") if isinstance(unit, dict) else getattr(unit, "unit_id", "unknown")
-        unit_code = (unit.get("code") if isinstance(unit, dict) else getattr(unit, "code", "")) or source_code
-        try:
-            res = detect_via_server(unit_code, threshold=detector_threshold, server_url=server_url)
-            prob = float(res.get("vulnerable_probability", 0.0))
-            label = "Vulnerable" if prob >= detector_threshold else "Safe"
-            unit_results.append({
-                "unit_id": unit_id,
-                "label": label,
-                "vulnerability_probability": round(prob, 4),
-                "threshold": detector_threshold,
-                "line_scores": res.get("line_scores"),
-                "start_line": unit.get("start_line") if isinstance(unit, dict) else getattr(unit, "start_line", 1),
-                "end_line": unit.get("end_line") if isinstance(unit, dict) else getattr(unit, "end_line", 1),
-            })
-            if prob > max_prob:
-                max_prob = prob
-        except Exception as e:
-            # Fallback trung thực khi lỗi mạng/inference: không bịa xác suất 0.85/0.05 (Task A2, R-05)
-            unit_results.append({
-                "unit_id": unit_id,
-                "status": "error",
-                "label": "Inconclusive",
-                "vulnerability_probability": None,
-                "threshold": detector_threshold,
-                "error": str(e),
-                "start_line": unit.get("start_line") if isinstance(unit, dict) else getattr(unit, "start_line", 1),
-                "end_line": unit.get("end_line") if isinstance(unit, dict) else getattr(unit, "end_line", 1),
-            })
-
-    detector_elapsed_ms = round((time.perf_counter() - det_start) * 1000, 2)
-    is_contract_vuln = max_prob >= detector_threshold or len(findings) > 0
-    print(f"[{time.strftime('%H:%M:%S')}] [PHASE 1C] Completed: Neural detection finished ({len(unit_results)} unit(s) evaluated, max_prob: {max_prob:.4f}).", flush=True)
-
-    print(f"[{time.strftime('%H:%M:%S')}] [PHASE 1 FUSED] Synchronizing multi-modal detection signals...", flush=True)
-
-    # Task B1: Chạy fuse_findings() trước Phase 2 Agent để lọc false positive và khử trùng lặp
-    from E2E.shared.fusion import fuse_findings
-    static_p1 = request.get("local_phase1", {}).get("static", {}) or request.get("static", {})
-    rag_p1 = request.get("local_phase1", {}).get("rag", {}) or request.get("rag", {})
-
-    confirmed_findings, candidate_findings = fuse_findings(
-        unit_results,
-        static_p1,
-        rag_p1,
-        tau_agent=0.45,
+    # Phase 1C: neural detector on every unit with a body.
+    _log(f"[PHASE 1C] Running Neural Detector v13 on GPU server ({len(unit_objs)} code unit(s))...")
+    detector_started = time.perf_counter()
+    unit_results = score_units_via_server(unit_objs, detector_threshold, server_url)
+    detector_original = summarize_detector(unit_results, detector_threshold)
+    detector_elapsed_ms = round((time.perf_counter() - detector_started) * 1000, 2)
+    _log(
+        f"[PHASE 1C] Completed: {len(unit_results)} unit(s) evaluated, status={detector_original['status']}, "
+        f"max_prob={detector_original['vulnerability_probability']}."
     )
 
-    # Chỉ chuyển các finding đã được xác nhận (p_final >= tau_agent) sang Phase 2 Agent (Task B1)
-    findings = confirmed_findings
-
-    # Truy xuất cơ sở tri thức lỗ hổng (11,869 cases + 37 SWC registry) theo phương pháp Decompose-Retrieve-Generate của LLM-BSCVM
+    # Phase 1 fused: per-finding fusion decides what reaches the agents.
+    _log("[PHASE 1 FUSED] Synchronizing multi-modal detection signals...")
+    findings, candidate_findings = fuse_findings(unit_results, static_p1, rag_p1, tau_agent=0.45)
     try:
         from agents.advisor import RepairKnowledgeBase
-        kb = RepairKnowledgeBase()
-        findings = kb.enrich_findings(findings, code=source_code, code_units=code_units)
+
+        findings = RepairKnowledgeBase().enrich_findings(
+            findings, code=source_code, code_units=request.get("code_units", [])
+        )
     except Exception:
         pass
-
-    print(f"[{time.strftime('%H:%M:%S')}] [PHASE 1 FUSED] Completed: Multi-modal signals synchronized ({len(findings)} confirmed finding(s), {len(candidate_findings)} candidate(s)).", flush=True)
-
-    # 3. Phase 2-4: Advisor, Assessor, và Fixer
-    print(f"[{time.strftime('%H:%M:%S')}] [PHASE 2] Running Security Advisor agent (root cause & remediation analysis)...", flush=True)
-    advisor = _generate_advisor_section(findings, source_code, backend="server_gpu", use_llm=True)
-    print(f"[{time.strftime('%H:%M:%S')}] [PHASE 2] Completed: Security recommendations generated ({len(advisor.get('suggestions', []))} suggestion(s)).", flush=True)
-
-    print(f"[{time.strftime('%H:%M:%S')}] [PHASE 3] Running Risk Assessor agent (CVSS v3.1 scoring & priority ranking)...", flush=True)
-    assessor = _generate_assessor_section(
-        findings,
-        source_code,
-        backend="server_gpu",
-        use_llm=True,
-        advisor_suggestions=advisor.get("suggestions", []),
-    )
-    print(f"[{time.strftime('%H:%M:%S')}] [PHASE 3] Completed: Risk assessment finished ({len(assessor.get('assessments', []))} item(s) assessed).", flush=True)
-
-    patch_candidates = list(findings) + advisor.get("suggestions", [])
-    fixed_code, patch_outcomes = _apply_heuristic_security_patch(source_code, patch_candidates, code_units=code_units)
-
-    # Nâng cấp bản vá bằng Qwen 14B trên GPU server kết hợp vòng lặp kiểm tra tự động (Self-Correction Loop) tối đa 3 lần
-    MAX_VERIFICATION_ATTEMPTS = 3
-    verification_attempts = []
-    overall_verdict = "PASS"
-    fixed_unit_results = []
-    fixed_max_prob = 0.0
-    req_feedback = request.get("repair_feedback") or {}
-    feedback_note = ""
-    if req_feedback:
-        fb_parts = []
-        if req_feedback.get("compiler_error"):
-            fb_parts.append(f"Previous compilation error:\n{req_feedback['compiler_error']}")
-        for comp_name, comp_info in req_feedback.get("components", {}).items():
-            if not comp_info.get("passed", True):
-                reason = comp_info.get("reason") or comp_info.get("error") or ""
-                findings = comp_info.get("findings") or comp_info.get("residual_target_findings") or []
-                if findings:
-                    f_details = "; ".join(f.get("message") or f.get("name") or f.get("title") or "" for f in findings if f)
-                    fb_parts.append(f"Verification channel [{comp_name}] flagged issues: {f_details}")
-                elif reason:
-                    fb_parts.append(f"Verification channel [{comp_name}] reported: {reason}")
-        if fb_parts:
-            feedback_note = "\n".join(fb_parts)
-
-    # Trích xuất bối cảnh biến trạng thái, modifiers, events từ hợp đồng bao quanh
-    context_lines = []
-    for line in source_code.splitlines():
-        st = line.strip()
-        if (
-            st.startswith(("contract ", "pragma ", "import ", "mapping", "address", "uint", "int", "bool", "bytes", "string", "modifier ", "event ", "struct "))
-            and not st.startswith("function ")
-        ):
-            context_lines.append(line)
-    contract_context_str = "\n".join(context_lines[:35])
-    contract_context_section = f"\n\n### Enclosing Contract Context (State Variables, Modifiers, Events):\n```solidity\n{contract_context_str}\n```" if contract_context_str else ""
-
-    unit_objs = []
-    for u in code_units:
-        if isinstance(u, CodeUnit):
-            unit_objs.append(u)
-        elif isinstance(u, dict):
-            try:
-                unit_objs.append(CodeUnit(**u))
-            except Exception:
-                unit_objs.append(CodeUnit(
-                    unit_id=u.get("unit_id", "unknown"),
-                    kind=u.get("kind", "function"),
-                    name=u.get("name", "func"),
-                    contract_name=u.get("contract_name", "Contract"),
-                    start_offset=u.get("start_offset", 0),
-                    end_offset=u.get("end_offset", len(u.get("code", ""))),
-                    start_line=u.get("start_line", 1),
-                    end_line=u.get("end_line", 10),
-                    code=u.get("code", ""),
-                ))
-    unit_objs = []
-    for u in code_units:
-        if isinstance(u, CodeUnit):
-            unit_objs.append(u)
-        elif isinstance(u, dict):
-            try:
-                unit_objs.append(CodeUnit(**u))
-            except Exception:
-                unit_objs.append(CodeUnit(
-                    unit_id=u.get("unit_id", "unknown"),
-                    kind=u.get("kind", "function"),
-                    name=u.get("name", "func"),
-                    contract_name=u.get("contract_name", "Contract"),
-                    start_offset=u.get("start_offset", 0),
-                    end_offset=u.get("end_offset", len(u.get("code", ""))),
-                    start_line=u.get("start_line", 1),
-                    end_line=u.get("end_line", 10),
-                    code=u.get("code", ""),
-                    has_body=u.get("has_body", True),
-                    is_view_or_pure=u.get("is_view_or_pure", False),
-                ))
-    mapped_target_units = [
-        u for u in unit_objs
-        if any(f.get("unit_id") == u.unit_id and f.get("swc") and f.get("swc") != "UNMAPPED" for f in findings)
-    ]
-    target_units = mapped_target_units if mapped_target_units else [
-        u for u in unit_objs if any(f.get("unit_id") == u.unit_id for f in findings)
-    ]
-    # Task B8: Bỏ qua các hàm pure / view không ghi state khỏi danh sách mục tiêu sửa lỗi
-    target_units = [u for u in target_units if not getattr(u, "is_view_or_pure", False)]
-
-    fixer_loop_start = time.perf_counter()
-    best_attempt_code = source_code
-    best_attempt_outcomes = []
-    best_attempt_score = (-1, -1, -999, -999999)
-    active_target_units = list(target_units)
-
-    for attempt in range(1, MAX_VERIFICATION_ATTEMPTS + 1):
-        attempt_label = f"Attempt {attempt}/{MAX_VERIFICATION_ATTEMPTS}"
-        print(f"[{time.strftime('%H:%M:%S')}] [PHASE 4] Running Fixer agent (synthesizing secure Solidity patch via Qwen2.5-Coder-14B - {attempt_label})...", flush=True)
-
-        current_attempt_code = source_code
-        current_patch_outcomes = []
-
-        if is_contract_vuln and findings and active_target_units:
-            for t_unit in active_target_units:
-                unit_findings = [f for f in findings if f.get("unit_id") == t_unit.unit_id]
-                unit_suggestions = [s for s in advisor.get("suggestions", []) if s.get("unit_id") == t_unit.unit_id]
-
-                stage = "prepare"
-                try:
-                    # Task B3: build_contract_context rút gọn biến state, modifiers, events và invariants (ngân sách 1500 tokens)
-                    from E2E.shared.function_parser import build_contract_context
-                    contract_context_section = build_contract_context(t_unit, source_code, budget_tokens=1500)
-
-                    finding_context = []
-                    for uf in unit_findings:
-                        f_title = uf.get("title", "")
-                        f_swc = uf.get("swc", "")
-                        finding_context.append(f"  * [{f_swc}] {f_title}")
-                    for us in unit_suggestions:
-                        if us.get("fix_strategy"):
-                            finding_context.append(f"  * Fix Strategy: {us['fix_strategy']}")
-                        elif us.get("root_cause"):
-                            finding_context.append(f"  * Root cause: {us['root_cause']}")
-
-                    findings_str = "\n".join(finding_context) if finding_context else "Security vulnerability detected."
-
-                    sol_match = re.search(r"pragma\s+solidity\s+([^;]+);", source_code)
-                    version_rules = ""
-                    if sol_match:
-                        ver_spec = sol_match.group(1).strip()
-                        if any(v in ver_spec for v in ("0.4.", "0.5.")):
-                            version_rules = (
-                                f"   - TARGET SOLIDITY COMPILER: pragma solidity {ver_spec} (Solidity legacy 0.4.x / 0.5.x).\n"
-                                f"     * In Solidity <0.4.22: DO NOT pass a message string to require()! Only single-argument `require(condition);` is valid.\n"
-                                f"     * In Solidity <0.4.22: DO NOT use the `constructor` keyword! Use a function named after the contract.\n"
-                                f"     * In Solidity <0.4.21: DO NOT use the `emit` keyword! Trigger events directly via `EventName(...)`.\n"
-                                f"     * Preserve function return semantics: if the original function returns a boolean (e.g. `return false;`), do NOT alter it to `revert()`.\n"
-                            )
-
-                    unit_prompt = (
-                        f"You are an expert Solidity smart contract security researcher.\n"
-                        f"Target vulnerable function: `{t_unit.name}`\n"
-                        f"Identified Vulnerabilities & Diagnoses:\n{findings_str}\n\n"
-                        f"Original declaration:\n```solidity\n{t_unit.code}\n```\n\n"
-                        f"Contract Context & Invariants:\n```solidity\n{contract_context_section}\n```\n"
-                        f"{feedback_note}\n\n"
-                        f"INSTRUCTIONS:\n"
-                        f"1. Generate a MINIMAL DIFF security repair for `{t_unit.name}`.\n"
-                        f"{version_rules}"
-                        f"2. All state write statements and event emissions from the original function MUST be preserved.\n"
-                        f"3. Return ONLY a single valid JSON object with format:\n"
-                        f"{{\n"
-                        f'  "replacement": "full replacement code beginning with function {t_unit.name} and ending at its closing brace",\n'
-                        f'  "changed_lines": [1, 2],\n'
-                        f'  "why": "brief rationale"\n'
-                        f"}}\n"
-                        f"Do NOT include explanations or text outside the JSON."
-                    )
-
-                    stage = "generate"
-                    llm_reply = generate_via_server(
-                        unit_prompt,
-                        system_prompt="You are a Solidity security auditor. Output strictly valid JSON with the requested schema.",
-                        temperature=0.0,
-                        server_url=server_url,
-                    )
-
-                    stage = "extract"
-                    candidate_body = extract_declaration_body(llm_reply, target_name=t_unit.name)
-                    if not candidate_body or t_unit.name not in candidate_body:
-                        raise ValueError(f"Extracted patch does not define expected function {t_unit.name}")
-
-                    stage = "guard"
-                    validate_observable_behavior(t_unit.code, candidate_body)
-
-                    stage = "apply"
-                    from E2E.shared.function_parser import parse_code_units
-                    current_units_in_fixed = parse_code_units(current_attempt_code)
-                    active_unit_in_fixed = next(
-                        (u for u in current_units_in_fixed if u.unit_id == t_unit.unit_id or u.name == t_unit.name),
-                        t_unit,
-                    )
-                    updated_code, unit_outcomes = apply_unit_patches(
-                        current_attempt_code,
-                        [active_unit_in_fixed],
-                        [{"unit_id": active_unit_in_fixed.unit_id, "replacement": candidate_body, "summary": f"Qwen-14B patch for {t_unit.unit_id} ({attempt_label})"}],
-                    )
-                    if not any(uo.get("status") == "applied" for uo in unit_outcomes):
-                        raise ValueError("Failed to apply patch replacement into contract code")
-
-                    current_attempt_code = updated_code
-                    current_patch_outcomes = [po for po in current_patch_outcomes if po.get("unit_id") != t_unit.unit_id]
-                    current_patch_outcomes.append({
-                        "finding_id": f"LLM:Qwen14B:{t_unit.unit_id}",
-                        "unit_id": t_unit.unit_id,
-                        "status": "applied",
-                        "stage": "applied",
-                        "fixed_code": candidate_body,
-                        "patched_code": candidate_body,
-                        "attempt": attempt,
-                        "reason": f"Applied neural unit patch for {t_unit.unit_id} ({attempt_label}).",
-                    })
-                except Exception as e:
-                    # Ghi log lý do lỗi chi tiết theo từng stage (Task A5, R-03)
-                    current_patch_outcomes.append({
-                        "finding_id": f"LLM:Qwen14B:{t_unit.unit_id}",
-                        "unit_id": t_unit.unit_id,
-                        "status": "rejected",
-                        "stage": stage,
-                        "attempt": attempt,
-                        "error": str(e),
-                        "reason": f"Patch rejected at stage '{stage}': {str(e)}",
-                    })
-
-                # Fallback to Advisor's suggestion if LLM patch was not applied
-                if not any(po.get("unit_id") == t_unit.unit_id and po.get("status") == "applied" for po in current_patch_outcomes):
-                    for us in unit_suggestions:
-                        sug_fixed = str(us.get("fixed_code") or "").strip()
-                        if sug_fixed and sug_fixed != t_unit.code:
-                            candidate_body = extract_declaration_body(sug_fixed, target_name=t_unit.name)
-                            if candidate_body and t_unit.name in candidate_body and re.sub(r"\s+", "", candidate_body) != re.sub(r"\s+", "", t_unit.code):
-                                try:
-                                    validate_observable_behavior(t_unit.code, candidate_body)
-                                    from E2E.shared.function_parser import parse_code_units
-                                    current_units_in_fixed = parse_code_units(current_attempt_code)
-                                    active_unit_in_fixed = next(
-                                        (u for u in current_units_in_fixed if u.unit_id == t_unit.unit_id or u.name == t_unit.name),
-                                        t_unit,
-                                    )
-                                    updated_code, unit_outcomes = apply_unit_patches(
-                                        current_attempt_code,
-                                        [active_unit_in_fixed],
-                                        [{"unit_id": active_unit_in_fixed.unit_id, "replacement": candidate_body, "summary": f"Advisor patch for {t_unit.unit_id}"}],
-                                    )
-                                    if any(uo.get("status") == "applied" for uo in unit_outcomes):
-                                        current_attempt_code = updated_code
-                                        current_patch_outcomes.append({
-                                            "finding_id": us.get("finding_id") or f"Advisor:{t_unit.unit_id}",
-                                            "unit_id": t_unit.unit_id,
-                                            "status": "applied",
-                                            "stage": "applied",
-                                            "fixed_code": candidate_body,
-                                            "patched_code": candidate_body,
-                                            "attempt": attempt,
-                                            "reason": f"Applied Advisor security patch for {t_unit.unit_id}.",
-                                        })
-                                        break
-                                except Exception as e:
-                                    current_patch_outcomes.append({
-                                        "finding_id": us.get("finding_id") or f"Advisor:{t_unit.unit_id}",
-                                        "unit_id": t_unit.unit_id,
-                                        "status": "rejected",
-                                        "stage": "advisor_fallback",
-                                        "attempt": attempt,
-                                        "error": str(e),
-                                        "reason": f"Advisor patch rejected: {str(e)}",
-                                    })
-
-        # Fallback to empirical heuristic patch if no unit patch applied in this attempt
-        if not any(po.get("status") == "applied" for po in current_patch_outcomes):
-            heuristic_code, heuristic_outcomes = _apply_heuristic_security_patch(source_code, patch_candidates, code_units=code_units)
-            if heuristic_outcomes:
-                current_attempt_code = heuristic_code
-                current_patch_outcomes = heuristic_outcomes
-
-        print(f"[{time.strftime('%H:%M:%S')}] [PHASE 4] Completed: Security patch synthesized ({len(current_patch_outcomes)} outcome(s) generated).", flush=True)
-
-        # Giai đoạn 5: Xác minh bản vá bằng Solc Compiler và Neural Detector v13 của Phase 1
-        print(f"[{time.strftime('%H:%M:%S')}] [PHASE 5] Running Multi-Tier Self-Verification (Solc + Neural Detector v13) ({attempt_label})...", flush=True)
-        attempt_vulnerable = False
-        attempt_max_prob = 0.0
-
-        # Step 5A: Solc compilation check on current_attempt_code
-        compile_res = check_solidity_compilation(current_attempt_code)
-        compile_failed = not compile_res.get("passed", True)
-        if compile_failed:
-            attempt_vulnerable = True
-            print(f"[{time.strftime('%H:%M:%S')}] [PHASE 5] Solc Compilation Check: FAILED with compiler {compile_res.get('compiler')}!", flush=True)
-            print(f"[{time.strftime('%H:%M:%S')}] [PHASE 5] Error detail:\n{compile_res.get('error', '').strip()[:400]}", flush=True)
-        else:
-            print(f"[{time.strftime('%H:%M:%S')}] [PHASE 5] Solc Compilation Check: PASSED with compiler {compile_res.get('compiler')}.", flush=True)
-
-        # Trích xuất các hàm đã được cập nhật trong current_attempt_code
-        try:
-            from E2E.shared.function_parser import parse_code_units
-            patched_units = parse_code_units(current_attempt_code)
-            patched_units_map = {u.name: u.code for u in patched_units}
-        except Exception:
-            patched_units_map = {}
-
-        patched_unit_ids = {po.get("unit_id") for po in current_patch_outcomes if po.get("status") == "applied"}
-        confirmed_target_ids = {
-            tu.unit_id for tu in target_units
-            if any(f.get("unit_id") == tu.unit_id and f.get("swc") and f.get("swc") != "UNMAPPED" for f in findings)
-        }
-        verification_target_ids = patched_unit_ids or confirmed_target_ids or {tu.unit_id for tu in target_units}
-
-        attempt_unit_results = []
-        for u in unit_results:
-            u_id = u["unit_id"]
-            u_name = u_id.split(".")[-1]
-            is_patched = u_id in patched_unit_ids
-            is_target = u_id in verification_target_ids
-
-            # Task B8: Chỉ re-scan unit đã bị vá! Unit không bị vá giữ nguyên điểm ban đầu
-            if is_patched:
-                unit_code_to_test = patched_units_map.get(u_name) or u.get("code") or current_attempt_code
-                try:
-                    res = detect_via_server(unit_code_to_test, threshold=detector_threshold, server_url=server_url)
-                    prob = float(res.get("vulnerable_probability", 0.0))
-                    l_scores = res.get("line_scores")
-                except Exception:
-                    # Task A2: Không bịa xác suất 0.02
-                    prob = None
-                    l_scores = None
-            else:
-                prob = u.get("vulnerability_probability")
-                l_scores = u.get("line_scores")
-
-            is_vuln = (prob is not None) and (prob >= detector_threshold)
-            if is_target and is_vuln:
-                attempt_vulnerable = True
-            if is_target and prob is not None and prob > attempt_max_prob:
-                attempt_max_prob = prob
-
-            attempt_unit_results.append({
-                "unit_id": u_id,
-                "label": "Vulnerable" if is_vuln else ("Safe" if prob is not None else "Inconclusive"),
-                "vulnerability_probability": round(prob, 4) if prob is not None else None,
-                "threshold": detector_threshold,
-                "line_scores": l_scores,
-                "attempt": attempt,
-            })
-
-        fixed_max_prob = attempt_max_prob
-        attempt_record = {
-            "attempt": attempt,
-            "max_attempts": MAX_VERIFICATION_ATTEMPTS,
-            "max_vulnerability_probability": round(attempt_max_prob, 4),
-            "threshold": detector_threshold,
-            "compilation": compile_res,
-            "verdict": "Vulnerable" if attempt_vulnerable else "Safe",
-            "unit_results": attempt_unit_results,
-            "patch_outcomes": current_patch_outcomes,
-        }
-
-        # Danh sách failing units: loại bỏ hàm view/pure (Task B8)
-        failing_units = [
-            ur["unit_id"] for ur in attempt_unit_results
-            if ur["label"] == "Vulnerable" and ur["unit_id"] in verification_target_ids
-            and not any(u.unit_id == ur["unit_id"] and getattr(u, "is_view_or_pure", False) for u in unit_objs)
+    # Units flagged only by the neural detector (no SWC from static/RAG) are optional repair
+    # targets: `detector_only_min_prob` (execution.repair) raises the bar for them, and a value
+    # above 1 keeps them out of repair entirely. They are still reported.
+    detector_only_min = (execution.get("repair") or {}).get("detector_only_min_prob")
+    detector_only_deferred: list[dict[str, Any]] = []
+    if detector_only_min is not None:
+        detector_only_deferred = [
+            item for item in findings
+            if item.get("swc") == "UNMAPPED" and float(item.get("p_detector") or 0.0) < float(detector_only_min)
         ]
+        deferred_ids = {id(item) for item in detector_only_deferred}
+        findings = [item for item in findings if id(item) not in deferred_ids]
+    _log(
+        f"[PHASE 1 FUSED] Completed: {len(findings)} confirmed finding(s), {len(candidate_findings)} candidate(s)"
+        + (f", {len(detector_only_deferred)} detector-only finding(s) not repaired." if detector_only_deferred else ".")
+    )
 
-        # Chấm điểm lần thử theo bộ (compile_ok, guard_ok, -n_still_vuln, -diff_size) - Task B4
-        compile_ok = 1 if not compile_failed else 0
-        guard_ok = 1 if not any(po.get("stage") == "guard" for po in current_patch_outcomes) else 0
-        n_still_vuln = len(failing_units)
-        diff_size = abs(len(current_attempt_code) - len(source_code))
-        attempt_score = (compile_ok, guard_ok, -n_still_vuln, -diff_size)
+    # Phase 2: Advisor (triage + remediation). False positives are removed from the repair set.
+    _log("[PHASE 2] Running Security Advisor agent (root cause & remediation analysis)...")
+    advisor = _generate_advisor_section(findings, source_code, backend="server_gpu", use_llm=True)
+    dismissed_ids = set(advisor.get("false_positives", []))
+    dismissed = [item for item in findings if finding_key(item) in dismissed_ids]
+    findings = [item for item in findings if finding_key(item) not in dismissed_ids]
+    _log(
+        f"[PHASE 2] Completed: {len(advisor.get('suggestions', []))} suggestion(s), "
+        f"{len(dismissed)} finding(s) dismissed as false positive."
+    )
 
-        if attempt_score > best_attempt_score:
-            best_attempt_score = attempt_score
-            best_attempt_code = current_attempt_code
-            best_attempt_outcomes = current_patch_outcomes
+    # Phase 3: Assessor (CVSS only feeds the report, so single-pass batch runs skip it).
+    if single_pass:
+        _log("[PHASE 3] Skipped (single-pass mode).")
+        assessor = {"status": "skipped", "assessments": []}
+    else:
+        _log("[PHASE 3] Running Risk Assessor agent (CVSS v3.1 scoring & priority ranking)...")
+        assessor = _generate_assessor_section(
+            findings,
+            source_code,
+            backend="server_gpu",
+            use_llm=True,
+            advisor_suggestions=advisor.get("suggestions", []),
+        )
+        _log(f"[PHASE 3] Completed: {len(assessor.get('assessments', []))} item(s) assessed.")
 
-        if not attempt_vulnerable and not compile_failed:
-            print(f"[{time.strftime('%H:%M:%S')}] [PHASE 5] Verification Succeeded: All units verified Safe by Neural Detector (prob: {attempt_max_prob:.4f} < {detector_threshold}) & Solc compilation passed on {attempt_label}.", flush=True)
-            attempt_record["notes"] = f"Verified clean by Phase 1 Neural Detector and Solc compilation on attempt {attempt}."
-            verification_attempts.append(attempt_record)
-            overall_verdict = "PASS"
-            break
-        else:
-            reasons = []
-            if compile_failed:
-                reasons.append(f"Solc compilation errors ({compile_res.get('compiler')})")
-            if attempt_max_prob >= detector_threshold:
-                reasons.append(f"Residual vulnerability flagged by Neural Detector (max prob: {attempt_max_prob:.4f} >= {detector_threshold})")
-
-            print(f"[{time.strftime('%H:%M:%S')}] [PHASE 5] Verification {attempt_label}: Failed due to {', '.join(reasons)}.", flush=True)
-            if attempt < MAX_VERIFICATION_ATTEMPTS:
-                # Task B4 & B8: Chỉ đưa unit mục tiêu đã thất bại vào lần thử tiếp theo
-                active_target_units = [u for u in target_units if u.unit_id in failing_units]
-                print(f"[{time.strftime('%H:%M:%S')}] [PHASE 5] Collecting error diagnostics for failing unit(s) {failing_units} (Attempt {attempt + 1}/{MAX_VERIFICATION_ATTEMPTS})...", flush=True)
-
-                feedback_parts = [
-                    f"\n\n[CRITICAL RESIDUAL ERROR FEEDBACK - ATTEMPT {attempt}/{MAX_VERIFICATION_ATTEMPTS}]"
-                ]
-                if compile_failed:
-                    # Trích xuất chính xác dòng Error: từ log của solc (Task B4)
-                    solc_raw_err = compile_res.get("error", "").strip()
-                    err_lines = [el for el in solc_raw_err.splitlines() if "Error:" in el or "ParserError:" in el or "TypeError:" in el]
-                    clean_solc_err = "\n".join(err_lines[:8]) if err_lines else solc_raw_err[:400]
-                    feedback_parts.append(
-                        f"Solidity compiler ({compile_res.get('compiler')}) failed with error:\n"
-                        f"{clean_solc_err}\n"
-                        f"Your patch broke compilation. You MUST fix this compiler error."
-                    )
-                if attempt_max_prob >= detector_threshold:
-                    feedback_parts.append(
-                        f"Phase 1 Neural Detector re-evaluated your patch and STILL FLAGGED it as Vulnerable (max prob: {attempt_max_prob:.1%}).\n"
-                        f"Failing unit(s): {', '.join(failing_units)}.\n"
-                        f"Ensure state mutations occur before external calls and invariants are preserved."
-                    )
-                feedback_note = "\n".join(feedback_parts)
-                attempt_record["feedback"] = feedback_note
-                verification_attempts.append(attempt_record)
-            else:
-                print(f"[{time.strftime('%H:%M:%S')}] [PHASE 5] Completed: Reached maximum {MAX_VERIFICATION_ATTEMPTS} verification attempts. Retaining best verified attempt.", flush=True)
-                attempt_record["notes"] = f"Residual issues remain after {MAX_VERIFICATION_ATTEMPTS} attempts: {', '.join(reasons)}."
-                verification_attempts.append(attempt_record)
-                overall_verdict = "WARN"
-
-    # Task B4: Pipeline giữ lần thử có điểm tốt nhất (thay vì luôn lấy lần thử cuối)
-    fixed_code = best_attempt_code
-    patch_outcomes = best_attempt_outcomes
-    fixed_unit_results = attempt_unit_results
-
-    print(f"[{time.strftime('%H:%M:%S')}] [PHASE 5] Completed: Multi-Tier Self-Verification finished (Verdict: {overall_verdict}, Total Attempts: {len(verification_attempts)}).", flush=True)
-
-    last_attempt = verification_attempts[-1] if verification_attempts else {}
-    last_compile = last_attempt.get("compilation", {})
-    compile_passed = last_compile.get("passed", True)
-
-    verifier_items = [
-        {
-            "finding_id": f.get("finding_id") or f"{f.get('swc', 'Unknown')}:{f.get('unit_id', 'contract')}",
-            "status": "PASS" if overall_verdict == "PASS" else "FLAGGED",
-            "residual_risk": "None" if overall_verdict == "PASS" else f"Residual probability: {fixed_max_prob:.1%}",
-            "verification_notes": f"Multi-Tier Verification (Attempts: {len(verification_attempts)}/{MAX_VERIFICATION_ATTEMPTS}, Prob: {fixed_max_prob:.4f}, Solc: {'Passed' if compile_passed else 'Failed'}).",
-            "checklist": [
-                {"name": "Solidity Compilation Integrity (solc)", "passed": compile_passed},
-                {"name": "Phase 1 Neural Detector Re-scan", "passed": fixed_max_prob < detector_threshold},
-                {"name": "Iterative Feedback Loop", "passed": True, "attempts": len(verification_attempts)},
-                {"name": "No Residual Logic Vulnerability", "passed": overall_verdict == "PASS"},
-            ],
-        }
-        for f in findings
+    # Phase 4-5: repair loop.
+    finding_units = {item.get("unit_id") for item in findings if item.get("unit_id")}
+    target_units = [
+        unit for unit in unit_objs
+        if unit.unit_id in finding_units and unit.has_body and not unit.is_view_or_pure
     ]
+    # Optional budget for very large contracts: keep the units with the strongest fused
+    # evidence; the rest are reported as `skipped_targets`, never silently dropped.
+    max_target_units = (execution.get("repair") or {}).get("max_target_units")
+    skipped_targets: list[str] = []
+    if max_target_units and len(target_units) > int(max_target_units):
+        strength = {
+            unit.unit_id: max(
+                float(item.get("p_final") or 0.0) for item in findings if item.get("unit_id") == unit.unit_id
+            )
+            for unit in target_units
+        }
+        ranked = sorted(target_units, key=lambda unit: strength[unit.unit_id], reverse=True)
+        target_units = ranked[: int(max_target_units)]
+        skipped_targets = [unit.unit_id for unit in ranked[int(max_target_units):]]
+        _log(f"[PHASE 4] Target budget: repairing {len(target_units)} unit(s), skipping {len(skipped_targets)}.")
+    target_unit_ids = {unit.unit_id for unit in target_units}
+    target_pairs = {pair for pair in _finding_pairs(findings) if pair[1] in target_unit_ids}
+    known_pairs = _finding_pairs(
+        [
+            *static_p1.get("findings", []),
+            *static_p1.get("candidates", []),
+            *rag_p1.get("findings", []),
+        ]
+    )
+    suggestions = advisor.get("suggestions", [])
+    patch_candidates = list(findings) + suggestions
+    first_swc = next((item.get("swc") for item in findings if item.get("swc") not in {None, "UNMAPPED"}), None)
+    rag_section = _build_rag_knowledge_section(rag_context, target_swc=first_swc)
+    feedback_note = _feedback_from_request(request.get("repair_feedback"))
 
-    total_elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
-    fixer_elapsed_ms = round((time.perf_counter() - fixer_loop_start) * 1000, 2)
+    fixer_started = time.perf_counter()
+    attempts: list[dict[str, Any]] = []
+    best: dict[str, Any] | None = None
+    base_code = source_code
+    carried_outcomes: list[dict[str, Any]] = []
+    active_targets = list(target_units)
 
+    for attempt in range(1, max_attempts + 1 if target_units else 1):
+        label = f"Attempt {attempt}/{max_attempts}"
+        _log(f"[PHASE 4] Running Fixer agent via Qwen2.5-Coder-14B ({label}, {len(active_targets)} unit(s))...")
+        current_code = base_code
+        outcomes = list(carried_outcomes)
+        for unit in active_targets:
+            current_code, outcome = patch_unit(
+                current_code,
+                unit,
+                unit_findings=[item for item in findings if item.get("unit_id") == unit.unit_id],
+                unit_suggestions=[item for item in suggestions if item.get("unit_id") == unit.unit_id],
+                source_code=source_code,
+                feedback_note=feedback_note,
+                rag_section=rag_section,
+                attempt=attempt,
+                server_url=server_url,
+                single_pass=single_pass,
+            )
+            outcomes.append(outcome)
+
+        if (
+            not single_pass
+            and not any(item.get("status") == "applied" for item in outcomes)
+            and base_code == source_code
+        ):
+            heuristic_code, heuristic_outcomes = _apply_heuristic_security_patch(
+                source_code, patch_candidates, code_units=unit_objs
+            )
+            if heuristic_outcomes:
+                current_code = heuristic_code
+                outcomes.extend(heuristic_outcomes)
+
+        patched_ids = {
+            str(item.get("unit_id")) for item in outcomes
+            if item.get("status") == "applied" and item.get("unit_id")
+        }
+        if single_pass:
+            _log("[PHASE 5] Skipped (single-pass mode): the fixer output is taken as the final patch.")
+            verification = {
+                "passed": False,
+                "compilation": {"state": "skipped", "failed": False},
+                "unit_results": [],
+                "detector_failing_units": [],
+                "unverified_units": [],
+                "residual_findings": [],
+                "introduced_findings": [],
+                "channel_errors": {},
+                "failing_units": [],
+                "compile_culprit_units": [],
+                "max_vulnerability_probability": None,
+            }
+        else:
+            _log(f"[PHASE 5] Verifying candidate ({label}): compiler + neural detector + static/RAG re-run...")
+            verification = verify_candidate(
+                source_code,
+                current_code,
+                patched_unit_ids=patched_ids,
+                target_unit_ids=target_unit_ids,
+                original_unit_results=unit_results,
+                target_pairs=target_pairs,
+                known_pairs=known_pairs,
+                threshold=detector_threshold,
+                server_url=server_url,
+            )
+        record = {
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "threshold": detector_threshold,
+            "verdict": "Unverified" if single_pass else ("Safe" if verification["passed"] else "Vulnerable"),
+            "code": current_code,
+            "patch_outcomes": outcomes,
+            **verification,
+        }
+        attempts.append(record)
+        score = (
+            0 if verification["compilation"]["failed"] else 1,
+            -len(verification["failing_units"]),
+            len(patched_ids),
+            -abs(len(current_code) - len(source_code)),
+        )
+        if best is None or score > best["_score"]:
+            best = {**record, "_score": score}
+        _log(
+            f"[PHASE 5] {label}: {'PASSED' if verification['passed'] else 'FAILED'} "
+            f"(compile={verification['compilation']['state']}, failing={verification['failing_units']})."
+        )
+        if verification["passed"]:
+            break
+        if attempt == max_attempts:
+            break
+
+        record["feedback"] = _verification_feedback(attempt, max_attempts, verification)
+        feedback_note = record["feedback"]
+        failing = set(verification["failing_units"])
+        failing.update(
+            unit.unit_id for unit in active_targets
+            if unit.unit_id not in patched_ids
+        )
+        compile_localized = not verification["compilation"]["failed"] or bool(
+            set(verification["compile_culprit_units"]) & patched_ids
+        )
+        base_code, carried_outcomes, active_targets = source_code, [], list(target_units)
+        if compile_localized and failing:
+            # Next attempt = original source + the patches that already verified; the failing
+            # units are re-patched from their original code (never on top of a failed patch).
+            keep = [
+                item for item in outcomes
+                if item.get("status") == "applied" and item.get("unit_id") not in failing
+            ]
+            rebuilt = source_code
+            try:
+                for item in keep:
+                    unit = units_by_id[item["unit_id"]]
+                    rebuilt = _splice_unit(rebuilt, unit, item["patched_code"], str(item.get("reason") or ""))
+            except (KeyError, ValueError):
+                pass  # cannot rebuild (e.g. rule-based patch without unit code): restart fully
+            else:
+                base_code, carried_outcomes = rebuilt, keep
+                active_targets = [unit for unit in target_units if unit.unit_id in failing]
+
+    fixer_elapsed_ms = round((time.perf_counter() - fixer_started) * 1000, 2)
+
+    if best is None:
+        fixed_code, patch_outcomes, final_verification = source_code, [], None
+        overall_verdict = "NOT_APPLICABLE"
+    else:
+        fixed_code = best["code"]
+        patch_outcomes = best["patch_outcomes"]
+        final_verification = best
+        overall_verdict = "UNVERIFIED" if single_pass else ("PASS" if best["passed"] else "WARN")
+    _log(f"[PHASE 5] Completed: verdict {overall_verdict} after {len(attempts)} attempt(s).")
+
+    if final_verification is not None and not single_pass:
+        fixed_detector = summarize_detector(
+            [item for item in final_verification["unit_results"] if item["unit_id"] in target_unit_ids],
+            detector_threshold,
+        )
+    else:
+        fixed_detector = {
+            "status": "not_run",
+            "verdict": "Not run",
+            "score": None,
+            "vulnerability_probability": None,
+            "threshold": detector_threshold,
+            "unit_results": [],
+            "reason": "Verification skipped (single-pass mode)." if single_pass and final_verification
+            else "No function-level repair target.",
+        }
+
+    patched_ids = {
+        str(item.get("unit_id")) for item in patch_outcomes
+        if item.get("status") == "applied" and item.get("unit_id")
+    }
+    failing_final = set(final_verification["failing_units"]) if final_verification else set()
+    verifier_items = []
+    for item in findings:
+        unit_id = item.get("unit_id")
+        if unit_id in failing_final:
+            status = "FLAGGED"
+        elif unit_id in patched_ids:
+            status = "SKIPPED" if single_pass else "PASS"
+        else:
+            status = "NOT_PATCHED"
+        verifier_items.append({
+            "finding_id": finding_key(item),
+            "unit_id": unit_id,
+            "status": status,
+            "residual_risk": "None" if status == "PASS" else "Unverified or residual risk remains",
+        })
+
+    attempts_public = [{k: v for k, v in record.items() if k != "code"} for record in attempts]
+    compilation = final_verification["compilation"] if final_verification else {}
+    applied_count = sum(1 for item in patch_outcomes if item.get("status") == "applied")
     phases = {
         "detector": {
-            "status": "ok",
-            "original": {
-                "status": "ok",
-                "verdict": "Vulnerable" if is_contract_vuln else "Safe",
-                "vulnerability_probability": round(max_prob, 4),
-                "threshold": detector_threshold,
-                "unit_results": unit_results,
-            },
-            "fixed": {
-                "status": "ok",
-                "verdict": "Safe" if fixed_max_prob < detector_threshold else "Vulnerable",
-                "score": round(fixed_max_prob, 4),
-                "vulnerability_probability": round(fixed_max_prob, 4),
-                "threshold": detector_threshold,
-                "unit_results": fixed_unit_results,
-            },
+            "status": detector_original["status"],
+            "original": detector_original,
+            "fixed": fixed_detector,
             "candidate_findings": candidate_findings,
             "confirmed_findings": findings,
+            "dismissed_findings": dismissed,
+            "skipped_targets": skipped_targets,
+            "detector_only_deferred": detector_only_deferred,
         },
         "advisor": advisor,
         "assessor": assessor,
@@ -793,42 +1074,39 @@ def run_server_gpu_pipeline(
             "fixed_code": fixed_code,
             "patch_outcomes": patch_outcomes,
             "patches": [
-                {
-                    "finding_id": p["finding_id"],
-                    "description": p["reason"],
-                }
-                for p in patch_outcomes
+                {"finding_id": item.get("finding_id"), "description": item.get("reason")}
+                for item in patch_outcomes
             ],
         },
         "verifier": {
             "status": "ok",
-            "verification_model": "Qwen2.5-Coder-14B v13 Neural Detector & Solc",
+            "verification_model": "solc baseline + Qwen2.5-Coder-14B v13 detector + static/RAG re-run",
             "verdict": overall_verdict,
             "overall_verdict": overall_verdict,
             "verifications": verifier_items,
-            "attempts_count": len(verification_attempts),
-            "max_attempts": MAX_VERIFICATION_ATTEMPTS,
-            "attempts": verification_attempts,
-            "compilation": last_compile,
-            "fixed_unit_results": fixed_unit_results,
-            "vulnerability_probability": round(fixed_max_prob, 4),
+            "attempts_count": len(attempts),
+            "max_attempts": max_attempts,
+            "attempts": attempts_public,
+            "compilation": compilation,
+            "fixed_unit_results": fixed_detector.get("unit_results", []),
+            "vulnerability_probability": fixed_detector.get("vulnerability_probability"),
             "threshold": detector_threshold,
-            "notes": f"Multi-Tier Self-Verification ({len(verification_attempts)} attempt(s)). Final verdict: {overall_verdict}.",
+            "notes": f"Self-verification over {len(attempts)} attempt(s). Final verdict: {overall_verdict}.",
         },
         "reporter": {
             "status": "ok",
             "executive_summary": (
-                f"Audit completed using Dedicated GPU Server (v13 Qwen2.5-Coder-14B) for run {run_id}. "
-                f"Identified {len(findings)} finding(s). Applied {len(patch_outcomes)} security patch(es)."
+                f"Audit completed using the GPU server (Qwen2.5-Coder-14B v13) for run {run_id}. "
+                f"{len(findings)} confirmed finding(s), {len(dismissed)} dismissed by the Advisor, "
+                f"{applied_count} patch(es) applied."
             ),
             "recommendations": advisor["recommendations"],
         },
     }
-
     return {
         "schema_version": "1.0.0",
         "pipeline_version": "1.0.0",
-        "status": "ok",
+        "status": "ok" if detector_original["status"] == "ok" else "partial",
         "run_id": run_id,
         "backend": "server_gpu_rtx4070ti",
         "source_sha256": request.get("source", {}).get("sha256", ""),
@@ -837,7 +1115,7 @@ def run_server_gpu_pipeline(
         "verification_verdict": overall_verdict,
         "phases": phases,
         "timings": {
-            "total_ms": total_elapsed_ms,
+            "total_ms": round((time.perf_counter() - started_at) * 1000, 2),
             "detector_ms": detector_elapsed_ms,
             "fixer_ms": fixer_elapsed_ms,
         },

@@ -19,19 +19,29 @@ Thực hiện các yêu cầu trong kế hoạch thẩm định (B5, R-03):
 from __future__ import annotations
 
 import json
-import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from E2E.shared.function_parser import CodeUnit, parse_code_units
+from E2E.shared.function_parser import parse_code_units, validate_observable_behavior
 from E2E.shared.solc import compile_solidity_code, select_best_solc
 
 
-OBSERVABLE_SIGNALS = {
-    "ETH value call": re.compile(r"(\.call\s*\{\s*value\s*:|\.call\.value\s*\()"),
-    "ETH transfer": re.compile(r"\.transfer\s*\("),
-    "ETH send": re.compile(r"\.send\s*\("),
-    "event emission": re.compile(r"(\bemit\s+[A-Za-z_$][\w$]*\s*\(|[A-Z][A-Za-z0-9_$]*\s*\([^;]*\)\s*;)"),
-    "return statement": re.compile(r"\breturn\b"),
+# Member calls that move value; safe wrappers count as the same observable behaviour.
+TRANSFER_MEMBERS = {
+    "transfer": "transfer",
+    "safeTransfer": "transfer",
+    "send": "transfer",
+    "sendValue": "transfer",
+    "safeTransferETH": "transfer",
+    "call": "call",
+    "delegatecall": "delegatecall",
+    "transferFrom": "transferFrom",
+    "safeTransferFrom": "transferFrom",
+}
+CALL_LABELS = {
+    "call": "ETH value call / low-level call",
+    "transfer": "ETH or token transfer",
+    "transferFrom": "token transferFrom",
+    "delegatecall": "delegatecall",
 }
 
 
@@ -49,7 +59,7 @@ def _extract_ast_dict(raw_ast_stdout: str) -> Optional[dict]:
         return None
 
 
-def _collect_function_ast_features(fn_node: dict) -> dict[str, Any]:
+def _collect_function_ast_features(fn_node: dict, state_vars: Set[str] | None = None) -> dict[str, Any]:
     """
     Thu thập các đặc trưng hành vi của một hàm từ AST:
       - state_writes: set of (var_name, operator)
@@ -81,32 +91,33 @@ def _collect_function_ast_features(fn_node: dict) -> dict[str, Any]:
             return
         nt = node.get("nodeType")
 
-        # 1. State variable writes
+        # 1. State variable writes (locals and parameters are not observable state)
         if nt == "Assignment":
             op = str(node.get("operator") or "=")
             left = node.get("leftHandSide") or {}
             var_name = get_var_name(left)
-            if var_name:
+            root = var_name.split(".")[0]
+            if var_name and (state_vars is None or root in state_vars or var_name in state_vars):
                 state_writes.add((var_name, op))
 
-        # 2. External calls & transfers
+        # 2. External calls & transfers, normalised so safe wrappers match the raw call
         elif nt == "MemberAccess":
             member = node.get("memberName") or ""
-            if member in {"transfer", "send", "call", "delegatecall"}:
-                expr = node.get("expression") or {}
-                caller = get_var_name(expr) or "unknown"
-                external_calls.add(f"{caller}.{member}")
+            if member in TRANSFER_MEMBERS:
+                external_calls.add(TRANSFER_MEMBERS[member])
 
-        # 3. Events & Function calls
+        # 3. Legacy events: a plain call to an upper-case name that is neither a type
+        # conversion (IERC20(x)) nor a struct constructor.
         elif nt == "FunctionCall":
             expr = node.get("expression") or {}
             fn_name = get_var_name(expr)
-            # Trong 0.4, event thường được gọi trực tiếp bằng tên Viết Hoa
-            if fn_name and fn_name[0].isupper() and fn_name not in {"Require", "Assert", "Revert"}:
+            if (
+                node.get("kind") == "functionCall"
+                and expr.get("nodeType") == "Identifier"
+                and fn_name
+                and fn_name[0].isupper()
+            ):
                 events.add(fn_name)
-            # Cú pháp .call{value: ...} hoặc .call.value(...)
-            if "call" in fn_name.lower():
-                external_calls.add("call")
 
         elif nt == "EmitStatement":
             expr = node.get("eventCall") or {}
@@ -139,7 +150,7 @@ def _collect_function_ast_features(fn_node: dict) -> dict[str, Any]:
 
 
 def _extract_ast_functions_map(ast_dict: dict) -> Dict[str, dict]:
-    """Tạo map unit_id -> function AST node."""
+    """Tạo map unit_id -> function AST node (overloads get the same `#n` suffix as the parser)."""
     fn_map: Dict[str, dict] = {}
     if not ast_dict:
         return fn_map
@@ -147,23 +158,37 @@ def _extract_ast_functions_map(ast_dict: dict) -> Dict[str, dict]:
     for node in ast_dict.get("nodes", []):
         if node.get("nodeType") == "ContractDefinition":
             c_name = node.get("name") or "Contract"
+            seen: Dict[str, int] = {}
             for sub in node.get("nodes", []):
                 if sub.get("nodeType") == "FunctionDefinition":
-                    f_name = sub.get("name") or "fallback"
-                    fn_map[f"{c_name}.{f_name}"] = sub
-                    fn_map[f_name] = sub
+                    f_name = sub.get("name") or sub.get("kind") or "fallback"
+                    seen[f_name] = seen.get(f_name, 0) + 1
+                    suffix = f"#{seen[f_name]}" if seen[f_name] > 1 else ""
+                    fn_map[f"{c_name}.{f_name}{suffix}"] = sub
+                    fn_map.setdefault(f_name, sub)
     return fn_map
+
+
+def _state_variable_names(ast_dict: dict) -> Set[str]:
+    names: Set[str] = set()
+    for node in (ast_dict or {}).get("nodes", []):
+        if node.get("nodeType") == "ContractDefinition":
+            for sub in node.get("nodes", []):
+                if sub.get("nodeType") == "VariableDeclaration" and sub.get("stateVariable"):
+                    names.add(str(sub.get("name") or ""))
+    return names
 
 
 def _compare_unit_behavior_ast(
     orig_fn_ast: dict,
     fixed_fn_ast: dict,
     unit_id: str,
+    state_vars: Set[str] | None = None,
 ) -> List[dict[str, Any]]:
     """So sánh AST của hai phiên bản hàm."""
     findings = []
-    orig_feats = _collect_function_ast_features(orig_fn_ast)
-    fixed_feats = _collect_function_ast_features(fixed_fn_ast)
+    orig_feats = _collect_function_ast_features(orig_fn_ast, state_vars)
+    fixed_feats = _collect_function_ast_features(fixed_fn_ast, state_vars)
 
     # 1. Kiểm tra mất mát câu lệnh ghi state
     missing_writes = orig_feats["state_writes"] - fixed_feats["state_writes"]
@@ -180,18 +205,20 @@ def _compare_unit_behavior_ast(
             "evidence": f"Patch removed state variable mutation for: {', '.join(sorted(completely_missing_vars))}",
         })
 
-    # 2. Kiểm tra external calls / ETH transfer
+    # 2. Kiểm tra external calls / ETH transfer (a raw transfer may become a value call or a
+    # safe wrapper: both still move value)
     missing_calls = orig_feats["external_calls"] - fixed_feats["external_calls"]
+    value_moves = {"transfer", "call"}
+    if missing_calls & value_moves and fixed_feats["external_calls"] & value_moves:
+        missing_calls -= value_moves
     if missing_calls:
-        # Nếu mất transfer hoặc call.value
-        crit_calls = [c for c in missing_calls if any(k in c for k in ("transfer", "send", "call"))]
-        if crit_calls:
-            findings.append({
-                "unit_id": unit_id,
-                "severity": "High",
-                "check": "ast-external-call-preservation",
-                "evidence": f"Patch removed ETH/token external call or transfer: {', '.join(sorted(crit_calls))}",
-            })
+        findings.append({
+            "unit_id": unit_id,
+            "severity": "High",
+            "check": "ast-external-call-preservation",
+            "evidence": "Patch removed observable behavior: "
+            + ", ".join(CALL_LABELS.get(call, call) for call in sorted(missing_calls)),
+        })
 
     # 3. Kiểm tra events
     missing_events = orig_feats["events"] - fixed_feats["events"]
@@ -256,9 +283,11 @@ def verify_patch_behavior(
     fixed_ast_dict = _extract_ast_dict(fixed_comp.get("ast") or "") if fixed_comp.get("passed") else None
 
     use_ast = bool(orig_ast_dict and fixed_ast_dict)
+    ast_checked: Set[str] = set()
     if use_ast:
         orig_fn_map = _extract_ast_functions_map(orig_ast_dict)
         fixed_fn_map = _extract_ast_functions_map(fixed_ast_dict)
+        state_vars = _state_variable_names(orig_ast_dict) | _state_variable_names(fixed_ast_dict)
         checks.append({
             "check": "ast_compilation",
             "engine": orig_comp.get("compiler"),
@@ -269,8 +298,9 @@ def verify_patch_behavior(
             orig_ast = orig_fn_map.get(unit_id) or orig_fn_map.get(unit_id.split(".")[-1])
             fixed_ast = fixed_fn_map.get(unit_id) or fixed_fn_map.get(unit_id.split(".")[-1])
             if orig_ast and fixed_ast:
-                ast_findings = _compare_unit_behavior_ast(orig_ast, fixed_ast, unit_id)
+                ast_findings = _compare_unit_behavior_ast(orig_ast, fixed_ast, unit_id, state_vars)
                 findings.extend(ast_findings)
+                ast_checked.add(unit_id)
 
     # Luôn chạy bộ kiểm tra tín hiệu Observable (đảm bảo tương thích ngược và kiểm tra chéo)
     original_units = {item.unit_id: item.code for item in parse_code_units(original_code)}
@@ -294,34 +324,30 @@ def verify_patch_behavior(
             })
             continue
 
-        for label, pattern in OBSERVABLE_SIGNALS.items():
-            existed = bool(pattern.search(original))
-            preserved = bool(pattern.search(fixed))
-            checks.append({
+        # Syntactic guard shared with Phase 4; only consulted when the AST comparison could
+        # not run, so the two checks do not double-report the same regression.
+        if unit_id in ast_checked:
+            continue
+        try:
+            validate_observable_behavior(original, fixed)
+            checks.append({"unit_id": unit_id, "check": "observable-behavior-preservation", "status": "passed"})
+        except ValueError as error:
+            findings.append({
                 "unit_id": unit_id,
-                "signal": label,
-                "original": existed,
-                "fixed": preserved,
+                "severity": "High",
+                "check": "observable-behavior-preservation",
+                "evidence": str(error),
             })
-            if existed and not preserved:
-                # Đảm bảo không trùng lặp finding đã được phát hiện bởi AST
-                if not any(f.get("unit_id") == unit_id and label.lower() in str(f.get("evidence", "")).lower() for f in findings):
-                    findings.append({
-                        "unit_id": unit_id,
-                        "severity": "High",
-                        "check": "observable-behavior-preservation",
-                        "evidence": f"Patch removed {label} present in the original declaration.",
-                    })
 
     # Tích hợp kiểm tra Slither locked-ether nếu có trong tool_result
     if tool_result:
         for finding in (tool_result.get("slither") or {}).get("findings", []):
-            if finding.get("check") == "locked-ether":
+            if (finding.get("check") or finding.get("name")) == "locked-ether":
                 findings.append({
                     "unit_id": "",
-                    "severity": finding.get("impact", "Medium"),
+                    "severity": finding.get("severity") or finding.get("impact") or "Medium",
                     "check": "slither-locked-ether",
-                    "evidence": finding.get("description", "Patched contract can lock Ether."),
+                    "evidence": finding.get("message") or finding.get("description") or "Patched contract can lock Ether.",
                 })
 
     return {

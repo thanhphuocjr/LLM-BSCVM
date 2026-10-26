@@ -12,27 +12,30 @@ Kiến trúc "All-in-One":
   - Phase 2, 3, 4, 5, 6 (Generative): Sử dụng lm_head để sinh bản vá, phân tích
     nguyên nhân (Advisor), đánh giá CVSS (Assessor), và đối kháng (Verifier).
 
-Cổng mặc định: 8000
+Cổng mặc định: 6868
 ══════════════════════════════════════════════════════════════════════════════
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import contextlib
 import gc
 import json
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from safetensors import safe_open
 
@@ -117,11 +120,27 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[origin for origin in os.environ.get("SERVER_GPU_CORS_ORIGINS", "").split(",") if origin],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
+
+# Optional shared secret: when SERVER_GPU_API_KEY is set, every endpoint except the
+# health check requires the header `X-API-Key`.
+API_KEY = os.environ.get("SERVER_GPU_API_KEY", "").strip()
+PUBLIC_PATHS = {"/", "/health", "/api/v1/health"}
+
+
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    if API_KEY and request.url.path not in PUBLIC_PATHS and request.headers.get("X-API-Key") != API_KEY:
+        return JSONResponse(status_code=401, content={"detail": "Missing or invalid X-API-Key"})
+    return await call_next(request)
+
+
+# FastAPI runs sync endpoints in a thread pool; the single GPU model must not be used
+# by two requests at once (VRAM spikes, interleaved adapter enable/disable).
+GPU_LOCK = threading.Lock()
 
 # ─── Global Model State ───
 class ModelContainer:
@@ -214,7 +233,11 @@ class ModelContainer:
                 logger.warning(f"Không thể đọc score_head từ safetensors: {e}")
 
         if not score_loaded:
-            logger.warning("Không tìm thấy score_head trong safetensors, khởi tạo mặc định.")
+            # A randomly initialised head would silently return meaningless probabilities.
+            raise RuntimeError(
+                f"Không tìm thấy score_head (score.weight/classifier.weight) trong {safetensor_file}; "
+                "từ chối khởi động detector với head ngẫu nhiên."
+            )
         self.score_head.eval()
 
         # 5. Line head nếu có
@@ -282,52 +305,48 @@ def detect_vulnerability(req: DetectRequest):
     code = req.code.strip()
     input_text = f"{INSTRUCTION_PROMPT}{code}"
 
-    with torch.no_grad():
-        inputs = CONTAINER.tokenizer(
+    with GPU_LOCK, torch.no_grad():
+        encoded = CONTAINER.tokenizer(
             input_text,
             truncation=True,
             max_length=MAX_LEN,
             add_special_tokens=True,
+            return_offsets_mapping=True,
             return_tensors="pt",
-        ).to(CONTAINER.device)
+        )
+        offsets = encoded.pop("offset_mapping")[0].tolist()
+        inputs = encoded.to(CONTAINER.device)
 
         # Forward pass qua CausalLM với output_hidden_states=True
         outputs = CONTAINER.causal_model(**inputs, output_hidden_states=True, return_dict=True)
         hidden_states = outputs.hidden_states[-1]  # [1, seq_len, 5120]
 
-        # Trích xuất vector vị trí token cuối cùng
-        input_ids = inputs["input_ids"]
-        pad_token_id = CONTAINER.tokenizer.pad_token_id or CONTAINER.tokenizer.eos_token_id
-        non_pad_mask = (input_ids != pad_token_id).to(inputs["input_ids"].device, torch.int32)
-        token_indices = torch.arange(input_ids.shape[-1], device=inputs["input_ids"].device, dtype=torch.int32)
-        last_token_idx = (non_pad_mask * token_indices).argmax(dim=-1)
-
-        last_hidden = hidden_states[0, last_token_idx[0]].unsqueeze(0)
+        # Single unpadded sequence: the pooled token is the last one, as in training.
+        last_token_idx = inputs["input_ids"].shape[-1] - 1
+        last_hidden = hidden_states[0, last_token_idx].unsqueeze(0)
         logits = CONTAINER.score_head(last_hidden.float())
         probs = torch.softmax(logits, dim=-1)[0]
         prob_vuln = float(probs[1].item())
         prob_safe = float(probs[0].item())
 
-        # Line scores nếu có line_head: gộp theo dòng của code gốc (chưa normalize) - Task B7
+        # Line scores: map each token back to its source line through the tokenizer
+        # offsets (same alignment as the line labels used in training).
         line_scores = None
         if CONTAINER.line_head is not None:
             try:
-                line_logits = CONTAINER.line_head(hidden_states.float()).squeeze(-1)
-                token_probs = torch.sigmoid(line_logits)[0].tolist()
-                prefix_tokens = len(CONTAINER.tokenizer(INSTRUCTION_PROMPT, add_special_tokens=False)["input_ids"])
-                code_token_probs = token_probs[prefix_tokens : last_token_idx[0].item() + 1]
-                code_lines = req.code.splitlines()
-                num_lines = max(1, len(code_lines))
-                if code_token_probs and num_lines > 0:
-                    tokens_per_line = len(code_token_probs) / num_lines
-                    line_scores = []
-                    for i in range(num_lines):
-                        st = int(i * tokens_per_line)
-                        en = int((i + 1) * tokens_per_line) if i < num_lines - 1 else len(code_token_probs)
-                        chunk = code_token_probs[st:en]
-                        line_scores.append(round(float(max(chunk)), 4) if chunk else 0.0)
-                else:
-                    line_scores = [0.0] * num_lines
+                token_probs = torch.sigmoid(CONTAINER.line_head(hidden_states.float()).squeeze(-1))[0].tolist()
+                prefix_len = len(INSTRUCTION_PROMPT)
+                line_starts = [0]
+                for index, char in enumerate(code):
+                    if char == "\n":
+                        line_starts.append(index + 1)
+                line_scores = [0.0] * len(line_starts)
+                for probability, (start, end) in zip(token_probs, offsets):
+                    if end <= start or start < prefix_len:
+                        continue
+                    position = start - prefix_len
+                    line = max(0, bisect.bisect_right(line_starts, position) - 1)
+                    line_scores[line] = max(line_scores[line], round(float(probability), 4))
             except Exception as e:
                 logger.warning(f"Line head error: {e}")
 
@@ -345,6 +364,14 @@ def detect_vulnerability(req: DetectRequest):
         line_scores=line_scores,
         elapsed_ms=round(elapsed, 2),
     )
+
+
+def _sampling_kwargs(temperature: Optional[float], top_p: Optional[float]) -> Dict[str, Any]:
+    """temperature=0 means greedy decoding (0.0 must not fall back to the 0.2 default)."""
+    temperature = 0.2 if temperature is None else float(temperature)
+    if temperature <= 0.0:
+        return {"do_sample": False}
+    return {"do_sample": True, "temperature": temperature, "top_p": 0.9 if top_p is None else top_p}
 
 
 @app.post("/api/v1/generate", response_model=ChatResponse)
@@ -384,13 +411,11 @@ def generate_text(req: ChatRequest):
         if hasattr(CONTAINER.causal_model, "disable_adapter")
         else contextlib.nullcontext()
     )
-    with torch.no_grad(), disable_adapter_ctx:
+    with GPU_LOCK, torch.no_grad(), disable_adapter_ctx:
         output_ids = CONTAINER.causal_model.generate(
             **inputs,
+            **_sampling_kwargs(req.temperature, req.top_p),
             max_new_tokens=req.max_tokens or 1500,
-            temperature=req.temperature or 0.2,
-            top_p=req.top_p or 0.9,
-            do_sample=(req.temperature > 0.0),
             pad_token_id=CONTAINER.tokenizer.pad_token_id or CONTAINER.tokenizer.eos_token_id,
         )
 
@@ -438,13 +463,11 @@ def openai_chat_completions(req: OpenAIChatRequest):
         if hasattr(CONTAINER.causal_model, "disable_adapter")
         else contextlib.nullcontext()
     )
-    with torch.no_grad(), disable_adapter_ctx:
+    with GPU_LOCK, torch.no_grad(), disable_adapter_ctx:
         output_ids = CONTAINER.causal_model.generate(
             **inputs,
+            **_sampling_kwargs(req.temperature, req.top_p),
             max_new_tokens=req.max_tokens or 1500,
-            temperature=req.temperature or 0.2,
-            top_p=req.top_p or 0.9,
-            do_sample=(req.temperature > 0.0),
             pad_token_id=CONTAINER.tokenizer.pad_token_id or CONTAINER.tokenizer.eos_token_id,
         )
 
@@ -473,7 +496,11 @@ def openai_chat_completions(req: OpenAIChatRequest):
 
 def main():
     parser = argparse.ArgumentParser(description="Start v13 Unified AI Inference Server")
-    parser.add_argument("--host", default="0.0.0.0", help="Host interface (0.0.0.0 for LAN access)")
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Host interface (0.0.0.0 for LAN/Tailscale access; set SERVER_GPU_API_KEY when exposed)",
+    )
     parser.add_argument("--port", type=int, default=6868, help="Port (mặc định 6868)")
     parser.add_argument("--adapter-dir", default=str(DEFAULT_ADAPTER_DIR), help="Đường dẫn adapter")
     parser.add_argument("--base-model", default=DEFAULT_BASE_MODEL, help="Tên base model HF")

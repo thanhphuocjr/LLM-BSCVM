@@ -19,9 +19,16 @@ else
 fi
 
 PORT="${PORT:-8080}"
+# Mặc định chỉ nghe trên localhost: API này ghi file và khởi chạy tiến trình phân tích.
+# Muốn mở cho mạng LAN thì đặt HOST=0.0.0.0 một cách có chủ đích.
+HOST="${HOST:-127.0.0.1}"
+RELOAD_FLAG=""
+if [ "${RELOAD:-0}" = "1" ]; then
+    RELOAD_FLAG="--reload"
+fi
 echo "======================================================================"
 echo "🛡️  LLM-BSCVM v13 Unified AI Security Audit Studio Web App"
-echo "🌐  Địa chỉ truy cập: http://localhost:$PORT"
+echo "🌐  Địa chỉ truy cập: http://$HOST:$PORT"
 echo "======================================================================"
 
-exec "$PYTHON" -m uvicorn webapp.app:app --host 0.0.0.0 --port "$PORT" --reload
+exec "$PYTHON" -m uvicorn webapp.app:app --host "$HOST" --port "$PORT" $RELOAD_FLAG

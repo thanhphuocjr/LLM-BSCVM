@@ -118,3 +118,8 @@ artifacts/
 E2E/runs/
 E2E/phase1_detection.json
 E2E/audit_report.*
+
+
+*.sol
+*.test
+E2E/batch_runs/

@@ -137,7 +137,7 @@ def parse_code_units(code: str) -> list[CodeUnit]:
 
         # Kiểm tra view/pure và visibility
         header_part = snippet[: snippet.find("{")] if "{" in snippet else snippet
-        is_view_or_pure = bool(re.search(r"\b(view|pure)\b", header_part))
+        is_view_or_pure = bool(re.search(r"\b(view|pure|constant)\b", header_part))  # `constant` = pre-0.5 view
         vis_match = re.search(r"\b(public|external|internal|private)\b", header_part)
         visibility = vis_match.group(1) if vis_match else "public"
 
@@ -247,63 +247,131 @@ def apply_unit_patches(code: str, units: Iterable[CodeUnit], patches: Iterable[d
     return updated, outcomes
 
 
+_VALUE_CALL = r"(?:\.call\s*\{\s*value\s*:|\.call\.value\s*\()"
+_TRANSFER_EQUIVALENTS = {
+    # kind: (pattern that detects the original call, patterns accepted as preserving it)
+    "ETH value call": (_VALUE_CALL, (_VALUE_CALL, r"\bsendValue\s*\(", r"\bsafeTransferETH\s*\(")),
+    "ETH transfer": (
+        r"\.transfer\s*\(",
+        (r"\.transfer\s*\(", r"\.safeTransfer\s*\(", _VALUE_CALL, r"\bsendValue\s*\(", r"\bsafeTransferETH\s*\("),
+    ),
+    "ETH send": (
+        r"\.send\s*\(",
+        (r"\.send\s*\(", r"\.transfer\s*\(", _VALUE_CALL, r"\bsendValue\s*\("),
+    ),
+}
+_LOCAL_DECL_RE = re.compile(
+    r"\b(?:u?int\d*|address(?:\s+payable)?|bool|bytes\d*|string|var|[A-Z][\w$]*)"
+    r"(?:\s*\[[^\]]*\])*\s+(?:(memory|storage|calldata)\s+)?([A-Za-z_$][\w$]*)\s*(?=[=;,)])"
+)
+_STATE_WRITE_RE = re.compile(r"([A-Za-z_$][\w$]*)(?:\s*\[[^\]]+\])*\s*(\+=|-=|\*=|/=|%=|=)(?!=)")
+
+
+def _strip_comments(code: str) -> str:
+    return re.sub(r"/\*.*?\*/", "", re.sub(r"//[^\n]*", "", code), flags=re.DOTALL)
+
+
+def _local_names(code: str) -> set[str]:
+    """Parameters and non-storage local variables: rewriting them is not a state change."""
+    names = set()
+    for match in _LOCAL_DECL_RE.finditer(code):
+        if match.group(1) != "storage":
+            names.add(match.group(2))
+    for match in re.finditer(r"\(\s*bool\s+([A-Za-z_$][\w$]*)", code):
+        names.add(match.group(1))
+    return names
+
+
+def _state_writes(code: str) -> set[str]:
+    local = _local_names(code)
+    return {
+        match.group(1)
+        for match in _STATE_WRITE_RE.finditer(code)
+        if match.group(1) not in local
+    }
+
+
+def _emitted_events(code: str) -> set[str]:
+    """`emit X(...)`, or a legacy (<0.4.21) statement `X(...);` that is a call on its own.
+
+    Type conversions such as `IERC20(token).transfer(...)` are not events.
+    """
+    events = set(re.findall(r"\bemit\s+([A-Za-z_$][\w$]*)\s*\(", code))
+    for match in re.finditer(r"(?:^|[;{}])\s*([A-Z][\w$]*)\s*\(", code):
+        depth = 0
+        cursor = match.end() - 1
+        while cursor < len(code):
+            if code[cursor] == "(":
+                depth += 1
+            elif code[cursor] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            cursor += 1
+        rest = code[cursor + 1 :].lstrip()
+        if rest.startswith(";"):
+            events.add(match.group(1))
+    return events
+
+
 def validate_observable_behavior(original: str, replacement: str) -> None:
     """
-    Guard bảo toàn hành vi (Phase 4 / Phase 5).
-    Kiểm tra các tín hiệu observable:
-      - ETH transfers: call.value, transfer, send
-      - Event emissions: emit EventName(...) hoặc EventName(...) trong Solidity 0.4
-      - State variable writes: phát hiện phép gán state (ví dụ: balances[...] += ..., owner = ...)
-      - Return statements
+    Guard bảo toàn hành vi (Phase 4 / Phase 5) — kiểm tra cú pháp các tín hiệu observable:
+      - Chuyển giá trị: call{value}, transfer, send (chấp nhận dạng an toàn tương đương,
+        ví dụ transfer -> safeTransfer, send -> call{value})
+      - Event: emit X(...) hoặc câu lệnh X(...); kiểu 0.4
+      - Ghi biến state (bỏ qua tham số và biến cục bộ không phải storage)
+      - Lệnh return
+    Đây là kiểm tra cú pháp, không phải chứng minh tương đương ngữ nghĩa.
     """
-    # 1. External ETH calls & transfers
-    eth_call_original = bool(re.search(r"(\.call\s*\{\s*value\s*:|\.call\.value\s*\()", original))
-    eth_call_replacement = bool(re.search(r"(\.call\s*\{\s*value\s*:|\.call\.value\s*\()", replacement))
-    if eth_call_original and not eth_call_replacement:
-        raise ValueError("Generated patch removed observable behavior: ETH value call")
+    original_code = _strip_comments(original)
+    replacement_code = _strip_comments(replacement)
 
-    eth_transfer_original = bool(re.search(r"\.transfer\s*\(", original))
-    eth_transfer_replacement = bool(re.search(r"\.transfer\s*\(", replacement))
-    if eth_transfer_original and not eth_transfer_replacement:
-        raise ValueError("Generated patch removed observable behavior: ETH transfer")
+    for label, (detect, preserved_by) in _TRANSFER_EQUIVALENTS.items():
+        if re.search(detect, original_code) and not any(
+            re.search(pattern, replacement_code) for pattern in preserved_by
+        ):
+            raise ValueError(f"Generated patch removed observable behavior: {label}")
 
-    eth_send_original = bool(re.search(r"\.send\s*\(", original))
-    eth_send_replacement = bool(re.search(r"\.send\s*\(", replacement))
-    if eth_send_original and not eth_send_replacement:
-        raise ValueError("Generated patch removed observable behavior: ETH send")
-
-    # 2. Return statements
-    if re.search(r"\breturn\b", original) and not re.search(r"\breturn\b", replacement):
+    if re.search(r"\breturn\b", original_code) and not re.search(r"\breturn\b", replacement_code):
         raise ValueError("Generated patch removed observable behavior: return statement")
 
-    # 3. Events: bao gồm cả cú pháp emit hiện đại và gọi trực tiếp trong 0.4
-    orig_events = set(re.findall(r"(?:emit\s+)?([A-Z][A-Za-z0-9_$]*)\s*\(", original))
-    # Bỏ qua các hàm built-in/keywords có thể viết hoa
-    orig_events.discard("Assert")
-    orig_events.discard("Require")
-    if orig_events:
-        repl_events = set(re.findall(r"(?:emit\s+)?([A-Z][A-Za-z0-9_$]*)\s*\(", replacement))
-        missing_events = orig_events - repl_events
-        if missing_events:
-            raise ValueError(f"Generated patch removed observable event emission: {', '.join(missing_events)}")
+    missing_events = _emitted_events(original_code) - _emitted_events(replacement_code)
+    if missing_events:
+        raise ValueError(
+            f"Generated patch removed observable event emission: {', '.join(sorted(missing_events))}"
+        )
 
-    # 4. State variable writes: phát hiện các câu lệnh gán biến state như balances[to] += amount, etc.
-    state_write_pattern = re.compile(r"([A-Za-z_$][\w$]*(?:\[[^\]]+\])?)\s*(\+=|-=|\*=|/=|%=|=)(?!=)")
-    orig_writes = set()
-    for m in state_write_pattern.finditer(original):
-        var_name = m.group(1).split("[")[0].strip()
-        # Loại trừ biến cục bộ thường gặp
-        if var_name not in {"uint", "uint256", "bool", "address", "bytes32", "var", "int"}:
-            orig_writes.add(var_name)
+    missing_writes = _state_writes(original_code) - _state_writes(replacement_code)
+    if missing_writes:
+        raise ValueError(f"Generated patch removed state variable mutation: {', '.join(sorted(missing_writes))}")
 
-    if orig_writes:
-        repl_writes = set()
-        for m in state_write_pattern.finditer(replacement):
-            var_name = m.group(1).split("[")[0].strip()
-            repl_writes.add(var_name)
-        missing_writes = orig_writes - repl_writes
-        if missing_writes:
-            raise ValueError(f"Generated patch removed state variable mutation: {', '.join(missing_writes)}")
+
+_JSON_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "/": "/"}
+
+
+def lenient_json_string_field(text: str, field: str) -> str | None:
+    """Read a JSON string value even when the model left inner quotes unescaped.
+
+    The value ends at the first quote that is followed by `,` or `}` (end of the field).
+    """
+    match = re.search(rf'"{re.escape(field)}"\s*:\s*"', text)
+    if not match:
+        return None
+    chars: list[str] = []
+    cursor = match.end()
+    while cursor < len(text):
+        char = text[cursor]
+        if char == "\\" and cursor + 1 < len(text):
+            following = text[cursor + 1]
+            chars.append(_JSON_ESCAPES.get(following, "\\" + following))
+            cursor += 2
+            continue
+        if char == '"' and text[cursor + 1 :].lstrip()[:1] in {",", "}"}:
+            return "".join(chars)
+        chars.append(char)
+        cursor += 1
+    return None
 
 
 def extract_declaration_body(text: str, target_name: str | None = None) -> str:
@@ -319,15 +387,19 @@ def extract_declaration_body(text: str, target_name: str | None = None) -> str:
     raw_text = text.strip()
 
     # 1. Parse JSON format {"replacement": "..."}
-    try:
-        # Tìm khối JSON nếu có
-        json_match = re.search(r"\{[\s\S]*\"replacement\"[\s\S]*\}", raw_text)
-        if json_match:
-            data = json.loads(json_match.group(0))
-            if isinstance(data, dict) and "replacement" in data and data["replacement"]:
-                return extract_declaration_body(str(data["replacement"]), target_name=target_name)
-    except Exception:
-        pass
+    if '"replacement"' in raw_text:
+        replacement = None
+        try:
+            json_match = re.search(r"\{[\s\S]*\"replacement\"[\s\S]*\}", raw_text)
+            if json_match:
+                data = json.loads(json_match.group(0))
+                if isinstance(data, dict) and data.get("replacement"):
+                    replacement = str(data["replacement"])
+        except Exception:
+            # Models often emit invalid JSON (e.g. an unescaped `("")` inside the code).
+            replacement = lenient_json_string_field(raw_text, "replacement")
+        if replacement and replacement.strip() != raw_text:
+            return extract_declaration_body(replacement, target_name=target_name)
 
     # 2. Tìm khối code fence ```solidity ... ```
     fence_matches = list(re.finditer(r"```(?:solidity)?\s*([\s\S]*?)```", raw_text))

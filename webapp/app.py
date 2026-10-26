@@ -53,6 +53,24 @@ ACTIVE_TASKS: Dict[str, Dict[str, Any]] = {}
 TASK_LOCK = threading.Lock()
 
 
+RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+ALLOWED_BACKENDS = {"server_gpu", "local_fast", "local", "kaggle", "ollama", "gemini", "auto"}
+ALLOWED_TOOLS = {"slither", "mythril", "smartcheck"}
+
+
+def run_dir_for(run_id: str) -> Path:
+    """Resolve a run directory, rejecting ids that could escape RUNS_DIR (e.g. '..')."""
+    if not RUN_ID_RE.fullmatch(run_id) or ".." in run_id:
+        raise HTTPException(status_code=400, detail="Invalid run_id.")
+    return RUNS_DIR / run_id
+
+
+def safe_contract_file_name(file_name: str) -> str:
+    """Keep only a plain `<stem>.sol` name: no directories, no traversal."""
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "-", Path(file_name or "").stem).strip("-") or "Contract"
+    return f"{stem[:64]}.sol"
+
+
 class AuditRequest(BaseModel):
     code: str = Field(..., description="Solidity smart contract code")
     file_name: str = Field(default="Contract.sol", description="Contract filename")
@@ -342,16 +360,23 @@ def submit_audit(req: AuditRequest) -> Dict[str, Any]:
     if not req.code.strip():
         raise HTTPException(status_code=400, detail="Contract code cannot be empty.")
 
-    stem = re.sub(r"[^a-zA-Z0-9_-]+", "-", Path(req.file_name).stem).strip("-") or "contract"
+    if req.backend not in ALLOWED_BACKENDS:
+        raise HTTPException(status_code=400, detail=f"Unsupported backend: {req.backend}")
+    requested_tools = [item for item in re.split(r"[\s,]+", req.tools or "") if item]
+    unknown_tools = sorted(set(requested_tools) - ALLOWED_TOOLS - {"all"})
+    if unknown_tools:
+        raise HTTPException(status_code=400, detail=f"Unsupported tool(s): {', '.join(unknown_tools)}")
+    file_name = safe_contract_file_name(req.file_name)
+    stem = Path(file_name).stem
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     import hashlib
     sha_prefix = hashlib.sha256(req.code.encode("utf-8")).hexdigest()[:8]
     run_id = f"{timestamp}-{stem}-{sha_prefix}"
 
-    run_dir = RUNS_DIR / run_id
+    run_dir = run_dir_for(run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    input_file = run_dir / req.file_name
+    input_file = run_dir / file_name
     input_file.write_text(req.code, encoding="utf-8")
 
     cmd = [
@@ -369,8 +394,10 @@ def submit_audit(req: AuditRequest) -> Dict[str, Any]:
         "--max-fix-attempts",
         "3",
     ]
-    if req.tools:
-        cmd.extend(["--tools", req.tools])
+    if "all" in requested_tools:
+        cmd.append("--full-matrix")
+    elif requested_tools:
+        cmd.extend(["--tools", *requested_tools])
 
     log_file = run_dir / "execution.log"
 
@@ -506,7 +533,7 @@ def list_runs() -> List[Dict[str, Any]]:
 @app.get("/api/runs/{run_id}")
 def get_run_detail(run_id: str) -> Dict[str, Any]:
     """Returns all detail artifacts and phase states for a run."""
-    run_dir = RUNS_DIR / run_id
+    run_dir = run_dir_for(run_id)
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found.")
 
@@ -655,7 +682,7 @@ def get_run_detail(run_id: str) -> Dict[str, Any]:
 @app.get("/api/runs/{run_id}/logs")
 def get_run_logs(run_id: str) -> Dict[str, Any]:
     """Returns realtime logs of a run."""
-    run_dir = RUNS_DIR / run_id
+    run_dir = run_dir_for(run_id)
     log_file = run_dir / "execution.log"
     logs = ""
     if log_file.exists():
@@ -728,7 +755,7 @@ def get_run_logs(run_id: str) -> Dict[str, Any]:
 @app.get("/api/runs/{run_id}/report/html")
 def get_report_html(run_id: str):
     """Serves the generated HTML audit report."""
-    path = RUNS_DIR / run_id / "phase6_audit_report.html"
+    path = run_dir_for(run_id) / "phase6_audit_report.html"
     if not path.exists():
         raise HTTPException(status_code=404, detail="HTML report not yet generated.")
     return HTMLResponse(content=path.read_text(encoding="utf-8"))
@@ -737,7 +764,7 @@ def get_report_html(run_id: str):
 @app.get("/api/runs/{run_id}/report/pdf")
 def get_report_pdf(run_id: str):
     """Downloads the generated PDF audit report."""
-    path = RUNS_DIR / run_id / "phase6_audit_report.pdf"
+    path = run_dir_for(run_id) / "phase6_audit_report.pdf"
     if not path.exists():
         raise HTTPException(status_code=404, detail="PDF report not yet generated.")
     return FileResponse(path, media_type="application/pdf", filename=f"audit_report_{run_id}.pdf")
@@ -746,7 +773,7 @@ def get_report_pdf(run_id: str):
 @app.get("/api/runs/{run_id}/report/md")
 def get_report_md(run_id: str):
     """Returns markdown report text."""
-    path = RUNS_DIR / run_id / "phase6_audit_report.md"
+    path = run_dir_for(run_id) / "phase6_audit_report.md"
     if not path.exists():
         raise HTTPException(status_code=404, detail="Markdown report not yet generated.")
     return PlainTextResponse(content=path.read_text(encoding="utf-8"))
@@ -769,6 +796,7 @@ def cancel_run(run_id: str) -> Dict[str, Any]:
                     return {"status": "cancelled", "run_id": run_id}
                 except Exception as e:
                     raise HTTPException(status_code=500, detail=f"Failed to cancel process: {e}")
+    raise HTTPException(status_code=404, detail=f"Run {run_id} is not running.")
 
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

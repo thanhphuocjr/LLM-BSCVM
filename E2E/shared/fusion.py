@@ -36,6 +36,32 @@ def _active(component: dict[str, Any]) -> bool:
     return False
 
 
+def _detector_complete(component: dict[str, Any]) -> bool:
+    """A detector only counts as complete when every scored unit returned a probability.
+
+    A run where some (or all) units errored must never be allowed to produce `Safe`.
+    """
+    if not _active(component):
+        return False
+    units = component.get("unit_results") or []
+    for unit in units:
+        if unit.get("status") in {"error", "not_run"} or (
+            unit.get("vulnerability_probability") is None
+            and unit.get("label") not in {"Skipped"}
+        ):
+            return False
+    return True
+
+
+# Slither is a static tool: its findings belong to the same evidence channel as the
+# regex rules, so static + slither agreement is not cross-channel corroboration.
+_CHANNEL_BY_SOURCE = {"static": "static", "slither": "static", "rag": "rag"}
+
+
+def _channels(sources: list[str] | set[str]) -> set[str]:
+    return {_CHANNEL_BY_SOURCE.get(source, source) for source in sources}
+
+
 def merge_findings(static_result: dict[str, Any], rag_result: dict[str, Any]) -> list[dict[str, Any]]:
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for component in (static_result, rag_result):
@@ -64,7 +90,7 @@ def merge_findings(static_result: dict[str, Any], rag_result: dict[str, Any]) ->
                 "severity": severity,
                 "confidence": round(max(float(item.get("confidence") or 0.0) for item in evidence), 6),
                 "sources": sources,
-                "corroborated": len(sources) > 1,
+                "corroborated": len(_channels(sources)) > 1,
                 "line": next((item.get("line") for item in evidence if item.get("line")), None),
                 "description": next(
                     (item.get("description") for item in evidence if item.get("description")),
@@ -163,7 +189,13 @@ def fuse_findings(
         for item in unit_results
         if item.get("vulnerability_probability") is not None
     ]
-    contract_max_prob = max(valid_probs) if valid_probs else 0.0
+    errored_units = any(
+        item.get("vulnerability_probability") is None and item.get("status") == "error"
+        for item in unit_results
+    )
+    # A unit whose detector call failed gets a neutral 0.5 (unknown), never an implicit
+    # "safe" score. Without any detector run, only strong local evidence passes (0.05 prior).
+    contract_max_prob = max(valid_probs) if valid_probs else (0.5 if errored_units else 0.0)
 
     confirmed: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
@@ -176,12 +208,22 @@ def fuse_findings(
             p_detector = float(u_res["vulnerability_probability"])
         elif not u_id or u_id == "contract":
             p_detector = contract_max_prob
+        elif u_res is not None:
+            # Detector errored on this unit.
+            p_detector = 0.5
+            finding["p_detector_missing"] = True
         else:
+            # Detector did not run, or the unit was not scored (declaration without body).
             p_detector = 0.05
 
         evidence = finding.get("evidence", [])
         static_conf = max(
-            [float(item.get("confidence") or 0.0) for item in evidence if item.get("source") == "static"] or [0.0]
+            [
+                float(item.get("confidence") or 0.0)
+                for item in evidence
+                if _CHANNEL_BY_SOURCE.get(str(item.get("source"))) == "static"
+            ]
+            or [0.0]
         )
         rag_conf = max(
             [float(item.get("confidence") or 0.0) for item in evidence if item.get("source") == "rag"] or [0.0]
@@ -239,6 +281,19 @@ def fuse_findings(
             confirmed.append(finding)
         else:
             candidates.append(finding)
+
+    # Units flagged only by the neural detector must still reach the repair agents;
+    # otherwise a detector-driven Vulnerable verdict can never be repaired.
+    local_units = {str(item.get("unit_id")) for item in local_merged if item.get("unit_id")}
+    detector_only = detector_findings(
+        {"unit_results": unit_results, "model_name": calibration_config.get("model_name", "")},
+        [{"unit_id": unit_id} for unit_id in local_units],
+    )
+    for finding in detector_only:
+        p_detector = float(finding.get("confidence") or 0.0)
+        finding["p_detector"] = round(p_detector, 6)
+        finding["p_final"] = round(p_detector, 6)
+        confirmed.append(finding)
 
     return confirmed, candidates
 
@@ -362,7 +417,13 @@ def fuse_detection(
             decision_rules.append("llm_local_corroboration_floor")
     score = max(0.0, min(1.0, score))
 
-    all_required_active = all(_active(components[name]) for name in ("static", "rag", "llm_detector"))
+    all_required_active = (
+        _active(static_result)
+        and _active(rag_result)
+        and _detector_complete(detector)
+    )
+    if _active(detector) and not _detector_complete(detector):
+        decision_rules.append("detector_incomplete_no_safe_verdict")
     positive_evidence = bool(local_findings) or (
         _active(detector) and component_scores["llm_detector"] >= detector_threshold
     )

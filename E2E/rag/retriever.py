@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import re
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,22 @@ from E2E.shared.io_utils import read_json
 
 def _clamp(value: float) -> float:
     return max(0.0, min(1.0, value))
+
+
+MIN_EXACT_MATCH_CHARS = 80
+MIN_SEMANTIC_ONLY_SIMILARITY = 0.60
+CANDIDATE_CONFIDENCE_CAP = 0.59
+MIN_EXACT_MATCH_LENGTH_RATIO = 0.8
+
+
+def _is_exact_code_match(known_code: str, query_code: str) -> bool:
+    known = re.sub(r"\s+", " ", known_code).strip()
+    query = re.sub(r"\s+", " ", query_code).strip()
+    if len(known) < MIN_EXACT_MATCH_CHARS or len(query) < MIN_EXACT_MATCH_CHARS:
+        return False
+    if known not in query and query not in known:
+        return False
+    return min(len(known), len(query)) / max(len(known), len(query)) >= MIN_EXACT_MATCH_LENGTH_RATIO
 
 
 class LocalRAGRetriever:
@@ -91,12 +108,14 @@ class LocalRAGRetriever:
                 semantic_score = 0.0
                 best_item = None
 
-            # Detect exact/substring match with known empirical vulnerable code
+            # Exact match with a known empirical vulnerable function. Both sides must be
+            # non-trivial and near-identical in size: a short getter is a substring of many
+            # knowledge items, and a tiny knowledge snippet is a substring of many units.
             exact_code_match = False
             if best_item:
-                v_code = str(best_item.get("vulnerable_code") or "").strip()
-                if v_code and (v_code in code or code.strip() in v_code):
-                    exact_code_match = True
+                exact_code_match = _is_exact_code_match(
+                    str(best_item.get("vulnerable_code") or ""), code
+                )
 
             # Allow either deterministic regex hits, strong semantic match, or exact code match
             if not signal_hits and semantic_score < 0.28 and not exact_code_match:
@@ -109,8 +128,13 @@ class LocalRAGRetriever:
                 signal_strength = _clamp(len(signal_hits) / max(1, agent.min_signal_hits))
                 confidence = _clamp(0.55 * signal_strength + 0.45 * min(1.0, semantic_score * 2.5))
             else:
+                # Similarity alone (no deterministic code signal) was right only ~51% of the
+                # time on the function-level test split; it may only confirm a finding when
+                # the match is a near-duplicate, otherwise it stays a candidate.
                 signal_strength = 0.0
                 confidence = _clamp(min(1.0, semantic_score * 1.8))
+                if semantic_score < MIN_SEMANTIC_ONLY_SIMILARITY:
+                    confidence = min(confidence, CANDIDATE_CONFIDENCE_CAP)
 
             record = self.by_id.get(agent.swc_id, {})
             findings.append(

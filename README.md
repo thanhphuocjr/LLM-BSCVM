@@ -215,3 +215,4 @@ python3 phase4_vulnerability_repair.py \
 Output gồm: `fixed_code` (contract hoàn chỉnh), `diff`, và `changes[]` (mỗi lỗ hổng:
 priority, risk, tóm tắt thay đổi, đã xử lý chưa). Khác với Advisor (chỉ gợi ý từng đoạn),
 Fixer tạo MỘT contract sửa hoàn chỉnh nên các finding trùng chỗ gộp thành một bản vá đúng.
+# AI_Calling_Support

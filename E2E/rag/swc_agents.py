@@ -1,30 +1,20 @@
+"""SWC signal agents shared by the static runner and the local RAG retriever.
+
+One agent per SWC registry entry: regex signal patterns, per-SWC severity and the
+custom context checks (guards, checked low-level calls, pragma) that gate a hit.
+"""
+
 from __future__ import annotations
 
-import argparse
 import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Dict, List, Sequence
 
-CODE = ""
-DEVICE = "cpu"
-KNOWLEDGE_DIR = ""
-MAX_INPUT_CHARS = 15000
-MAX_SEQ_LENGTH = 512
-MODEL_NAME = "BAAI/bge-m3"
-class KnowledgeBaseRetriever:
-    """Placeholder for legacy sentence-transformers retriever."""
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        pass
-    def search_many(self, *args: Any, **kwargs: Any) -> list:
-        return []
+from E2E.config import RUNTIME_DATA_DIR
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_SWC_REGISTRY = str(PROJECT_ROOT / "data" / "runtime" / "swc_registry.json")
-DEFAULT_AGENT_TOP_K = 1
-DEFAULT_MAX_FINDINGS = 3
+DEFAULT_SWC_REGISTRY = str(RUNTIME_DATA_DIR / "swc_registry.json")
 
 
 @dataclass(frozen=True)
@@ -48,7 +38,6 @@ class AgentConfig:
         return f"{self.swc_id} Agent - {self.title}"
 
 
-RISK_ORDER = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "None": 0}
 
 SEVERITY_BY_SWC = {
     "SWC-104": "Critical",
@@ -473,24 +462,6 @@ def find_signal_hits(code: str, patterns: Sequence[str], swc_id: str | None = No
     ]
 
 
-def has_low_level_success_check(code: str) -> bool:
-    has_low_level_call = bool(
-        re.search(r"\.(?:call|delegatecall|staticcall|send)\s*[\(\{]", code, re.IGNORECASE | re.DOTALL)
-    )
-    result_names = set(re.findall(r"\(\s*bool\s+(\w+)\s*,?", code, re.IGNORECASE))
-    result_names.update(
-        re.findall(
-            r"\bbool\s+(\w+)\s*=\s*[^;]*\.(?:call|delegatecall|staticcall|send)\s*[\(\{]",
-            code,
-            re.IGNORECASE | re.DOTALL,
-        )
-    )
-    for name in result_names:
-        if re.search(rf"(?:require\s*\(\s*{re.escape(name)}\b|if\s*\(\s*!\s*{re.escape(name)}\b)", code):
-            return has_low_level_call
-    return False
-
-
 def has_access_control_guard(code: str) -> bool:
     return bool(
         re.search(
@@ -499,230 +470,3 @@ def has_access_control_guard(code: str) -> bool:
             re.IGNORECASE,
         )
     )
-
-
-def clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
-    return max(lower, min(upper, value))
-
-
-class MultiAgentVulnerabilityDetector:
-    def __init__(
-        self,
-        retriever: KnowledgeBaseRetriever | None = None,
-        agents: Sequence[AgentConfig] | None = None,
-        swc_registry_path: str = DEFAULT_SWC_REGISTRY,
-        top_k: int = DEFAULT_AGENT_TOP_K,
-        max_findings: int = DEFAULT_MAX_FINDINGS,
-        include_all_agents: bool = False,
-    ) -> None:
-        if retriever is None and KnowledgeBaseRetriever is None:
-            raise RuntimeError(
-                "Semantic retriever is unavailable. Use E2E.rag.retriever.LocalRAGRetriever "
-                "or install sentence-transformers for the restored legacy mode."
-            )
-        self.retriever = retriever or KnowledgeBaseRetriever()
-        self.agents = list(agents) if agents is not None else build_agents_from_registry(swc_registry_path)
-        self.top_k = top_k
-        self.max_findings = max(1, max_findings)
-        self.include_all_agents = include_all_agents
-
-    def analyze(self, code: str) -> Dict:
-        queries = [agent.query for agent in self.agents]
-        retrievals = self.retriever.search_many(queries, code, top_k=self.top_k)
-        agent_results = [
-            self._score_agent(agent, retrieval, code)
-            for agent, retrieval in zip(self.agents, retrievals)
-        ]
-        return self._aggregate(agent_results)
-
-    def _score_agent(self, agent: AgentConfig, retrieval: Dict, code: str) -> Dict:
-        target_results = [
-            result
-            for result in retrieval["results"]
-            if normalize_swc_id(result.get("Swc")) == agent.swc_id
-        ]
-        evidence = target_results or retrieval["results"][:1]
-        best_result = evidence[0] if evidence else {}
-        target_match = bool(target_results)
-
-        signal_hits = find_signal_hits(code, agent.signal_patterns, agent.swc_id)
-
-        signal_confirmed = bool(agent.signal_patterns and len(signal_hits) >= agent.min_signal_hits)
-        signal_score = clamp(len(signal_hits) / max(agent.min_signal_hits, 1)) if agent.signal_patterns else 0.0
-
-        semantic_score = float(best_result.get("SemanticScore", 0.0) or 0.0)
-        similarity_score = float(best_result.get("SimilarityScore", 0.0) or 0.0)
-        rag_score = clamp(similarity_score if target_match else similarity_score * 0.35)
-        confidence = clamp((0.40 * rag_score) + (0.60 * signal_score))
-        if not signal_confirmed:
-            confidence = min(confidence, 0.45 if target_match else 0.30)
-
-        vulnerable = bool(target_match and signal_confirmed and confidence >= agent.threshold)
-        candidate = bool(
-            target_match
-            and not vulnerable
-            and (semantic_score >= 0.62 or similarity_score >= 0.72)
-            and signal_confirmed
-        )
-
-        return {
-            "agent": agent.name,
-            "swc": agent.swc_id,
-            "title": agent.title,
-            "query": agent.query,
-            "severity": agent.severity,
-            "vulnerable": vulnerable,
-            "candidate": candidate,
-            "confidence": round(confidence, 4),
-            "rag_score": round(rag_score, 4),
-            "semantic_score": round(semantic_score, 4),
-            "signal_score": round(signal_score, 4),
-            "signal_confirmed": signal_confirmed,
-            "signal_hits": signal_hits,
-            "evidence": evidence,
-        }
-
-    @staticmethod
-    def _compact_finding(result: Dict) -> Dict:
-        evidence = result.get("evidence", [])
-        best_evidence = evidence[0] if evidence else {}
-        return {
-            "agent": result["agent"],
-            "swc": result["swc"],
-            "title": result["title"],
-            "severity": result["severity"],
-            "confidence": result["confidence"],
-            "rag_score": result["rag_score"],
-            "semantic_score": result["semantic_score"],
-            "signal_hits": result["signal_hits"],
-            "vulnerable": result["vulnerable"],
-            "candidate": result["candidate"],
-            "best_practice": best_evidence.get("BestPractice"),
-            "checklist": best_evidence.get("BestPracticeChecklist", []),
-            "similarity_score": best_evidence.get("SimilarityScore"),
-        }
-
-    def _aggregate(self, agent_results: List[Dict]) -> Dict:
-        positives = [result for result in agent_results if result["vulnerable"]]
-        candidates = [result for result in agent_results if result["candidate"] and not result["vulnerable"]]
-        sorted_positives = sorted(
-            positives,
-            key=lambda item: (RISK_ORDER.get(item["severity"], 0), item["confidence"]),
-            reverse=True,
-        )
-        sorted_candidates = sorted(
-            candidates,
-            key=lambda item: (RISK_ORDER.get(item["severity"], 0), item["rag_score"]),
-            reverse=True,
-        )
-        top_results = (sorted_positives + sorted_candidates)[: self.max_findings]
-        max_risk = sorted_positives[0]["severity"] if sorted_positives else "None"
-        final_score = round(max((result["confidence"] for result in agent_results), default=0.0), 4)
-
-        best_practices = []
-        seen_practices = set()
-        for result in top_results:
-            for item in result.get("evidence", []):
-                key = (item.get("Swc"), item.get("BestPractice"))
-                if key in seen_practices:
-                    continue
-                seen_practices.add(key)
-                best_practices.append(
-                    {
-                        "agent": result["agent"],
-                        "swc": item.get("Swc"),
-                        "title": item.get("Title"),
-                        "best_practice": item.get("BestPractice"),
-                        "checklist": item.get("BestPracticeChecklist", []),
-                    }
-                )
-
-        output = {
-            "final_verdict": "Vulnerable" if sorted_positives else "Safe",
-            "risk_level": max_risk,
-            "final_score": final_score,
-            "total_agents": len(agent_results),
-            "all_positive_count": len(sorted_positives),
-            "all_candidate_count": len(sorted_candidates),
-            "returned_findings": len(top_results),
-            "positive_agents": [result["agent"] for result in sorted_positives[: self.max_findings]],
-            "candidate_agents": [result["agent"] for result in sorted_candidates[: self.max_findings]],
-            "top_findings": [self._compact_finding(result) for result in top_results],
-            "recommended_best_practices": best_practices[: self.max_findings],
-        }
-        if self.include_all_agents:
-            output["agent_results"] = agent_results
-        return output
-
-
-def run_multi_agent_analysis(
-    code: str,
-    knowledge_dir: str = KNOWLEDGE_DIR,
-    model_name: str = MODEL_NAME,
-    device: str = DEVICE,
-    max_seq_length: int = MAX_SEQ_LENGTH,
-    max_input_chars: int = MAX_INPUT_CHARS,
-    top_k: int = DEFAULT_AGENT_TOP_K,
-    swc_registry_path: str = DEFAULT_SWC_REGISTRY,
-    max_findings: int = DEFAULT_MAX_FINDINGS,
-    include_all_agents: bool = False,
-) -> Dict:
-    if KnowledgeBaseRetriever is None:
-        raise RuntimeError("sentence-transformers is required for legacy semantic RAG")
-    retriever = KnowledgeBaseRetriever(
-        knowledge_dir=knowledge_dir,
-        model_name=model_name,
-        device_arg=device,
-        max_seq_length=max_seq_length,
-        max_input_chars=max_input_chars,
-    )
-    detector = MultiAgentVulnerabilityDetector(
-        retriever=retriever,
-        swc_registry_path=swc_registry_path,
-        top_k=top_k,
-        max_findings=max_findings,
-        include_all_agents=include_all_agents,
-    )
-    return detector.analyze(code)
-
-
-def load_code(args: argparse.Namespace) -> str:
-    if args.code_file:
-        return Path(args.code_file).read_text(encoding="utf-8")
-    if args.code:
-        return args.code
-    return CODE
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Run one SWC agent per SWC registry entry.")
-    parser.add_argument("--code", default=None, help="Raw Solidity code string.")
-    parser.add_argument("--code-file", default=None, help="Path to a Solidity/code text file.")
-    parser.add_argument("--swc-registry", default=DEFAULT_SWC_REGISTRY)
-    parser.add_argument("--knowledge-dir", default=KNOWLEDGE_DIR)
-    parser.add_argument("--model-name", default=MODEL_NAME)
-    parser.add_argument("--device", default=DEVICE)
-    parser.add_argument("--max-seq-length", type=int, default=MAX_SEQ_LENGTH)
-    parser.add_argument("--max-input-chars", type=int, default=MAX_INPUT_CHARS)
-    parser.add_argument("--top-k", type=int, default=DEFAULT_AGENT_TOP_K)
-    parser.add_argument("--max-findings", type=int, default=DEFAULT_MAX_FINDINGS)
-    parser.add_argument("--include-all-agents", action="store_true")
-    args = parser.parse_args()
-
-    output = run_multi_agent_analysis(
-        code=load_code(args),
-        knowledge_dir=args.knowledge_dir,
-        model_name=args.model_name,
-        device=args.device,
-        max_seq_length=args.max_seq_length,
-        max_input_chars=args.max_input_chars,
-        top_k=args.top_k,
-        swc_registry_path=args.swc_registry,
-        max_findings=args.max_findings,
-        include_all_agents=args.include_all_agents,
-    )
-    print(json.dumps(output, ensure_ascii=False, indent=2))
-
-
-if __name__ == "__main__":
-    main()

@@ -5,15 +5,23 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 E2E_ROOT = Path(__file__).resolve().parent
+# Every dataset lives under E2E/data (git-ignored, local only).
 DATA_DIR = E2E_ROOT / "data"
-SOURCE_DATA_DIR = DATA_DIR / "source"
-RUNTIME_DATA_DIR = DATA_DIR / "runtime"
+RUNTIME_DATA_DIR = DATA_DIR / "runtime"          # RAG artifacts built by E2E.rag.build_store
+KNOWLEDGE_DIR = DATA_DIR / "knowledge"           # vulnerability knowledge base (build_store input)
+CONTRACTS_DIR = DATA_DIR / "contracts"           # contract corpora for batch audits / benchmarks
+EVAL_DATA_DIR = DATA_DIR / "eval"                # evaluation sets and benchmark results
 RUNS_DIR = E2E_ROOT / "runs"
-MODEL_DIR = E2E_ROOT / "models"
-DETECTOR_ADAPTER_DIR = MODEL_DIR / "codellama-vuln-detector"
+BATCH_RUNS_DIR = E2E_ROOT / "batch_runs"
+# Model weights live in <repo>/models (git-ignored); one folder per adapter.
+MODEL_DIR = PROJECT_ROOT / "models"
+DETECTOR_ADAPTER_DIR = MODEL_DIR / "qwen25-v13-14b-detector-final"
 SCHEMA_DIR = E2E_ROOT / "schemas"
 KAGGLE_DIR = E2E_ROOT / "kaggle"
-VULNERABILITY_KNOWLEDGE_PATH = PROJECT_ROOT / "final_vulnerability_knowledge" / "final-vulnerability-knowledge.json"
+VULNERABILITY_KNOWLEDGE_PATH = KNOWLEDGE_DIR / "final-vulnerability-knowledge.json"
+SMARTBUGS_WILD_DIR = CONTRACTS_DIR / "smartbugs_wild"
+# Train/val/test split of the active v13 detector; kept inside the GPU-server bundle.
+DETECTOR_DATASET_PATH = PROJECT_ROOT / "server_train" / "final-dataset-v12-train.json"
 
 SCHEMA_VERSION = "1.0.0"
 PIPELINE_VERSION = "1.0.0"

@@ -4,7 +4,7 @@ from typing import Any
 
 from E2E.config import RISK_ORDER
 from E2E.local.tool_verifier import _run_native_slither
-from E2E.rag.legacy.multi_agent_vuln_detector import find_custom_signal_hits
+from E2E.rag.swc_agents import find_custom_signal_hits
 from E2E.shared.function_parser import CodeUnit, parse_code_units
 from E2E.shared.io_utils import jsonable
 from E2E.shared.solc import select_best_solc

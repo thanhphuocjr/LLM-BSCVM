@@ -5,7 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from E2E.config import DATA_DIR, DETECTOR_ADAPTER_DIR, E2E_ROOT
+from E2E.config import CONTRACTS_DIR, DATA_DIR, DETECTOR_ADAPTER_DIR, DETECTOR_DATASET_PATH, E2E_ROOT, PROJECT_ROOT
 from E2E.shared.io_utils import utc_now, write_json
 
 
@@ -19,7 +19,7 @@ def hash_file(path: Path) -> str:
 
 def manifest_entry(path: Path) -> dict:
     return {
-        "path": str(path.relative_to(E2E_ROOT)),
+        "path": str(path.relative_to(PROJECT_ROOT)),
         "bytes": path.stat().st_size,
         "sha256": hash_file(path),
     }
@@ -40,7 +40,7 @@ def tree_entry(path: Path) -> dict:
         file_count += 1
         total_bytes += size
     return {
-        "path": str(path.relative_to(E2E_ROOT)),
+        "path": str(path.relative_to(PROJECT_ROOT)),
         "file_count": file_count,
         "bytes": total_bytes,
         "tree_sha256": digest.hexdigest(),
@@ -48,22 +48,23 @@ def tree_entry(path: Path) -> dict:
 
 
 def build_manifest(output: Path) -> dict:
-    raw_dir = DATA_DIR / "source" / "raw"
+    """One hash per data/model file; each contract corpus (tens of thousands of .sol) is one tree hash."""
+    corpora = sorted(item for item in CONTRACTS_DIR.iterdir() if item.is_dir()) if CONTRACTS_DIR.exists() else []
     paths = sorted(
         {
             *[
                 path
                 for path in DATA_DIR.rglob("*")
-                if path.is_file() and raw_dir not in path.parents
+                if path.is_file()
+                and not path.name.startswith(".")
+                and not any(corpus in path.parents for corpus in corpora)
             ],
             *[path for path in DETECTOR_ADAPTER_DIR.rglob("*") if path.is_file()],
+            *([DETECTOR_DATASET_PATH] if DETECTOR_DATASET_PATH.exists() else []),
         }
     )
     entries = [manifest_entry(path) for path in paths if path != output]
-    trees = [
-        tree_entry(path)
-        for path in sorted(item for item in raw_dir.iterdir() if item.is_dir())
-    ] if raw_dir.exists() else []
+    trees = [tree_entry(path) for path in corpora]
     payload = {
         "created_at": utc_now(),
         "root": ".",

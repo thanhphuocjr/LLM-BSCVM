@@ -1,125 +1,72 @@
-# ==============================================================================
-# Git Ignore Configuration for LLM-BSCVM Repository
-# Only source code, scripts, documentation, and small configurations are tracked.
-# All large datasets, model weights, binaries, logs, and outputs are excluded.
-# ==============================================================================
+# Only code, scripts, small configs and docs are pushed.
+# Datasets, model weights, run outputs and local tools stay on this machine.
 
-# ── Python & Environments ─────────────────────────────────────────────────────
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
-*$py.class
-*.pyd
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual environments
+build/
+dist/
 .venv/
 venv/
-env/
-ENV/
-env.bak/
-venv.bak/
 
-# ── OS & IDE ──────────────────────────────────────────────────────────────────
+# ── OS / IDE / local tools ────────────────────────────────────────────────────
 .DS_Store
-.DS_Store?
 ._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
 .vscode/
 .idea/
 *.swp
-*.swo
-*~
 .tools/
 
-# ── Secrets & Environment Variables ──────────────────────────────────────────
+# ── Secrets ───────────────────────────────────────────────────────────────────
 .env
 .env.*
 !.env.example
 
-# ── Heavy Datasets & Knowledge Stores (DO NOT PUSH) ───────────────────────────
-data/
-dataset/
-datasets/
-final_dataset_train/
-final_vulnerability_knowledge/
+# ── Data and models (local only) ──────────────────────────────────────────────
 E2E/data/
-smartbugs_wild/
+models/
 server_train/*.json
-server_train/*.csv
+docs/*.pdf
 
-# Raw and processed tabular/dataset file formats
+# ── Run outputs ───────────────────────────────────────────────────────────────
+E2E/runs/*
+!E2E/runs/.gitkeep
+E2E/batch_runs/
+E2E/phase1_detection.json
+E2E/audit_report.*
+results/
+kaggle-kernel-build/
+kaggle-output*/
+*.log
+*.pid
+
+# ── Heavy formats anywhere else ───────────────────────────────────────────────
 *.csv
 *.tsv
-*.parquet
 *.jsonl
-*.arrow
+*.parquet
 *.sqlite
 *.sqlite3
 *.db
-*.h5
-*.hdf5
-
-# Precomputed vector matrices & serialized vectorizers
 *.npz
 *.npy
 *.joblib
 *.pkl
-*.pickle
-
-# Heavy binary archives and documents
-*.pdf
-*.zip
-*.tar
-*.tar.gz
-*.tgz
-*.gz
-*.rar
-*.7z
-
-# ── Machine Learning Models & Checkpoints (DO NOT PUSH) ───────────────────────
-models/
-E2E/models/
 *.safetensors
 *.bin
 *.pt
 *.pth
 *.onnx
 *.ckpt
-kaggle-output/
-kaggle-output-*/
-kaggle-kernel-build/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.7z
+*.pdf
 
-# ── Logs, Temporary Artifacts, and Audit Outputs ──────────────────────────────
-*.log
-logs/
-server_train/*.log
-runs/
-results/
-reports/
-artifacts/
-E2E/runs/
-E2E/phase1_detection.json
-E2E/audit_report.*
-
-
+# Solidity sources are data, except the bundled examples used by tests and the web UI
 *.sol
-*.test
-E2E/batch_runs/
+!E2E/examples/*.sol

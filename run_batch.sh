@@ -18,7 +18,7 @@ cd "$(dirname "$0")"
 BATCH="${BATCH:-main}"                             # folder under E2E/batch_runs/
 SNAPSHOT_EVERY="${SNAPSHOT_EVERY:-100}"            # fixed CSV of the first 100, 200, ... contracts; the run continues
 TARGET="${TARGET:-}"                               # optional: stop for good after N done contracts; empty = never
-INPUT_DIR="${INPUT_DIR:-SmartContractRunPipeline}"
+INPUT_DIR="${INPUT_DIR:-E2E/data/contracts/smartbugs_wild}"
 ACTIVE_HOURS="${ACTIVE_HOURS:-}"                   # e.g. 19:00-07:30; empty = whenever the server is up
 EXPORT_EVERY="${EXPORT_EVERY:-5}"                  # refresh the CSV every N finished contracts
 POLL_SECONDS="${POLL_SECONDS:-60}"                 # how often to re-check server / time window

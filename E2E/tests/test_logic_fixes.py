@@ -18,7 +18,7 @@ from E2E.local.tool_verifier import _evaluate_tool_result, _policy_verdict
 from E2E.rag.retriever import _is_exact_code_match
 from E2E.shared.function_parser import parse_code_units, validate_observable_behavior
 from E2E.shared.fusion import fuse_detection, fuse_findings, merge_findings
-from agents.assessor import compute_cvss_31_base_score
+from E2E.agents.assessor import compute_cvss_31_base_score
 
 
 OK_EMPTY = {"status": "ok", "score": 0.0, "findings": []}

@@ -11,8 +11,8 @@ from typing import Any
 
 from E2E.config import DEFAULT_DETECTOR_THRESHOLD
 from E2E.shared.function_parser import CodeUnit, apply_unit_patches, parse_code_units, validate_observable_behavior
-from agents.advisor import AdvisorAgent, RepairKnowledgeBase
-from agents.assessor import AssessorAgent, compute_cvss_31_base_score, cvss_to_level
+from E2E.agents.advisor import AdvisorAgent, RepairKnowledgeBase
+from E2E.agents.assessor import AssessorAgent, compute_cvss_31_base_score, cvss_to_level
 
 
 OLLAMA_ENDPOINT = "http://localhost:11434/api/generate"
@@ -678,7 +678,7 @@ def run_local_llm_pipeline(
 
     # Truy xuất cơ sở tri thức lỗ hổng (11,869 cases + 37 SWC registry) theo LLM-BSCVM
     try:
-        from agents.advisor import RepairKnowledgeBase
+        from E2E.agents.advisor import RepairKnowledgeBase
         kb = RepairKnowledgeBase()
         findings = kb.enrich_findings(findings, code=source_code, code_units=code_units)
     except Exception:

@@ -10,7 +10,7 @@ from scipy.sparse import load_npz
 from sklearn.metrics.pairwise import cosine_similarity
 
 from E2E.config import RISK_ORDER, RUNTIME_DATA_DIR
-from E2E.rag.legacy.multi_agent_vuln_detector import (
+from E2E.rag.swc_agents import (
     build_agents_from_registry,
     find_signal_hits,
 )

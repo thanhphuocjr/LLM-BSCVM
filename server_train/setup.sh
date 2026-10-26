@@ -1,13 +1,13 @@
 #!/bin/bash
 # ══════════════════════════════════════════════════════════════════════════════
-# Setup môi trường cho CodeLlama-13B Training
+# Setup môi trường cho Qwen2.5-Coder-14B v13 (train + API server)
 # Chạy 1 lần trước khi train: bash setup.sh
 # ══════════════════════════════════════════════════════════════════════════════
 
 set -e
 
 echo "════════════════════════════════════════════════════════════════════"
-echo "  Setup môi trường cho CodeLlama-13B v12 Training"
+echo "  Setup môi trường cho Qwen2.5-Coder-14B v13"
 echo "════════════════════════════════════════════════════════════════════"
 
 # Kiểm tra GPU
@@ -51,9 +51,6 @@ echo ""
 echo ">>> Kiểm tra dataset..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_FILE="$SCRIPT_DIR/final-dataset-v12-train.json"
-if [ ! -f "$DATA_FILE" ]; then
-    DATA_FILE="$SCRIPT_DIR/final-dataset-train.json"
-fi
 
 if [ -f "$DATA_FILE" ]; then
     SIZE=$(du -h "$DATA_FILE" | cut -f1)
@@ -61,28 +58,28 @@ if [ -f "$DATA_FILE" ]; then
     echo "✅ Dataset tìm thấy: $DATA_FILE ($SIZE, $COUNT mẫu)"
 else
     echo "❌ Chưa có dataset v12! Copy file vào đây:"
-    echo "   cp /path/to/final-dataset-v12-train.json $SCRIPT_DIR/"
+    echo "   Từ máy local: ./gpu_server.sh deploy"
     exit 1
 fi
 
 # Pre-download model (optional, tránh timeout khi train)
 echo ""
-echo ">>> Pre-download CodeLlama-13B (nếu chưa có cache)..."
+echo ">>> Pre-download tokenizer Qwen2.5-Coder-14B-Instruct (nếu chưa có cache)..."
 python3 -c "
 from transformers import AutoTokenizer
 print('Downloading tokenizer...')
-tok = AutoTokenizer.from_pretrained('codellama/CodeLlama-13b-hf', use_fast=True)
+tok = AutoTokenizer.from_pretrained('Qwen/Qwen2.5-Coder-14B-Instruct', use_fast=True)
 print('✅ Tokenizer downloaded successfully')
-print('💡 Model weights sẽ được download khi bắt đầu train (~7.3GB 4-bit)')
+print('💡 Model weights sẽ được download khi bắt đầu train / khởi động API')
 "
 
 echo ""
 echo "════════════════════════════════════════════════════════════════════"
 echo "  ✅ Setup hoàn tất!"
 echo ""
-echo "  Chạy train:"
-echo "    nohup python3 train_codellama13b.py > train.log 2>&1 &"
+echo "  Chạy train v13 (background, log train_v13_<timestamp>.log):"
+echo "    bash run_train.sh"
 echo ""
-echo "  Theo dõi:"
-echo "    tail -f train.log"
+echo "  Bật API inference v13:"
+echo "    bash service.sh start"
 echo "════════════════════════════════════════════════════════════════════"

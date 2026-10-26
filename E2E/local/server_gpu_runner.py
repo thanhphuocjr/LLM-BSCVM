@@ -790,7 +790,7 @@ def run_server_gpu_pipeline(
     _log("[PHASE 1 FUSED] Synchronizing multi-modal detection signals...")
     findings, candidate_findings = fuse_findings(unit_results, static_p1, rag_p1, tau_agent=0.45)
     try:
-        from agents.advisor import RepairKnowledgeBase
+        from E2E.agents.advisor import RepairKnowledgeBase
 
         findings = RepairKnowledgeBase().enrich_findings(
             findings, code=source_code, code_units=request.get("code_units", [])

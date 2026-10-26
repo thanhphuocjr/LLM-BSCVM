@@ -1,0 +1,24 @@
+# Local pipeline + web app (Python 3.12). Install: .venv/bin/python -m pip install -r requirements.txt
+# The GPU server has its own stack: see server_train/setup.sh.
+
+# Web app
+fastapi>=0.141
+uvicorn>=0.53
+pydantic>=2.13
+
+# Pipeline core: parsing, static analysis, RAG, fusion, reports
+numpy>=2.0
+scipy>=1.14
+scikit-learn>=1.6
+joblib>=1.4
+semantic-version>=2.10
+reportlab>=5.0
+
+# Agent LLM backends (only the one selected by LLM_BACKEND is imported)
+google-genai>=2.8
+ollama>=0.6
+
+# Optional
+# kaggle>=2.2               # --backend kaggle
+# slither-analyzer>=0.11    # native Slither in Phase 1/5 (usually installed globally with solc-select)
+# solc-select>=1.0          # compilers under ~/.solc-select, picked per pragma by E2E/shared/solc.py

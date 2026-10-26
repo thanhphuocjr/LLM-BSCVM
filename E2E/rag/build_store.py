@@ -16,7 +16,7 @@ from E2E.config import (
     RUNTIME_DATA_DIR,
     VULNERABILITY_KNOWLEDGE_PATH,
 )
-from E2E.rag.legacy.multi_agent_vuln_detector import (
+from E2E.rag.swc_agents import (
     SEVERITY_BY_SWC,
     SIGNAL_PATTERNS_BY_SWC,
     normalize_swc_id,

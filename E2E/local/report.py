@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from E2E.shared.io_utils import write_text
-from agents.reporter import VULNERABILITY_REFERENCE
+from E2E.agents.reporter import VULNERABILITY_REFERENCE
 
 
 DEFAULT_RECOMMENDATIONS = [

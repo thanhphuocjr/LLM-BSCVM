@@ -23,6 +23,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Tuple
 
+from E2E.config import SMARTBUGS_WILD_DIR
+
 
 def strip_solidity_comments(source: str) -> str:
     """
@@ -242,8 +244,8 @@ def main():
     parser.add_argument(
         "--target-dir",
         type=Path,
-        default=Path("smartbugs_wild/contracts"),
-        help="Path to folder containing .sol files (default: smartbugs_wild/contracts)",
+        default=SMARTBUGS_WILD_DIR,
+        help="Path to folder containing .sol files (default: E2E/data/contracts/smartbugs_wild)",
     )
     parser.add_argument(
         "--output-dir",

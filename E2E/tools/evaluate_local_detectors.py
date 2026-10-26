@@ -6,7 +6,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-from E2E.config import DATA_DIR, E2E_ROOT
+from E2E.config import DETECTOR_DATASET_PATH, EVAL_DATA_DIR, PROJECT_ROOT
 from E2E.local.static_runner import run_static
 from E2E.rag.retriever import LocalRAGRetriever
 from E2E.shared.io_utils import utc_now, write_json
@@ -30,13 +30,18 @@ def metrics(counts: dict[str, int]) -> dict:
     }
 
 
+def load_rows(dataset: Path, split: str) -> list[dict]:
+    """A JSON array (the v12 detector dataset) or JSONL, filtered to one split."""
+    text = dataset.read_text(encoding="utf-8")
+    if text.lstrip().startswith("["):
+        rows = json.loads(text)
+    else:
+        rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+    return [row for row in rows if row.get("split") == split]
+
+
 def evaluate(dataset: Path, split: str) -> dict:
-    rows = []
-    with dataset.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            row = json.loads(line)
-            if row.get("split") == split:
-                rows.append(row)
+    rows = load_rows(dataset, split)
     retriever = LocalRAGRetriever()
     overall = {name: defaultdict(int) for name in ("static", "rag")}
     by_source = {
@@ -45,7 +50,8 @@ def evaluate(dataset: Path, split: str) -> dict:
     }
     started = time.perf_counter()
     for row in rows:
-        expected = row["label"] == "Vulnerable"
+        # v12 stores label "0"/"1" next to label_text; the JSONL sets use label="Vulnerable".
+        expected = (row.get("label_text") or row.get("label")) == "Vulnerable"
         predictions = {
             "static": run_static(row["code"])["verdict"] == "Vulnerable",
             "rag": retriever.analyze(row["code"])["final_verdict"] == "Vulnerable",
@@ -56,7 +62,7 @@ def evaluate(dataset: Path, split: str) -> dict:
             by_source[name][row.get("source", "unknown")][key] += 1
     return {
         "created_at": utc_now(),
-        "dataset": str(dataset.relative_to(E2E_ROOT)),
+        "dataset": str(dataset.resolve().relative_to(PROJECT_ROOT)) if PROJECT_ROOT in dataset.resolve().parents else str(dataset),
         "split": split,
         "rows": len(rows),
         "elapsed_seconds": round(time.perf_counter() - started, 3),
@@ -70,7 +76,7 @@ def evaluate(dataset: Path, split: str) -> dict:
         },
         "interpretation": (
             "Static and local RAG are supporting evidence channels. They are not "
-            "replacements for the fine-tuned CodeLlama classifier or manual review."
+            "replacements for the fine-tuned Qwen v13 detector or manual review."
         ),
     }
 
@@ -80,13 +86,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         type=Path,
-        default=DATA_DIR / "training" / "detect_v4_functionlevel.jsonl",
+        default=DETECTOR_DATASET_PATH,
+        help="JSON array or JSONL with code/label/split (default: the v13 train/val/test set)",
     )
     parser.add_argument("--split", default="test")
     parser.add_argument(
         "--output",
         type=Path,
-        default=DATA_DIR / "training" / "reports" / "local_detector_eval.json",
+        default=EVAL_DATA_DIR / "results" / "local_detector_eval.json",
     )
     return parser.parse_args()
 

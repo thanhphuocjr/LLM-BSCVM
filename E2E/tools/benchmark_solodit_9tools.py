@@ -3,7 +3,7 @@
 Benchmark 9 Docker Security Tools on Solodit / iAudit Dataset (iaudit_solodit.jsonl).
 
 This script:
-1. Loads samples from E2E/data/training/iaudit_solodit.jsonl
+1. Loads samples from E2E/data/eval/iaudit_solodit.jsonl
 2. Wraps function snippets into compilable Solidity contracts with pragma heuristics
 3. Evaluates each sample against all 9 Docker security tools (Slither, Mythril, Osiris,
    HoneyBadger, Manticore, Maian, Oyente, Securify, SmartCheck)
@@ -39,8 +39,8 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATASET_PATH = PROJECT_ROOT / "E2E" / "data" / "training" / "iaudit_solodit.jsonl"
-DEFAULT_RESULTS_DIR = PROJECT_ROOT / "results"
+DATASET_PATH = PROJECT_ROOT / "E2E" / "data" / "eval" / "iaudit_solodit.jsonl"
+DEFAULT_RESULTS_DIR = PROJECT_ROOT / "E2E" / "data" / "eval" / "results"
 
 SECURITY_TOOL_NAMES = [
     "slither",

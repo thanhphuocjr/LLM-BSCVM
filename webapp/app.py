@@ -18,11 +18,9 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-E2E_ROOT = PROJECT_ROOT / "E2E"
-RUNS_DIR = E2E_ROOT / "runs"
+from E2E.config import DETECTOR_ADAPTER_DIR, E2E_ROOT, PROJECT_ROOT, RUNS_DIR, RUNTIME_DATA_DIR
+
 EXAMPLES_DIR = E2E_ROOT / "examples"
-RUNTIME_DATA_DIR = E2E_ROOT / "data" / "runtime"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 app = FastAPI(
@@ -251,10 +249,7 @@ load_env_file()
 def get_system_status() -> Dict[str, Any]:
     """Returns system status, active models, and environment readiness."""
     load_env_file()
-    adapter_path = PROJECT_ROOT / "models" / "qwen25-v13-14b-detector-final"
-    if not adapter_path.exists():
-        adapter_path = E2E_ROOT / "models" / "codellama-vuln-detector"
-    threshold_cfg = read_json_safe(adapter_path / "threshold_config.json") or {}
+    threshold_cfg = read_json_safe(DETECTOR_ADAPTER_DIR / "threshold_config.json") or {}
     
     # Check kaggle CLI
     kaggle_available = shutil.which("kaggle") is not None
@@ -301,8 +296,8 @@ def get_system_status() -> Dict[str, Any]:
         "max_context_length": threshold_cfg.get("max_len", 1024),
         "lora_rank": threshold_cfg.get("lora_r", 64),
         "lora_alpha": threshold_cfg.get("lora_alpha", 128),
-        "adapter_present": (adapter_path / "adapter_model.safetensors").exists(),
-        "adapter_size_bytes": (adapter_path / "adapter_model.safetensors").stat().st_size if (adapter_path / "adapter_model.safetensors").exists() else 0,
+        "adapter_present": (DETECTOR_ADAPTER_DIR / "adapter_model.safetensors").exists(),
+        "adapter_size_bytes": (DETECTOR_ADAPTER_DIR / "adapter_model.safetensors").stat().st_size if (DETECTOR_ADAPTER_DIR / "adapter_model.safetensors").exists() else 0,
         "knowledge_store_cases": kb_count,
         "server_gpu_online": server_gpu_online,
         "server_gpu_info": server_gpu_info,

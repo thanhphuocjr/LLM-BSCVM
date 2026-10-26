@@ -3,7 +3,7 @@ advisor.py
 ──────────────────────────────────────────────────────────────────────────────
 Repair Suggestion Agent (Advisor) — agent #2 of the LLM-BSCVM framework.
 
-Consumes the output of the detection phase (phase1_integrated_detector.py) and,
+Consumes the fused Phase 1 detection result (E2E.local.orchestrator) and,
 for each detected vulnerability, produces a targeted repair suggestion using
 Retrieval-Augmented Generation:
 
@@ -31,17 +31,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List
 
+from E2E.config import RUNTIME_DATA_DIR
+
 try:
     from .llm_client import GeminiClient, build_llm_client
 except ImportError:  # allow running as a script
     from llm_client import GeminiClient, build_llm_client
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_KNOWLEDGE_DIR = (
-    PROJECT_ROOT / "E2E" / "data" / "runtime"
-    if (PROJECT_ROOT / "E2E" / "data" / "runtime").exists()
-    else PROJECT_ROOT / "rag" / "knowledge_store"
-)
+DEFAULT_KNOWLEDGE_DIR = RUNTIME_DATA_DIR
 
 # Structured-output schema (OpenAPI subset)
 REPAIR_RESPONSE_SCHEMA: Dict[str, Any] = {
@@ -115,9 +112,7 @@ class RepairKnowledgeBase:
         k_dir = Path(knowledge_dir)
         # Fall back to E2E/data/runtime if provided directory does not exist
         if not k_dir.exists():
-            fallback = PROJECT_ROOT / "E2E" / "data" / "runtime"
-            if fallback.exists():
-                k_dir = fallback
+            k_dir = RUNTIME_DATA_DIR
 
         self._registry_by_swc: Dict[str, Dict[str, Any]] = {}
         self._items_by_swc: Dict[str, List[Dict[str, Any]]] = {}

@@ -29,7 +29,7 @@ try:
 except ImportError:  # allow running as a script
     from llm_client import GeminiClient, build_llm_client
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 RISK_LEVELS = ("Critical", "High", "Medium", "Low")
 RISK_ORDER = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "None": 0, "Unknown": 0}

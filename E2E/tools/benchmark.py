@@ -33,6 +33,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from E2E.config import SMARTBUGS_WILD_DIR
 from E2E.local.static_runner import run_static
 from E2E.shared.function_parser import parse_code_units
 from E2E.shared.fusion import fuse_findings
@@ -42,7 +43,7 @@ from E2E.shared.solc import select_best_solc
 BENCHMARK_CONTRACTS = {
     "coinage": {
         "name": "Coinage",
-        "path": PROJECT_ROOT / "smartbugs_wild" / "contracts" / "0x7415c7bf3e2415fa9a55f1fd8b6fccf2914c39a6.sol",
+        "path": SMARTBUGS_WILD_DIR / "0x7415c7bf3e2415fa9a55f1fd8b6fccf2914c39a6.sol",
         "expected_solc": "0.4.18",
         "expected_critical_max": 0,
         "expected_fused_max": 5,
@@ -50,7 +51,7 @@ BENCHMARK_CONTRACTS = {
     },
     "true_token": {
         "name": "TRUEToken",
-        "path": PROJECT_ROOT / "smartbugs_wild" / "contracts" / "0xa4d17ab1ee0efdd23edc2869e7ba96b89eecf9ab.sol",
+        "path": SMARTBUGS_WILD_DIR / "0xa4d17ab1ee0efdd23edc2869e7ba96b89eecf9ab.sol",
         "expected_solc": "0.4.11",
         "expected_critical_max": 0,
         "expected_fused_max": 5,
@@ -58,7 +59,7 @@ BENCHMARK_CONTRACTS = {
     },
     "elixir": {
         "name": "elixir",
-        "path": PROJECT_ROOT / "smartbugs_wild" / "contracts" / "0xc8c6a31a4a806d3710a7b38b7b296d2fabccdba8.sol",
+        "path": SMARTBUGS_WILD_DIR / "0xc8c6a31a4a806d3710a7b38b7b296d2fabccdba8.sol",
         "expected_solc": "0.4.11",
         "expected_swc_115": 4,
         "empty_body_units": ["elixor.returnAmountOfELIXAddressCanProduce"],

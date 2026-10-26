@@ -1,212 +1,126 @@
 {
-  "created_at": "2026-10-07T08:07:37+00:00",
+  "created_at": "2026-10-26T10:48:40+00:00",
   "root": ".",
-  "file_count": 23337,
-  "total_bytes": 2460618014,
+  "file_count": 47422,
+  "total_bytes": 1604331893,
   "files": [
     {
-      "path": "data/.DS_Store",
-      "bytes": 6148,
-      "sha256": "11cde2f6fd0244ea225dfe87de58bde0915cf48533e4477edbcb99a3b635e643"
-    },
-    {
-      "path": "data/runtime/baseline_taxonomy.json",
-      "bytes": 56590,
-      "sha256": "082fbd69a7aab153981e0315f2df8aa58d424303cc33ec974229aec1d6f383df"
-    },
-    {
-      "path": "data/runtime/knowledge_items.json",
-      "bytes": 26699272,
-      "sha256": "73ecdaee73413f9efd954c18fb39a601fa5e40d776c394fd9b89d8b207d0111c"
-    },
-    {
-      "path": "data/runtime/knowledge_manifest.json",
-      "bytes": 457,
-      "sha256": "b394a62f659138089e030674944ea37150aad80e8c4b6049fdbc02e7a28b9468"
-    },
-    {
-      "path": "data/runtime/swc_matrix.npz",
-      "bytes": 58105948,
-      "sha256": "f948a3de3a3e8ec6fabb70b8f31cbc2055dc7d21278b1f7c8a0526953995475f"
-    },
-    {
-      "path": "data/runtime/swc_registry.json",
-      "bytes": 306197,
-      "sha256": "1ffe5e98c064e8d7d4e994f272c7b64d6d2fa25522627b2063071f630b4a3be4"
-    },
-    {
-      "path": "data/runtime/swc_vectorizer.joblib",
-      "bytes": 2048460,
-      "sha256": "4af6b4d75f74ca6eb5df83f114a8132853f2f535b71fa157b90b4a208b9ec5f9"
-    },
-    {
-      "path": "data/training/dappscan_contracts_full.jsonl",
-      "bytes": 39220943,
-      "sha256": "97f9c10b6773e7146705ff971f919f87a950073a15778503f08d2b427688e620"
-    },
-    {
-      "path": "data/training/dappscan_contracts_safe.jsonl",
-      "bytes": 11264153,
-      "sha256": "25644e2dab4397773def1ea7a22b0897c195d9d4cd70e59a60b57919bc007529"
-    },
-    {
-      "path": "data/training/dappscan_contracts_vuln.jsonl",
-      "bytes": 27956790,
-      "sha256": "ff5037ae10a9b1750ab3a8f168cc43ed0bd2fee935b077862f628d7492a5c8d0"
-    },
-    {
-      "path": "data/training/dappscan_safe_pool.jsonl",
-      "bytes": 6454161,
-      "sha256": "27fc27b74fe7e6e80b3d8d68468ba00da2e04567a0d06cd3a9a4032af1e6e360"
-    },
-    {
-      "path": "data/training/dappscan_safe_v5.jsonl",
-      "bytes": 2722127,
-      "sha256": "76588064f82cdf0cb1a9d4c5575056c58ae0d57eec8d4cbbef008b8c1216b0b3"
-    },
-    {
-      "path": "data/training/dappscan_vuln_functions.jsonl",
-      "bytes": 2363557,
-      "sha256": "e0ffe616a628bc03b73b37387c74c4c58e3cc5044fcc175dd483fd7e4e0780b8"
-    },
-    {
-      "path": "data/training/dappscan_vuln_v5.jsonl",
-      "bytes": 1034256,
-      "sha256": "34f6c6779bf4dc671db8abe6d914c95df5ea8d21bfa082e5fdd41153b0f02114"
-    },
-    {
-      "path": "data/training/detect_v4_functionlevel.csv",
-      "bytes": 3109022,
-      "sha256": "3982e06efe9b804eaa693c1e9acf348950e9119d5295bf403876ab333547f81d"
-    },
-    {
-      "path": "data/training/detect_v4_functionlevel.jsonl",
-      "bytes": 3670879,
-      "sha256": "75d8edce865cf8cb07ced598f1c97074b40a7b10e92bff8bced4da68e9d1d488"
-    },
-    {
-      "path": "data/training/detect_v4_preview.csv",
-      "bytes": 673975,
-      "sha256": "cf5a92899eb1737b7f5dfe9eb84c2976e17bbeefd8ae9f923633ba797c0164bc"
-    },
-    {
-      "path": "data/training/detect_v5_functionlevel.csv",
-      "bytes": 2969066,
-      "sha256": "faa6d0e0057ef3c4cb495a16a001e7693331d0b874fd1218ba428fa235a466a7"
-    },
-    {
-      "path": "data/training/detect_v5_functionlevel.jsonl",
-      "bytes": 3517527,
-      "sha256": "b5aadb566c9cfd0da25496bfa5e44e2c979ab01121920be188f59c0929647c60"
-    },
-    {
-      "path": "data/training/detect_v5_preview.csv",
-      "bytes": 993711,
-      "sha256": "2b1cc54e5c6d0393049fea8f2ab2ec2c235b651bba63b5c025f03c2ffe45bb8d"
-    },
-    {
-      "path": "data/training/detect_v6_functionlevel.csv",
-      "bytes": 2956328,
-      "sha256": "e11393bfc65fd9ff3da9f60acd19da9f7ed50fc172732b05e2d21d2ff64f04fa"
-    },
-    {
-      "path": "data/training/detect_v6_functionlevel.jsonl",
-      "bytes": 3502564,
-      "sha256": "9a4d3607f1c391229fcbfd1abadc04bc83230f5e48a07a8e809effa8e55bcc9d"
-    },
-    {
-      "path": "data/training/iaudit_solodit.jsonl",
+      "path": "E2E/data/eval/iaudit_solodit.jsonl",
       "bytes": 2605463,
       "sha256": "fdda41f7695e003f11f148e4980bc32cf3a188571c1d5d0abc9b2ba73649ea3c"
     },
     {
-      "path": "data/training/iaudit_solodit_v5.jsonl",
-      "bytes": 2337422,
-      "sha256": "13352a628fe31c2b89decc2e583f8b83aeca11fb52c37f4fbd8a9df3249a5901"
+      "path": "E2E/data/eval/results/solodit_9tools_benchmark_details.csv",
+      "bytes": 1247974,
+      "sha256": "8b075a74dc3a6503d318db6ae63278701e2ca009f1f16a6e1955ca9bf36111de"
     },
     {
-      "path": "data/training/reports/DATASET_REPORT.md",
-      "bytes": 7813,
-      "sha256": "009e2e7ffc6a98f9ab1a16a92ebc4d3b9669130ea34a6dbb79077a7ded07dafe"
+      "path": "E2E/data/eval/results/solodit_9tools_benchmark_report.md",
+      "bytes": 2853,
+      "sha256": "dd259d94fdfdf81f58c7c57397404afaab6a887158ef0f0aff30324b8bfc1169"
     },
     {
-      "path": "data/training/reports/DATASET_V5_REPORT.md",
-      "bytes": 5995,
-      "sha256": "8ac4aed17745b4765dc3cd5b908455890708a583f5060dea75dab58eea50d4b6"
+      "path": "E2E/data/eval/results/solodit_9tools_benchmark_summary.csv",
+      "bytes": 1107,
+      "sha256": "4caf9066d589dada31c0027599b90941cc2db9f29a92791be9d77abaf9737cf2"
     },
     {
-      "path": "data/training/reports/DATASET_V6_REPORT.md",
-      "bytes": 2941,
-      "sha256": "fdafb89fd84f2498f47d0390c2d170974d5e9d5cf5cb8a12025941eb2ddfb417"
+      "path": "E2E/data/knowledge/final-vulnerability-knowledge.json",
+      "bytes": 25913231,
+      "sha256": "a14a25d3b12ce6009d9d2514a28b4917d38757a178e680e3143aeecf18e0ab6a"
     },
     {
-      "path": "data/training/reports/README.md",
-      "bytes": 3587,
-      "sha256": "c8ca4c16f6a616e4d97983c0c352d1b809a80e67b44015805236300d5743636f"
+      "path": "E2E/data/runtime/baseline_taxonomy.json",
+      "bytes": 56590,
+      "sha256": "082fbd69a7aab153981e0315f2df8aa58d424303cc33ec974229aec1d6f383df"
     },
     {
-      "path": "data/training/reports/local_detector_eval.json",
-      "bytes": 1636,
-      "sha256": "9a4093c4190cda1862fb22a7bd4b32e44fe08148031d1b04c650e755c7d01d3e"
+      "path": "E2E/data/runtime/fusion_calibration.json",
+      "bytes": 497,
+      "sha256": "b09a2bf1f9c5ad569fdcf6534301412a36dbde921816de13b7835314860a2fec"
     },
     {
-      "path": "models/codellama-vuln-detector/README.md",
+      "path": "E2E/data/runtime/knowledge_items.json",
+      "bytes": 26699272,
+      "sha256": "73ecdaee73413f9efd954c18fb39a601fa5e40d776c394fd9b89d8b207d0111c"
+    },
+    {
+      "path": "E2E/data/runtime/knowledge_manifest.json",
+      "bytes": 446,
+      "sha256": "0e2c62ba70cc3b978d1b6dc0588fdcda2b84be73ca9e41520f692b358f709ad6"
+    },
+    {
+      "path": "E2E/data/runtime/swc_matrix.npz",
+      "bytes": 58105948,
+      "sha256": "f948a3de3a3e8ec6fabb70b8f31cbc2055dc7d21278b1f7c8a0526953995475f"
+    },
+    {
+      "path": "E2E/data/runtime/swc_registry.json",
+      "bytes": 306197,
+      "sha256": "1ffe5e98c064e8d7d4e994f272c7b64d6d2fa25522627b2063071f630b4a3be4"
+    },
+    {
+      "path": "E2E/data/runtime/swc_vectorizer.joblib",
+      "bytes": 2048460,
+      "sha256": "4af6b4d75f74ca6eb5df83f114a8132853f2f535b71fa157b90b4a208b9ec5f9"
+    },
+    {
+      "path": "models/qwen25-v13-14b-detector-final/README.md",
       "bytes": 5186,
       "sha256": "ebcbee26ba17149c7645eb78fea4fcbd35c4365e09d98850cc4fceb30ab41d3d"
     },
     {
-      "path": "models/codellama-vuln-detector/adapter_config.json",
+      "path": "models/qwen25-v13-14b-detector-final/adapter_config.json",
       "bytes": 1207,
       "sha256": "b48b63db12b4eb5ae4cefa9b9e30bfaf24282fd279c968ff00874586733cda2c"
     },
     {
-      "path": "models/codellama-vuln-detector/adapter_model.safetensors",
+      "path": "models/qwen25-v13-14b-detector-final/adapter_model.safetensors",
       "bytes": 1101136912,
       "sha256": "782220785037c4ae59046f6c70f3ae2c21824840beada62382f5037c437c85ea"
     },
     {
-      "path": "models/codellama-vuln-detector/chat_template.jinja",
+      "path": "models/qwen25-v13-14b-detector-final/chat_template.jinja",
       "bytes": 2507,
       "sha256": "cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f"
     },
     {
-      "path": "models/codellama-vuln-detector/line_head.pt",
+      "path": "models/qwen25-v13-14b-detector-final/line_head.pt",
       "bytes": 12213,
       "sha256": "a3374a14c3839d6a598a8b72303092084937bac819f290dc09f263bda9e3a3aa"
     },
     {
-      "path": "models/codellama-vuln-detector/threshold_config.json",
+      "path": "models/qwen25-v13-14b-detector-final/threshold_config.json",
       "bytes": 1177,
       "sha256": "366594ab4c789906c06b657eb307d1262e2318cd2f48194991f9002ee3a948d6"
     },
     {
-      "path": "models/codellama-vuln-detector/tokenizer.json",
+      "path": "models/qwen25-v13-14b-detector-final/tokenizer.json",
       "bytes": 11421991,
       "sha256": "2f55e63353d3d978b390d346bae531be8b83bc9532c0be500d62b7253aa4c595"
     },
     {
-      "path": "models/codellama-vuln-detector/tokenizer_config.json",
+      "path": "models/qwen25-v13-14b-detector-final/tokenizer_config.json",
       "bytes": 693,
       "sha256": "8b6f658e2435ec8da6866013cb485a1d2a6559bed4bf76ed99ea68b031854b41"
     },
     {
-      "path": "models/codellama-vuln-detector/training_args.bin",
+      "path": "models/qwen25-v13-14b-detector-final/training_args.bin",
       "bytes": 5265,
       "sha256": "79cde15612eb733e92a50a3ad9f6fa336d9bdb21acab6edd12a6596490f578e4"
+    },
+    {
+      "path": "server_train/final-dataset-v12-train.json",
+      "bytes": 9249525,
+      "sha256": "d4e894b7d295ee20d154b59829d382445698229a7850f45121397918fa9429e5"
     }
   ],
   "trees": [
     {
-      "path": "data/source/raw/DAppSCAN",
-      "file_count": 23257,
-      "bytes": 1044934945,
-      "tree_sha256": "124d6c43a131544d89f0165baeadf2036db77574f6a3caf8719a12081fa8781d"
-    },
-    {
-      "path": "data/source/raw/iAudit-TrustLLM",
-      "file_count": 42,
-      "bytes": 98498930,
-      "tree_sha256": "07baae188a9b60555a84f95c54b0a23d213007f41f295902104c674b4c91f466"
+      "path": "E2E/data/contracts/smartbugs_wild",
+      "file_count": 47400,
+      "bytes": 365507179,
+      "tree_sha256": "dca988b61c2bceffd933094c270d2073994eaf1e78412962e3afc6fb1f18ed98"
     }
   ]
 }

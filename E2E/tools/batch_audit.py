@@ -20,7 +20,7 @@ the result, with no verification (an external judge scores the CSV). `--verify` 
 verify-and-retry loop; a batch is locked to the mode it was started in.
 
 Usage (from the repository root):
-  .venv/bin/python -m E2E.tools.batch_audit run    --batch pilot --input-dir SmartContractRunPipeline --limit 5
+  .venv/bin/python -m E2E.tools.batch_audit run    --batch pilot --input-dir E2E/data/contracts/smartbugs_wild --limit 5
   .venv/bin/python -m E2E.tools.batch_audit status --batch pilot
   .venv/bin/python -m E2E.tools.batch_audit export --batch pilot
   .venv/bin/python -m E2E.tools.batch_audit retry-failed --batch pilot
@@ -43,13 +43,13 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from E2E.config import E2E_ROOT
+from E2E.config import BATCH_RUNS_DIR
 from E2E.local.orchestrator import run_pipeline
 from E2E.local.server_gpu_runner import check_server_health, run_server_gpu_pipeline
 from E2E.shared.function_parser import parse_code_units
 from E2E.shared.io_utils import read_json, sha256_text, utc_now, write_json
 
-BATCH_ROOT = E2E_ROOT / "batch_runs"
+BATCH_ROOT = BATCH_RUNS_DIR
 
 # The requested columns come first; the rest let the evaluator explain each verdict.
 CSV_COLUMNS = [
@@ -636,6 +636,7 @@ def export_batch(batch: str, out: str | None = None, quiet: bool = False, first:
     """Write the CSV/JSONL files atomically, so a file opened mid-run is never half-written.
 
     first=N exports only the first N contracts that finished (a fixed snapshot of the batch).
+    Snapshots are CSV only: the JSONL twin holds the same rows, so only the live export keeps it.
     """
     batch_dir = BATCH_ROOT / batch
     db = connect(batch_dir)
@@ -685,24 +686,34 @@ def export_batch(batch: str, out: str | None = None, quiet: bool = False, first:
 
     write_atomic(out_path, write_functions)
     write_atomic(summary_path, write_summary)
-    write_atomic(jsonl_path, write_jsonl)
+    if not first:
+        write_atomic(jsonl_path, write_jsonl)
     if not quiet:
         print(f"[batch] {len(rows)} function row(s) -> {out_path}")
         print(f"[batch] contract summary -> {summary_path}")
-        print(f"[batch] same rows as JSONL -> {jsonl_path}")
+        if not first:
+            print(f"[batch] same rows as JSONL -> {jsonl_path}")
     return out_path
 
 
 def ensure_snapshots(db: sqlite3.Connection, args: argparse.Namespace, log) -> None:
-    """Write `<batch>_first{N}_*` once for every multiple N of --snapshot-every already reached."""
+    """Write `<batch>_first{N}_*` once for every multiple N of --snapshot-every reached.
+
+    The last milestone written is kept in `meta`, so a snapshot deleted to free disk space is
+    not rebuilt on the next start (`export --first N` re-creates one on demand).
+    """
     step = args.snapshot_every
     if not step:
         return
     done = counts(db).get("done", 0)
-    for milestone in range(step, done + 1, step):
+    row = db.execute("SELECT value FROM meta WHERE key = 'last_snapshot'").fetchone()
+    last = int(row["value"]) if row else 0
+    for milestone in range((last // step + 1) * step, done + 1, step):
         if not snapshot_path(args.batch, milestone).exists():
             path = export_batch(args.batch, quiet=True, first=milestone)
             log(f"SNAPSHOT: first {milestone} contracts -> {path.name} (the run continues).")
+        db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('last_snapshot', ?)", (str(milestone),))
+        db.commit()
 
 
 def command_export(args: argparse.Namespace) -> None:

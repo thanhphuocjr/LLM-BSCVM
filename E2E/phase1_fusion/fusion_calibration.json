@@ -1,0 +1,22 @@
+{
+  "description": "Fusion calibration weights for LLM-BSCVM (Task B2)",
+  "mode": "calibrated_logistic",
+  "intercept": -2.15,
+  "weights": {
+    "p_detector": 3.85,
+    "static_conf": 1.20,
+    "rag_conf": 1.10,
+    "corroborated": 0.65,
+    "severity_critical": 0.80,
+    "severity_high": 0.40,
+    "severity_medium": 0.0,
+    "severity_low": -0.50
+  },
+  "paper_weights": {
+    "llm_detector": 0.70,
+    "rag": 0.20,
+    "static": 0.10
+  },
+  "tau_agent": 0.45,
+  "detector_threshold": 0.70
+}

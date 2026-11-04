@@ -1,5 +1,5 @@
 # Only code, scripts, small configs and docs are pushed.
-# Datasets, model weights, run outputs and local tools stay on this machine.
+# Datasets, run results, model weights and local tools stay on this machine.
 
 # ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
@@ -23,25 +23,15 @@ venv/
 .env.*
 !.env.example
 
-# ── Data and models (local only) ──────────────────────────────────────────────
-E2E/data/
+# ── Data, results and models (local only; layout in data/README.md) ──────────
+data/*
+!data/README.md
+!data/data_manifest.json
 models/
-server_train/*.json
-docs/*.pdf
-
-# ── Run outputs ───────────────────────────────────────────────────────────────
-E2E/runs/*
-!E2E/runs/.gitkeep
-E2E/batch_runs/
-E2E/phase1_detection.json
-E2E/audit_report.*
-results/
-kaggle-kernel-build/
-kaggle-output*/
-*.log
-*.pid
 
 # ── Heavy formats anywhere else ───────────────────────────────────────────────
+*.log
+*.pid
 *.csv
 *.tsv
 *.jsonl
@@ -67,6 +57,10 @@ kaggle-output*/
 *.7z
 *.pdf
 
-# Solidity sources are data, except the bundled examples used by tests and the web UI
+# Solidity sources are data, except the demo contracts used by the web app and the tests
 *.sol
-!E2E/examples/*.sol
+!demo_contracts/*.sol
+
+# KLTN
+graduation thesis/
+

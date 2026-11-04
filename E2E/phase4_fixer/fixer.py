@@ -1,0 +1,317 @@
+"""
+Phase 4 - Fixer: repair one vulnerable function at a time with Qwen2.5-Coder-14B.
+
+Prompt = target function + findings and the Advisor's fix strategy + contract context
++ RAG knowledge (similar vulnerable/fixed cases) + compiler-version rules + feedback of
+the previous attempt. The reply must be JSON {"replacement", "changed_lines", "why"}.
+
+The replacement is extracted, checked by the behaviour guard and spliced into the
+contract by unit id. When the model fails, the Advisor's fixed code is tried instead
+(not in single-pass mode, where the model's reply is the result).
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+from E2E.common.gpu_client import generate_via_server
+from E2E.phase0_parsing.code_units import CodeUnit, parse_code_units
+from E2E.phase0_parsing.contract_context import build_contract_context
+from E2E.phase4_fixer.behavior_guard import validate_observable_behavior
+from E2E.phase4_fixer.patching import apply_unit_patches, extract_declaration_body, lenient_json_string_field
+
+
+def _build_rag_knowledge_section(
+    rag_context: list[dict[str, Any]],
+    target_swc: str | None = None,
+    max_items: int = 3,
+) -> str:
+    """Xây dựng phần bối cảnh tri thức bảo mật (RAG context) từ 11,869 cases cho Fixer LLM."""
+    if not rag_context:
+        return ""
+
+    candidates = []
+    for ctx in rag_context:
+        sim = float(ctx.get("similarity") or 0.0)
+        c_swc = ctx.get("swc") or "Security"
+        # Ưu tiên case khớp SWC của lỗ hổng mục tiêu
+        priority = (2.0 + sim) if (target_swc and c_swc == target_swc) else sim
+        if sim >= 0.08 or (target_swc and c_swc == target_swc):
+            candidates.append((priority, ctx))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    selected = [c[1] for c in candidates[:max_items]]
+    if not selected:
+        return ""
+
+    items_text = []
+    for ctx in selected:
+        c_swc = ctx.get("swc") or "Security"
+        c_title = ctx.get("title") or c_swc
+        sim = float(ctx.get("similarity") or 0.0)
+        c_root = (ctx.get("root_cause") or ctx.get("description") or "").strip()
+        c_rem = (ctx.get("remediation") or "").strip()
+        entry = f"- [{c_swc}] {c_title} (similarity: {sim:.2f})"
+        if c_root:
+            entry += f"\n  Root cause: {c_root[:250]}"
+        if c_rem:
+            entry += f"\n  Remediation guidance: {c_rem[:250]}"
+        if ctx.get("fixed_code") and ctx.get("vulnerable_code"):
+            v_code = str(ctx["vulnerable_code"]).strip()
+            f_code = str(ctx["fixed_code"]).strip()
+            if len(v_code) <= 350 and len(f_code) <= 350:
+                entry += (
+                    f"\n  Vulnerable reference snippet:\n  ```solidity\n{v_code}\n  ```\n"
+                    f"  Secure reference fix:\n  ```solidity\n{f_code}\n  ```"
+                )
+        items_text.append(entry)
+
+    return (
+        "\n\n### RAG Retrieved Knowledge & Defense Context (Empirical Cases):\n"
+        + "\n\n".join(items_text)
+    )
+
+
+def _find_unit(units: list[CodeUnit], target: CodeUnit) -> CodeUnit | None:
+    """Locate `target` in a re-parsed source: by unit_id, else by a unique name match."""
+    by_id = next((unit for unit in units if unit.unit_id == target.unit_id), None)
+    if by_id is not None:
+        return by_id
+    same_name = [
+        unit for unit in units
+        if unit.name == target.name and unit.contract_name == target.contract_name
+    ]
+    return same_name[0] if len(same_name) == 1 else None
+
+
+def _splice_unit(code: str, target: CodeUnit, replacement: str, summary: str) -> str:
+    current = _find_unit(parse_code_units(code), target)
+    if current is None:
+        raise ValueError(f"Unit {target.unit_id} could not be located in the current source")
+    updated, outcomes = apply_unit_patches(
+        code,
+        [current],
+        [{"unit_id": current.unit_id, "replacement": replacement, "summary": summary}],
+    )
+    if not any(item.get("status") == "applied" for item in outcomes):
+        reason = outcomes[0].get("reason") if outcomes else "patch was not applied"
+        raise ValueError(str(reason))
+    return updated
+
+
+def _feedback_from_request(repair_feedback: dict[str, Any] | None) -> str:
+    """Turn an externally supplied repair_feedback object into prompt text."""
+    if not repair_feedback:
+        return ""
+    parts: list[str] = []
+    if repair_feedback.get("compiler_error"):
+        parts.append(f"Previous compilation error:\n{repair_feedback['compiler_error']}")
+    for channel_name, channel in (repair_feedback.get("components") or {}).items():
+        if channel.get("passed", True):
+            continue
+        channel_findings = channel.get("findings") or channel.get("residual_target_findings") or []
+        if channel_findings:
+            details = "; ".join(
+                str(item.get("message") or item.get("name") or item.get("title") or "")
+                for item in channel_findings
+                if item
+            )
+            parts.append(f"Verification channel [{channel_name}] flagged issues: {details}")
+        elif channel.get("reason") or channel.get("error"):
+            parts.append(f"Verification channel [{channel_name}] reported: {channel.get('reason') or channel.get('error')}")
+    return "\n".join(parts)
+
+
+def _min_pragma_version(source_code: str) -> tuple[int, int, int] | None:
+    """Lowest compiler version allowed by the pragma (the patch must compile with it)."""
+    match = re.search(r"pragma\s+solidity\s+([^;]+);", source_code)
+    if not match:
+        return None
+    versions = [
+        tuple(int(part) for part in found)
+        for found in re.findall(r"(\d+)\.(\d+)\.(\d+)", match.group(1))
+    ]
+    return min(versions) if versions else None
+
+
+def _version_rules(source_code: str) -> str:
+    version = _min_pragma_version(source_code)
+    if version is None or version >= (0, 6, 0):
+        return ""
+    spec = re.search(r"pragma\s+solidity\s+([^;]+);", source_code).group(1).strip()
+    rules = [f"   - TARGET SOLIDITY COMPILER: pragma solidity {spec} (legacy {version[0]}.{version[1]}.{version[2]})."]
+    if version < (0, 4, 22):
+        rules.append("     * DO NOT pass a message string to require(); only `require(condition);` is valid.")
+        rules.append("     * DO NOT use the `constructor` keyword; constructors are functions named after the contract.")
+        rules.append("     * DO NOT use `abi.encode` / `abi.encodePacked` (not available); pass several arguments "
+                     "directly, e.g. `keccak256(a, b)`.")
+    else:
+        rules.append("     * Keep the declaration kind unchanged: a `constructor(...)` stays a `constructor(...)`.")
+    if version < (0, 4, 21):
+        rules.append("     * DO NOT use the `emit` keyword; trigger events directly via `EventName(...)`.")
+    if version < (0, 5, 0):
+        rules.append("     * Keep pre-0.5 syntax (no `address payable`, no `calldata`, `.call.value(x)()` style).")
+    rules.append(
+        "     * Preserve return semantics: if the original returns a boolean (e.g. `return false;`), do NOT change it to `revert()`."
+    )
+    return "\n".join(rules) + "\n"
+
+
+def _build_fixer_prompt(
+    unit: CodeUnit,
+    unit_findings: list[dict[str, Any]],
+    unit_suggestions: list[dict[str, Any]],
+    source_code: str,
+    feedback_note: str,
+    rag_section: str,
+) -> str:
+    finding_lines = [f"  * [{item.get('swc', '')}] {item.get('title', '')}" for item in unit_findings]
+    for suggestion in unit_suggestions:
+        # Suggestions without `is_true_positive` come from the knowledge-base fallback and describe
+        # a different contract's case; feeding them as this function's diagnosis misleads the fixer.
+        if not suggestion.get("is_true_positive"):
+            continue
+        if suggestion.get("fix_strategy"):
+            finding_lines.append(f"  * Fix Strategy: {suggestion['fix_strategy']}")
+        elif suggestion.get("root_cause"):
+            finding_lines.append(f"  * Root cause: {suggestion['root_cause']}")
+    findings_text = "\n".join(finding_lines) if finding_lines else "Security vulnerability detected."
+    context = build_contract_context(unit, source_code, budget_tokens=1500)
+    return (
+        "You are an expert Solidity smart contract security researcher.\n"
+        f"Target vulnerable function: `{unit.name}`\n"
+        f"Identified Vulnerabilities & Diagnoses:\n{findings_text}\n\n"
+        f"Original declaration:\n```solidity\n{unit.code}\n```\n\n"
+        f"Contract Context & Invariants:\n```solidity\n{context}\n```\n"
+        f"{rag_section}\n"
+        f"{feedback_note}\n\n"
+        "INSTRUCTIONS:\n"
+        f"1. Generate a MINIMAL DIFF security repair for `{unit.name}`.\n"
+        f"{_version_rules(source_code)}"
+        "2. All state write statements and event emissions from the original function MUST be preserved.\n"
+        "3. Return ONLY a single valid JSON object with format:\n"
+        "{\n"
+        f'  "replacement": "full replacement code beginning with function {unit.name} and ending at its closing brace",\n'
+        '  "changed_lines": [1, 2],\n'
+        '  "why": "brief rationale"\n'
+        "}\n"
+        "Do NOT include explanations or text outside the JSON."
+    )
+
+
+def patch_unit(
+    code: str,
+    unit: CodeUnit,
+    *,
+    unit_findings: list[dict[str, Any]],
+    unit_suggestions: list[dict[str, Any]],
+    source_code: str,
+    feedback_note: str,
+    rag_section: str,
+    attempt: int,
+    server_url: str | None,
+    single_pass: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    """Patch one unit with the generative model, falling back to the Advisor's fixed code.
+
+    single_pass: the fixer's reply is the result. The behaviour guard only annotates it
+    (`guard_warning`), an unchanged reply is reported as `unchanged`, and no fallback runs.
+    """
+    label = f"attempt {attempt}"
+    stage = "prepare"
+    llm_error = ""
+    guard_warning = ""
+    rationale = ""
+    try:
+        prompt = _build_fixer_prompt(unit, unit_findings, unit_suggestions, source_code, feedback_note, rag_section)
+        stage = "generate"
+        reply = generate_via_server(
+            prompt,
+            system_prompt="You are a Solidity security auditor. Output strictly valid JSON with the requested schema.",
+            temperature=0.0,
+            server_url=server_url,
+        )
+        stage = "extract"
+        rationale = (lenient_json_string_field(reply, "why") or "").strip()
+        candidate = extract_declaration_body(reply, target_name=unit.name)
+        if not candidate or unit.name not in candidate:
+            raise ValueError(f"Extracted patch does not define expected function {unit.name}")
+        if single_pass and re.sub(r"\s+", "", candidate) == re.sub(r"\s+", "", unit.code):
+            return code, {
+                "finding_id": f"LLM:Qwen14B:{unit.unit_id}",
+                "unit_id": unit.unit_id,
+                "status": "unchanged",
+                "stage": "unchanged",
+                "engine": "llm_fixer",
+                "fixed_code": candidate,
+                "attempt": attempt,
+                "rationale": rationale,
+                "reason": "The fixer returned the function unchanged.",
+            }
+        stage = "guard"
+        try:
+            validate_observable_behavior(unit.code, candidate)
+        except ValueError as error:
+            if not single_pass:
+                raise
+            guard_warning = str(error)
+        stage = "apply"
+        updated = _splice_unit(code, unit, candidate, f"Qwen-14B patch for {unit.unit_id} ({label})")
+        return updated, {
+            "finding_id": f"LLM:Qwen14B:{unit.unit_id}",
+            "unit_id": unit.unit_id,
+            "status": "applied",
+            "stage": "applied",
+            "engine": "llm_fixer",
+            "fixed_code": candidate,
+            "patched_code": candidate,
+            "attempt": attempt,
+            "guard_warning": guard_warning,
+            "rationale": rationale,
+            "reason": f"Applied neural unit patch for {unit.unit_id} ({label}).",
+        }
+    except Exception as error:
+        llm_error = f"{type(error).__name__}: {error}"
+
+    advisor_error = ""
+    for suggestion in ([] if single_pass else unit_suggestions):
+        suggested = str(suggestion.get("fixed_code") or "").strip()
+        if not suggested:
+            continue
+        candidate = extract_declaration_body(suggested, target_name=unit.name)
+        if not candidate or unit.name not in candidate:
+            continue
+        if re.sub(r"\s+", "", candidate) == re.sub(r"\s+", "", unit.code):
+            continue
+        try:
+            validate_observable_behavior(unit.code, candidate)
+            updated = _splice_unit(code, unit, candidate, f"Advisor patch for {unit.unit_id}")
+        except Exception as error:
+            advisor_error = f"{type(error).__name__}: {error}"
+            continue
+        return updated, {
+            "finding_id": suggestion.get("finding_id") or f"Advisor:{unit.unit_id}",
+            "unit_id": unit.unit_id,
+            "status": "applied",
+            "stage": "applied",
+            "engine": "advisor_fallback",
+            "fixed_code": candidate,
+            "patched_code": candidate,
+            "attempt": attempt,
+            "reason": f"LLM fixer failed at stage '{stage}'; applied the Advisor's patch for {unit.unit_id}.",
+        }
+
+    reason = f"Patch rejected at stage '{stage}': {llm_error}"
+    if advisor_error:
+        reason += f"; advisor fallback rejected: {advisor_error}"
+    return code, {
+        "finding_id": f"LLM:Qwen14B:{unit.unit_id}",
+        "unit_id": unit.unit_id,
+        "status": "rejected",
+        "stage": stage,
+        "attempt": attempt,
+        "error": llm_error,
+        "rationale": rationale,
+        "reason": reason,
+    }

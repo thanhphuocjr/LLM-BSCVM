@@ -1,26 +1,24 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from E2E.config import DETECTOR_ADAPTER_DIR, E2E_ROOT, PROJECT_ROOT, RUNS_DIR, RUNTIME_DATA_DIR
+from E2E.common.gpu_client import check_server_health, load_env_file
+from E2E.config import DEMO_CONTRACTS_DIR, DETECTOR_ADAPTER_DIR, KNOWLEDGE_BASE_DIR, PROJECT_ROOT, RUNS_DIR
 
-EXAMPLES_DIR = E2E_ROOT / "examples"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 app = FastAPI(
@@ -52,7 +50,6 @@ TASK_LOCK = threading.Lock()
 
 
 RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
-ALLOWED_BACKENDS = {"server_gpu", "local_fast", "local", "kaggle", "ollama", "gemini", "auto"}
 ALLOWED_TOOLS = {"slither", "mythril", "smartcheck"}
 
 
@@ -72,7 +69,6 @@ def safe_contract_file_name(file_name: str) -> str:
 class AuditRequest(BaseModel):
     code: str = Field(..., description="Solidity smart contract code")
     file_name: str = Field(default="Contract.sol", description="Contract filename")
-    backend: str = Field(default="server_gpu", description="Backend: server_gpu, local_fast, local, kaggle, ollama")
     detector_threshold: float = Field(default=0.700, description="Detector threshold (default 0.700 for v13)")
     tools: str = Field(default="slither", description="Security tools: slither or all")
 
@@ -84,7 +80,7 @@ class PrepareRequest(BaseModel):
 
 def prepare_contract_context(code: str, file_name: str = "Contract.sol") -> Dict[str, Any]:
     """Phase 0 Prepare: Decomposes full contract into individual functions and extracts contract skeleton context."""
-    from E2E.shared.function_parser import parse_code_units
+    from E2E.phase0_parsing.code_units import parse_code_units
 
     if not code.strip():
         return {
@@ -228,59 +224,32 @@ def read_json_safe(path: Path) -> Any:
         return None
 
 
-def load_env_file(path: Path = PROJECT_ROOT / ".env") -> None:
-    """Populate os.environ from .env file so settings take effect immediately."""
-    if not path.exists():
-        return
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key:
-            os.environ[key] = value
-
-load_env_file()
+load_env_file(override=True)
 
 
 @app.get("/api/system/status")
 def get_system_status() -> Dict[str, Any]:
     """Returns system status, active models, and environment readiness."""
-    load_env_file()
     threshold_cfg = read_json_safe(DETECTOR_ADAPTER_DIR / "threshold_config.json") or {}
-    
-    # Check kaggle CLI
-    kaggle_available = shutil.which("kaggle") is not None
 
-    # Check Dedicated GPU Server (RTX 4070 Ti SUPER v13)
-    server_gpu_online = False
+    # GPU server (RTX 4070 Ti SUPER, Qwen v13). Its IP/port are never sent to the browser.
+    raw_info = check_server_health(timeout=1)
+    server_gpu_online = raw_info.get("status") == "ready"
     server_gpu_info = {}
-    server_url = os.environ.get("SERVER_GPU_URL", "http://100.122.153.35:6868").rstrip("/")
-    try:
-        import urllib.request
-        req = urllib.request.Request(f"{server_url}/api/v1/health", headers={"User-Agent": "LLM-BSCVM-Webapp"})
-        with urllib.request.urlopen(req, timeout=1.0) as resp:
-            if resp.status == 200:
-                raw_info = json.loads(resp.read().decode("utf-8"))
-                server_gpu_online = raw_info.get("status") == "ready"
-                # Bảo mật: Không để lộ IP/Port ra bên ngoài client
-                used_mb = raw_info.get("vram_used_mb")
-                allocated_gb = round(used_mb / 1024, 2) if used_mb is not None else raw_info.get("vram_allocated_gb")
-                server_gpu_info = {
-                    "status": raw_info.get("status"),
-                    "gpu_device": raw_info.get("gpu_device", "NVIDIA GeForce RTX 4070 Ti SUPER"),
-                    "model": raw_info.get("model_name") or raw_info.get("model", "qwen25-v13-14b-detector-final"),
-                    "model_name": raw_info.get("model_name") or raw_info.get("model", "qwen25-v13-14b-detector-final"),
-                    "vram_used_mb": used_mb,
-                    "vram_total_mb": raw_info.get("vram_total_mb"),
-                    "vram_allocated_gb": allocated_gb,
-                }
-    except Exception:
-        server_gpu_online = False
+    if raw_info.get("status") != "offline":
+        used_mb = raw_info.get("vram_used_mb")
+        allocated_gb = round(used_mb / 1024, 2) if used_mb is not None else raw_info.get("vram_allocated_gb")
+        server_gpu_info = {
+            "status": raw_info.get("status"),
+            "gpu_device": raw_info.get("gpu_device", "NVIDIA GeForce RTX 4070 Ti SUPER"),
+            "model": raw_info.get("model_name") or raw_info.get("model", "qwen25-v13-14b-detector-final"),
+            "model_name": raw_info.get("model_name") or raw_info.get("model", "qwen25-v13-14b-detector-final"),
+            "vram_used_mb": used_mb,
+            "vram_total_mb": raw_info.get("vram_total_mb"),
+            "vram_allocated_gb": allocated_gb,
+        }
 
-    kb_file = RUNTIME_DATA_DIR / "knowledge_items.json"
+    kb_file = KNOWLEDGE_BASE_DIR / "knowledge_items.json"
     kb_count = 0
     if kb_file.exists():
         try:
@@ -301,7 +270,6 @@ def get_system_status() -> Dict[str, Any]:
         "knowledge_store_cases": kb_count,
         "server_gpu_online": server_gpu_online,
         "server_gpu_info": server_gpu_info,
-        "kaggle_cli_installed": kaggle_available,
         "python_env": sys.executable,
     }
 
@@ -309,24 +277,22 @@ def get_system_status() -> Dict[str, Any]:
 @app.get("/api/phases")
 def get_pipeline_phases() -> List[Dict[str, Any]]:
     """Single Source of Truth cho các Phase của pipeline."""
-    from E2E.shared.phases import PHASES
+    from E2E.pipeline.phases import PHASES
     return PHASES
 
 
 @app.get("/api/contracts/examples")
 def get_example_contracts() -> List[Dict[str, Any]]:
-    """Returns list of curated example contracts."""
+    """Demo contracts shown under "Mẫu" (demo_contracts/)."""
     examples = []
-    if EXAMPLES_DIR.exists():
-        for file in sorted(EXAMPLES_DIR.glob("*.sol")):
+    if DEMO_CONTRACTS_DIR.exists():
+        for file in sorted(DEMO_CONTRACTS_DIR.glob("*.sol")):
             code = file.read_text(encoding="utf-8")
             vuln_type = "Unknown"
             if "VulnerableBank" in file.name:
                 vuln_type = "Reentrancy (SWC-107)"
             elif "AccessControl" in file.name:
                 vuln_type = "Access Control / tx.origin (SWC-105/115)"
-            elif "Signature" in file.name:
-                vuln_type = "Signature Replay (SWC-114/115)"
             elif "Safe" in file.name:
                 vuln_type = "Secure Benchmark (Safe)"
 
@@ -355,18 +321,14 @@ def submit_audit(req: AuditRequest) -> Dict[str, Any]:
     if not req.code.strip():
         raise HTTPException(status_code=400, detail="Contract code cannot be empty.")
 
-    if req.backend not in ALLOWED_BACKENDS:
-        raise HTTPException(status_code=400, detail=f"Unsupported backend: {req.backend}")
     requested_tools = [item for item in re.split(r"[\s,]+", req.tools or "") if item]
     unknown_tools = sorted(set(requested_tools) - ALLOWED_TOOLS - {"all"})
     if unknown_tools:
         raise HTTPException(status_code=400, detail=f"Unsupported tool(s): {', '.join(unknown_tools)}")
+    from E2E.pipeline.orchestrator import make_run_id
+
     file_name = safe_contract_file_name(req.file_name)
-    stem = Path(file_name).stem
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    import hashlib
-    sha_prefix = hashlib.sha256(req.code.encode("utf-8")).hexdigest()[:8]
-    run_id = f"{timestamp}-{stem}-{sha_prefix}"
+    run_id = make_run_id(file_name, req.code)
 
     run_dir = run_dir_for(run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -382,8 +344,6 @@ def submit_audit(req: AuditRequest) -> Dict[str, Any]:
         str(input_file),
         "--run-id",
         run_id,
-        "--backend",
-        req.backend,
         "--detector-threshold",
         str(req.detector_threshold),
         "--max-fix-attempts",
@@ -408,7 +368,7 @@ def submit_audit(req: AuditRequest) -> Dict[str, Any]:
         with open(log_file, "w", encoding="utf-8") as out:
             out.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting E2E audit run: {run_id}\n")
             out.write(f"Command: {' '.join(cmd)}\n")
-            out.write(f"Backend: {req.backend} | Threshold: {req.detector_threshold}\n\n")
+            out.write(f"Backend: server_gpu | Threshold: {req.detector_threshold}\n\n")
             out.flush()
 
             env = dict(os.environ)
@@ -446,7 +406,7 @@ def submit_audit(req: AuditRequest) -> Dict[str, Any]:
     return {
         "status": "started",
         "run_id": run_id,
-        "backend": req.backend,
+        "backend": "server_gpu",
         "detector_threshold": req.detector_threshold,
         "run_dir": str(run_dir),
     }
@@ -513,8 +473,6 @@ def list_runs() -> List[Dict[str, Any]]:
             if not is_actively_running:
                 if has_report or (manifest and manifest.get("completed_at")):
                     run_info["status"] = "completed"
-                elif manifest and manifest.get("status") == "awaiting_kaggle":
-                    run_info["status"] = "awaiting_kaggle"
                 elif manifest and manifest.get("status") == "failed":
                     run_info["status"] = "failed"
                 else:
@@ -605,18 +563,10 @@ def get_run_detail(run_id: str) -> Dict[str, Any]:
     if not is_actively_running:
         if has_report or manifest.get("completed_at"):
             status = "completed"
-            is_awaiting_kaggle = False
-        elif manifest.get("status") == "awaiting_kaggle":
-            status = "awaiting_kaggle"
-            is_awaiting_kaggle = True
         elif manifest.get("status") == "failed":
             status = "failed"
-            is_awaiting_kaggle = False
         else:
             status = "completed"
-            is_awaiting_kaggle = False
-    else:
-        is_awaiting_kaggle = False
 
     diff_text = fixer.get("diff", "")
     if not diff_text and original_code and fixed_code and original_code != fixed_code:
@@ -640,7 +590,6 @@ def get_run_detail(run_id: str) -> Dict[str, Any]:
     return {
         "run_id": run_id,
         "status": status,
-        "is_awaiting_kaggle": is_awaiting_kaggle,
         "manifest": manifest,
         "contract_name": contract_name,
         "original_code": original_code,
@@ -657,13 +606,13 @@ def get_run_detail(run_id: str) -> Dict[str, Any]:
             "phase0_input": phase0 if phase0 else bool(phase0),
             "phase1a_static": static,
             "phase1b_rag": rag,
-            "phase1c_llm": {"status": "pending" if is_awaiting_kaggle else "ok"},
+            "phase1c_llm": {"status": "ok"},
             "phase1_fused": fused,
             "phase2_advisor": advisor,
             "phase3_assessor": assessor,
             "phase4_fixer": fixer,
             "phase5_verification": verifier,
-            "phase6_report": (bool(report_data) or has_report) and not is_awaiting_kaggle,
+            "phase6_report": bool(report_data) or has_report,
         },
         "findings": fused.get("findings", []),
         "patch_outcomes": fixer.get("patch_outcomes", []),
@@ -716,7 +665,7 @@ def get_run_logs(run_id: str) -> Dict[str, Any]:
             return False
         data = read_json_safe(p)
         if isinstance(data, dict):
-            if data.get("status") in {"pending", "awaiting_kaggle"}:
+            if data.get("status") == "pending":
                 return False
             if "overall_verdict" in data and "pending" in str(data.get("overall_verdict", "")).lower():
                 return False

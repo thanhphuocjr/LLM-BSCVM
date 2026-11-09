@@ -6,6 +6,10 @@ import time
 from typing import Any, Callable
 
 
+# Nhiệm vụ: chạy một thành phần (vd run_static, run_rag), đo thời gian (elapsed_ms); nếu có exception
+# thì trả về dict status="error" kèm thông báo lỗi thay vì ném lỗi ra ngoài.
+# Mục đích: một kênh hỏng (Slither lỗi, KB thiếu...) không làm sập cả pipeline; fusion thấy status=error
+# sẽ kết luận "Inconclusive" (fail-closed) thay vì "Safe".
 def safe_run(component: str, action: Callable[[], dict[str, Any]]) -> dict[str, Any]:
     started = time.perf_counter()
     try:

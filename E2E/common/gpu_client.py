@@ -24,6 +24,9 @@ DEFAULT_SERVER_GPU_URL = "http://100.122.153.35:6868"
 DEFAULT_TEMPERATURE = 0.2
 
 
+# Nhiệm vụ: đọc file .env ở thư mục gốc và đưa biến vào os.environ (không cần thư viện python-dotenv).
+# override=False: biến có sẵn trong môi trường được ưu tiên; override=True: .env thắng.
+# Mục đích: lấy SERVER_GPU_URL / SERVER_GPU_API_KEY để biết GPU server ở đâu.
 def load_env_file(path: Path = PROJECT_ROOT / ".env", *, override: bool = False) -> None:
     """Populate os.environ from .env (no python-dotenv dependency).
 
@@ -43,6 +46,7 @@ def load_env_file(path: Path = PROJECT_ROOT / ".env", *, override: bool = False)
             os.environ[key] = value
 
 
+# Trả về URL GPU server: tham số truyền vào > SERVER_GPU_URL trong .env > DEFAULT_SERVER_GPU_URL.
 def get_server_url(server_url: str | None = None) -> str:
     if server_url:
         return server_url.rstrip("/")
@@ -50,6 +54,7 @@ def get_server_url(server_url: str | None = None) -> str:
     return os.environ.get("SERVER_GPU_URL", DEFAULT_SERVER_GPU_URL).rstrip("/")
 
 
+# Tạo header X-API-Key nếu có SERVER_GPU_API_KEY (bí mật dùng chung giữa máy local và server).
 def _auth_headers() -> dict[str, str]:
     """Optional shared secret for the GPU server (set SERVER_GPU_API_KEY on both sides)."""
     load_env_file(override=True)
@@ -57,6 +62,7 @@ def _auth_headers() -> dict[str, str]:
     return {"X-API-Key": api_key} if api_key else {}
 
 
+# Gửi POST JSON tới một URL (kèm header xác thực) và parse JSON trả về. Hàm HTTP cấp thấp.
 def _post_json(url: str, payload: dict[str, Any], timeout: int = 60) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -68,6 +74,8 @@ def _post_json(url: str, payload: dict[str, Any], timeout: int = 60) -> dict[str
         return json.loads(resp.read().decode("utf-8"))
 
 
+# Nhiệm vụ: gọi GET /api/v1/health của GPU server; lỗi kết nối thì trả {"status": "offline", ...}.
+# Mục đích: web app hiển thị trạng thái server; batch tự chờ server sống lại trước khi chạy tiếp.
 def check_server_health(server_url: str | None = None, timeout: int = 3) -> dict[str, Any]:
     """Kiểm tra xem API server v13 trên GPU server có sẵn sàng hay không."""
     actual_url = get_server_url(server_url)
@@ -80,6 +88,8 @@ def check_server_health(server_url: str | None = None, timeout: int = 3) -> dict
         return {"status": "offline", "error": str(exc), "url": url}
 
 
+# [Phase 1C / Phase 5] Gửi mã một hàm tới /api/v1/detect -> server trả P(vulnerable) và verdict
+# theo ngưỡng. Gửi code gốc (không tiền xử lý) để giống hệt lúc train (train-serve consistency).
 def detect_via_server(
     code: str,
     threshold: float = DEFAULT_DETECTOR_THRESHOLD,
@@ -93,6 +103,7 @@ def detect_via_server(
     return _post_json(url, payload, timeout=timeout)
 
 
+# Gửi prompt tới /api/v1/generate (model instruct, tắt LoRA) và trả về chuỗi trả lời.
 def generate_via_server(
     prompt: str,
     system_prompt: str = "",
@@ -114,6 +125,10 @@ def generate_via_server(
     return str(res.get("response", "")).strip()
 
 
+# Nhiệm vụ: lấy JSON từ câu trả lời của LLM một cách "chịu lỗi": bỏ ```json fence -> parse thẳng ->
+# cắt từ { đầu tới } cuối -> thay xuống dòng thô bằng \n -> cuối cùng dùng regex vớt từng khoá quan trọng
+# (fixed_code, root_cause, cvss_vector...).
+# Mục đích: model 14B hay trả JSON sai cú pháp; hàm này giúp Advisor/Assessor/Fixer vẫn dùng được kết quả.
 def extract_json(text: str) -> Any:
     """Robust, best-effort JSON extraction from an LLM response.
     
@@ -196,9 +211,12 @@ def extract_json(text: str) -> Any:
     raise json.JSONDecodeError("Failed to extract valid JSON from LLM response", text, 0)
 
 
+# Client LLM dùng chung cho các agent (Advisor, Assessor, Fixer): bọc endpoint /api/v1/generate.
+# Mục đích: các agent chỉ cần gọi .generate()/.generate_json(), không cần biết chi tiết HTTP.
 class ServerGPUClient:
     """Generative client backed by the dedicated GPU Server running v13 FastAPI."""
 
+    # Đọc cấu hình: base_url (SERVER_GPU_URL), tên model, temperature (SERVER_GPU_TEMPERATURE, mặc định 0.2), timeout.
     def __init__(
         self,
         base_url: str | None = None,
@@ -218,6 +236,7 @@ class ServerGPUClient:
         )
         self.timeout = timeout
 
+    # Header Content-Type JSON + X-API-Key (nếu có).
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         api_key = os.environ.get("SERVER_GPU_API_KEY", "").strip()
@@ -225,6 +244,7 @@ class ServerGPUClient:
             headers["X-API-Key"] = api_key
         return headers
 
+    # Gửi prompt + system prompt tới GPU server, trả về văn bản. Lỗi mạng -> ConnectionError có thông báo rõ.
     def generate(
         self,
         prompt: str,
@@ -257,6 +277,7 @@ class ServerGPUClient:
                 f"Vui lòng đảm bảo dịch vụ trên server đã được khởi chạy."
             ) from exc
 
+    # Như generate nhưng parse câu trả lời thành JSON bằng extract_json (agent cần output có cấu trúc).
     def generate_json(
         self,
         prompt: str,

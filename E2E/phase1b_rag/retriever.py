@@ -17,6 +17,7 @@ from E2E.phase1b_rag.swc_agents import (
 )
 
 
+# Kẹp giá trị vào đoạn [0, 1].
 def _clamp(value: float) -> float:
     return max(0.0, min(1.0, value))
 
@@ -27,6 +28,8 @@ CANDIDATE_CONFIDENCE_CAP = 0.59
 MIN_EXACT_MATCH_LENGTH_RATIO = 0.8
 
 
+# Kiểm tra đoạn mã cần xét gần như TRÙNG KHỚP một hàm lỗi đã biết trong KB: cả hai >= 80 ký tự, cái này chứa cái kia
+# và độ dài chênh lệch không quá 20%. Mục đích: tránh hàm getter ngắn "khớp" với rất nhiều ca trong KB.
 def _is_exact_code_match(known_code: str, query_code: str) -> bool:
     known = re.sub(r"\s+", " ", known_code).strip()
     query = re.sub(r"\s+", " ", query_code).strip()
@@ -37,9 +40,13 @@ def _is_exact_code_match(known_code: str, query_code: str) -> bool:
     return min(len(known), len(query)) / max(len(known), len(query)) >= MIN_EXACT_MATCH_LENGTH_RATIO
 
 
+# Bộ truy hồi RAG chạy local: TF-IDF (char 3-5 gram) trên 11,869 ca lỗ hổng + 37 SWC agent làm "cổng" tín hiệu.
+# Kết luận lỗ hổng chỉ khi có tín hiệu mã tất định (regex của agent) hoặc trùng khớp gần như y hệt một ca đã biết.
 class LocalRAGRetriever:
     """TF-IDF retrieval over SWC guidance and empirical vulnerability cases, gated by deterministic code signals."""
 
+    # Nạp các artifact đã build sẵn trong data/knowledge_base/built/: swc_registry.json, vectorizer TF-IDF,
+    # ma trận TF-IDF, knowledge_items.json; dựng 37 SWC agent; lập chỉ mục SWC -> các dòng trong ma trận.
     def __init__(self, store_dir: str | Path = KNOWLEDGE_BASE_DIR) -> None:
         self.store_dir = Path(store_dir)
         self.registry_path = self.store_dir / "swc_registry.json"
@@ -63,6 +70,8 @@ class LocalRAGRetriever:
             if swc_id:
                 self.swc_to_indices[swc_id].append(idx)
 
+    # Lấy top-k ca trong KB giống đoạn mã nhất (cosine similarity TF-IDF), kèm root cause, cách sửa, mã lỗi/mã đã sửa.
+    # Mục đích: cung cấp ví dụ thực tế cho Advisor/Fixer (không dùng để kết luận lỗi).
     def retrieve_context(self, code: str, top_k: int = 5) -> list[dict[str, Any]]:
         query = self.vectorizer.transform([code])
         similarities = cosine_similarity(query, self.matrix)[0]
@@ -91,6 +100,13 @@ class LocalRAGRetriever:
             )
         return results
 
+    # [CỐT LÕI RAG] Với mỗi SWC agent:
+    #   - tìm tín hiệu regex (find_signal_hits) + ca giống nhất cùng SWC (semantic_score) + có trùng khớp chính xác không;
+    #   - không có tín hiệu, similarity < 0.28 và không trùng khớp -> bỏ qua;
+    #   - confidence: trùng khớp = 0.95; có tín hiệu = 0.55*độ mạnh tín hiệu + 0.45*similarity;
+    #     chỉ có similarity thì bị chặn <= 0.59 nếu similarity < 0.60 (similarity đơn thuần chỉ đúng ~51%).
+    #   - vulnerable khi confidence >= 0.60, ngược lại là candidate.
+    # Trả về finding sắp theo mức rủi ro + confidence, verdict, risk_level, final_score.
     def analyze(self, code: str, max_findings: int = 10) -> dict[str, Any]:
         query = self.vectorizer.transform([code])
         similarities = cosine_similarity(query, self.matrix)[0]

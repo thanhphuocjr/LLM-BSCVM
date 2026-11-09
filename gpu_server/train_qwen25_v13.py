@@ -163,6 +163,7 @@ INSTRUCTION_PROMPT = (
 )
 
 
+# In banner cấu hình phiên huấn luyện v13 (model, MAX_LEN, LoRA, loss, trọng số nguồn...).
 def print_banner():
     """In banner thông tin đầu phiên train v13 Quality-First."""
     sep = "═" * 74
@@ -197,6 +198,7 @@ def print_banner():
 # 1. TÌM VÀ NẠP DATASET
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Tìm file dataset final-dataset-v12-train.json (cùng thư mục script -> data/ -> các đường dẫn khác).
 def find_data():
     """Tìm dataset: ưu tiên cùng thư mục script -> data/ -> các path khác."""
     candidates = [
@@ -218,6 +220,7 @@ def find_data():
     )
 
 
+# Nạp 100% dataset (không cắt giảm), chuẩn hoá nhãn Safe/Vulnerable -> 0/1, nguồn dữ liệu, dòng lỗi.
 def load_data(data_path):
     """Nạp và chuẩn hóa 100% dữ liệu (không cắt giảm)."""
     logger.info(f"Đang nạp dataset: {data_path}")
@@ -250,6 +253,7 @@ def load_data(data_path):
     return rows
 
 
+# Chia train/val/test theo trường "split" có sẵn trong dataset (không chia ngẫu nhiên lại -> tránh rò rỉ giữa các tập).
 def split_data(rows):
     """Phân chia theo trường split có sẵn trong dataset."""
     splits = {"train": [], "val": [], "test": []}
@@ -287,6 +291,8 @@ def split_data(rows):
 # 2. INSTRUCTION-AWARE TOKENIZATION & DATASET WRAPPER
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Tạo văn bản đầu vào = INSTRUCTION_PROMPT + mã hàm. KHÔNG chứa nhãn hay gợi ý lỗi.
+# Server khi suy luận (serve_v13_api.detect_vulnerability) dùng ĐÚNG định dạng này -> train/serve nhất quán.
 def build_model_input(row):
     """
     Xây dựng input text cho Qwen2.5-Coder-14B-Instruct:
@@ -297,6 +303,8 @@ def build_model_input(row):
     return f"{INSTRUCTION_PROMPT}{code}"
 
 
+# Tính trọng số mẫu cho WeightedRandomSampler: cân bằng lớp (luỹ thừa 0.7) x trọng số nguồn
+# (DAppSCAN 2.5, iAudit 1.5, Kaggle 0.8) -> ưu tiên dữ liệu thật, khó.
 def build_class_label_weights(items):
     """Tính sample weights cho Class-Balanced Sampler (kết hợp Source-Aware Weighting)."""
     labels = [ID2LABEL[r["label"]] for r in items]
@@ -325,6 +333,8 @@ def build_class_label_weights(items):
     return weights
 
 
+# Dataset PyTorch: tokenize (MAX_LEN 1024, có offset), và với mẫu Vulnerable có "vulnerable_lines" thì tạo nhãn
+# cấp token (1 = token nằm trên dòng lỗi) để huấn luyện line_head định vị dòng lỗi; kèm trọng số nguồn mỗi mẫu.
 class VulnDatasetV13(torch.utils.data.Dataset):
     """
     Dataset wrapper v13 cho Qwen2.5-Coder:
@@ -333,6 +343,7 @@ class VulnDatasetV13(torch.utils.data.Dataset):
     - Per-sample source weight
     """
 
+    # Tokenize toàn bộ mẫu và dựng nhãn dòng lỗi cấp token (mask M=1 cho mẫu có giám sát dòng).
     def __init__(self, items, tokenizer, sample_weights=None, max_length=MAX_LEN):
         self.items = items
         self.texts = [build_model_input(r) for r in items]
@@ -398,9 +409,11 @@ class VulnDatasetV13(torch.utils.data.Dataset):
 
         logger.info(f"  -> Số mẫu có giám sát dòng lỗi (Mask M=1): {sup_count} / {len(items)}")
 
+    # Số mẫu.
     def __len__(self):
         return len(self.labels)
 
+    # Trả một mẫu: input_ids, attention_mask, nhãn lớp, nhãn dòng, cờ có giám sát dòng, trọng số nguồn.
     def __getitem__(self, idx):
         return {
             "input_ids": self.enc["input_ids"][idx],
@@ -412,12 +425,15 @@ class VulnDatasetV13(torch.utils.data.Dataset):
         }
 
 
+# Gom batch: pad input_ids / attention_mask / line_labels cùng độ dài.
 class VulnDataCollatorV13:
     """Collator động v13: Pad input_ids, attention_mask và line_labels đồng bộ."""
 
+    # Lưu tokenizer (để biết pad_token_id).
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
 
+    # Pad và ghép các mẫu thành tensor batch.
     def __call__(self, features):
         labels = [f["labels"] for f in features]
         has_sup = [f["has_line_supervision"] for f in features]
@@ -449,6 +465,8 @@ class VulnDataCollatorV13:
 # 3. FOCAL LOSS & DECOUPLED DUAL-HEAD ARCHITECTURE
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Focal Loss (Lin et al., 2017): FL = -(1 - p_t)^gamma * log(p_t), gamma = 2.0 -> giảm ảnh hưởng của mẫu dễ
+# (vd mẫu tổng hợp Kaggle), tập trung vào mẫu khó (DAppSCAN). Có label smoothing.
 class FocalLoss(nn.Module):
     """
     Focal Loss (Lin et al., 2017) cho Binary/Multi-class Classification:
@@ -457,12 +475,14 @@ class FocalLoss(nn.Module):
     Mẫu khó (như DAppSCAN) p_t -> 0.5 sẽ giữ nguyên lực cập nhật gradient.
     """
 
+    # Lưu gamma và label_smoothing.
     def __init__(self, gamma=2.0, label_smoothing=0.01, reduction="none"):
         super().__init__()
         self.gamma = gamma
         self.label_smoothing = label_smoothing
         self.reduction = reduction
 
+    # Tính focal loss cho từng mẫu (chưa lấy trung bình, để nhân trọng số nguồn).
     def forward(self, logits, targets):
         ce_loss = nn.functional.cross_entropy(
             logits,
@@ -481,6 +501,8 @@ class FocalLoss(nn.Module):
         return loss
 
 
+# Tạo line_head = Linear(5120, 1) độc lập và gắn forward hook vào score_head để lấy hidden state cuối
+# (không cần output_hidden_states=True -> tiết kiệm ~490 MB VRAM).
 def setup_line_head(model):
     """Khởi tạo và gán line_head độc lập (nn.Linear(hidden_dim, 1)) vào model."""
     score_head = None
@@ -516,9 +538,12 @@ def setup_line_head(model):
 
     # Đăng ký Forward Hook trên score_head để lấy trực tiếp last_hidden_state
     # TUYỆT ĐỐI KHÔNG CẦN output_hidden_states=True -> Tiết kiệm ngay ~490 MB VRAM!
+    # Hook lưu đầu vào của score_head (= hidden state lớp cuối) cho line_head dùng.
     class LastHiddenHolder:
+        # Khởi tạo chỗ lưu hidden state.
         def __init__(self):
             self.val = None
+        # Hàm hook: lưu tensor đầu vào của score_head.
         def __call__(self, module, inp, out):
             if isinstance(inp, tuple) and len(inp) > 0:
                 self.val = inp[0]
@@ -539,6 +564,8 @@ def setup_line_head(model):
 # 4. MODEL LOADING & QLORA (MULTI-GPU 32GB VRAM)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Nạp Qwen2.5-Coder-14B-Instruct dạng AutoModelForSequenceClassification (2 lớp), lượng tử 4-bit NF4 (QLoRA),
+# FlashAttention-2, chia layer qua 2 GPU; gắn LoRA r=64, alpha=128 lên 7 projection; gradient checkpointing; line_head.
 def load_model_and_tokenizer():
     """
     Nạp Qwen2.5-Coder-14B-Instruct:
@@ -651,12 +678,14 @@ def load_model_and_tokenizer():
 # 5. CUSTOM TRAINER V13 VỚI FOCAL LOSS & DUAL-HEAD LINE GUIDANCE
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Lấy mảng logits từ output dự đoán của Trainer.
 def logits_from_predictions(predictions):
     if isinstance(predictions, tuple):
         predictions = predictions[0]
     return np.asarray(predictions)
 
 
+# Softmax ổn định số -> P(vulnerable).
 def probs_from_logits(logits):
     logits = np.asarray(logits)
     logits = logits - logits.max(axis=-1, keepdims=True)
@@ -664,6 +693,7 @@ def probs_from_logits(logits):
     return exp[:, 1] / exp.sum(axis=-1)
 
 
+# Chỉ số chuẩn của luận văn: accuracy + precision/recall/F1 macro.
 def paper_metrics(labels, pred):
     """Metrics chuẩn: macro-averaged precision, recall, F1."""
     precision, recall, f1, _ = precision_recall_fscore_support(
@@ -677,6 +707,7 @@ def paper_metrics(labels, pred):
     }
 
 
+# Chỉ số mỗi lần đánh giá trong lúc train (accuracy, precision, recall, f1_macro, f1_vuln) - dùng chọn checkpoint tốt nhất.
 def compute_metrics(eval_pred):
     logits = logits_from_predictions(eval_pred.predictions)
     labels = eval_pred.label_ids
@@ -691,34 +722,42 @@ def compute_metrics(eval_pred):
     }
 
 
+# Callback giải phóng bộ nhớ CUDA quanh mỗi lần đánh giá / cuối epoch (chống phân mảnh VRAM).
 class ClearCacheCallback(transformers.TrainerCallback):
     """Giải phóng bộ nhớ đệm CUDA trước và sau khi đánh giá để chống phân mảnh VRAM."""
 
+    # Dọn cache CUDA khi đánh giá.
     def on_evaluate(self, args, state, control, **kwargs):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    # Dọn cache CUDA cuối mỗi epoch.
     def on_epoch_end(self, args, state, control, **kwargs):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
 
+# Trainer tuỳ biến: Loss tổng = FocalLoss phân loại x trọng số nguồn + 0.20 x loss line_head (chỉ trên mẫu có nhãn dòng);
+# dùng sampler cân bằng lớp.
 class MaskedLineGuidanceTrainerV13(Trainer):
     """
     Custom Trainer v13:
       Total Loss = Loss_cls (Focal Loss x Source Weight) + AUX_LINE_WEIGHT * Loss_line_head
     """
 
+    # Tạo hàm FocalLoss (gamma, label smoothing).
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.focal_loss_fn = FocalLoss(gamma=FOCAL_GAMMA, label_smoothing=LABEL_SMOOTHING)
 
+    # Gọi sampler mặc định của Trainer (tương thích nhiều phiên bản transformers).
     def _default_train_sampler(self, train_dataset=None):
         method = super()._get_train_sampler
         if len(inspect.signature(method).parameters) == 0:
             return method()
         return method(train_dataset)
 
+    # Dùng WeightedRandomSampler theo sample_weights (cân bằng lớp + nguồn), seed cố định.
     def _get_train_sampler(self, train_dataset=None):
         dataset = train_dataset if train_dataset is not None else self.train_dataset
         if not USE_CLASS_BALANCED_SAMPLER:
@@ -734,6 +773,8 @@ class MaskedLineGuidanceTrainerV13(Trainer):
             generator=generator,
         )
 
+    # Tính loss: forward -> focal loss từng mẫu x trọng số nguồn -> trung bình; khi train và có nhãn dòng thì cộng
+    # loss BCE của line_head trên các token (có mask).
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         line_labels = inputs.pop("line_labels", None)
         has_line_supervision = inputs.pop("has_line_supervision", None)
@@ -808,6 +849,7 @@ class MaskedLineGuidanceTrainerV13(Trainer):
             return (total_loss, clean_output)
         return total_loss
 
+    # Khi đánh giá: bỏ các trường phụ (line_labels, source_weight) rồi dùng prediction_step chuẩn, chỉ trả logits phân loại.
     def prediction_step(
         self,
         model: nn.Module,
@@ -831,6 +873,8 @@ class MaskedLineGuidanceTrainerV13(Trainer):
         return loss, logits, labels
 
 
+# TrainingArguments: 10 epoch, lr 2e-5, batch 1 x grad_accum 16, warmup 8%, bf16, đánh giá/lưu mỗi epoch,
+# chọn checkpoint tốt nhất theo F1, early stopping (patience 5).
 def build_training_args():
     """Xây dựng TrainingArguments tối ưu v13."""
     kwargs = {
@@ -896,11 +940,14 @@ def build_training_args():
 # 6. THRESHOLD TUNING & SMOKE TESTS
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Chỉ số khi phân loại bằng một ngưỡng xác suất cho trước.
 def metrics_at_threshold(labels, probs, threshold):
     pred = (probs >= threshold).astype(int)
     return paper_metrics(labels, pred)
 
 
+# Dò ngưỡng tốt nhất trên tập VALIDATION (0.05 -> 0.95, bước 0.005) theo F1 -> ra best_threshold (0.70) ghi vào
+# threshold_config.json. Dò trên val (không phải test) để không rò rỉ thông tin tập test.
 def tune_threshold(labels, probs, thresholds=THRESHOLD_GRID, objective=THRESHOLD_OBJECTIVE):
     results = []
     for th in thresholds:
@@ -976,9 +1023,12 @@ SMOKE_TESTS = [
 ]
 
 
+# Chạy 7 ca kiểm thử nhanh (reentrancy, unchecked call, thiếu phân quyền, tx.origin... và 2 ca an toàn) để kiểm tra
+# model sau train có hành xử hợp lý.
 def run_smoke_tests(model, tokenizer, threshold):
     model.eval()
 
+    # Dự đoán một đoạn mã: (nhãn, P(vulnerable)).
     @torch.no_grad()
     def predict(code_text):
         input_text = f"{INSTRUCTION_PROMPT}{code_text.strip()}"
@@ -1021,6 +1071,9 @@ def run_smoke_tests(model, tokenizer, threshold):
 # MAIN PIPELINE V13 QUALITY FIRST
 # ══════════════════════════════════════════════════════════════════════════════
 
+# [QUY TRÌNH HUẤN LUYỆN] 1) nạp dữ liệu -> 2) nạp model + tokenizer -> 3) dựng dataset train/val/test ->
+# 4) train với MaskedLineGuidanceTrainerV13 -> 5) dò ngưỡng trên val -> 6) đánh giá trên test (tổng, theo nguồn,
+# riêng contract thực tế) -> 7) smoke test -> 8) lưu adapter + line_head.pt + threshold_config.json.
 def main():
     start_time = time.time()
     print_banner()

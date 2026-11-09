@@ -13,6 +13,10 @@ import re
 from E2E.phase0_parsing.code_units import CodeUnit
 
 
+# Nhiệm vụ: trích "bất biến" của hàm gốc bằng regex: biến bị ghi (=, +=, ...), event được phát,
+# lời gọi chuyển ETH / call ra ngoài, biểu thức return.
+# Mục đích: đưa vào prompt Fixer ("không được làm mất những thứ này") và để kiểm tra bản vá
+# không xoá mất hành vi quan trọng của hàm.
 def extract_function_invariants(func_code: str) -> dict[str, list[str]]:
     """Tự động trích xuất các bất biến logic từ mã nguồn hàm gốc (Task B3, B4, D3).
     
@@ -66,6 +70,10 @@ def extract_function_invariants(func_code: str) -> dict[str, list[str]]:
     return invariants
 
 
+# Nhiệm vụ: dựng đoạn ngữ cảnh ngắn quanh hàm đang xét: biến trạng thái, modifier kèm thân,
+# khai báo event, và bất biến của hàm (extract_function_invariants); cắt theo ngân sách ~1500 token.
+# Mục đích: thay cho việc dán cả contract vào prompt (vượt giới hạn 4096 token của server)
+# mà Advisor/Fixer vẫn biết hàm dùng biến/modifier nào.
 def build_contract_context(
     unit: CodeUnit | dict,
     source_code: str,

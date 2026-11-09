@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 # Kiểu dữ liệu nội bộ
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Một lần khớp pattern: dòng, cột, đoạn text khớp, ngữ cảnh xung quanh và trọng số đóng góp vào điểm.
 @dataclass
 class PatternMatch:
     """Kết quả một lần khớp pattern."""
@@ -44,6 +45,8 @@ class PatternMatch:
     pattern_weight: float # trọng số đóng góp vào score
 
 
+# Kết quả cho MỘT loại lỗ hổng (vd reentrancy, SWC-107): danh sách các lần khớp, mức rủi ro,
+# trọng số loại, đã được xác nhận (confirmed) hay chưa, ghi chú theo dòng.
 @dataclass
 class VulnerabilityFinding:
     """Kết quả phát hiện một loại lỗ hổng."""
@@ -55,17 +58,20 @@ class VulnerabilityFinding:
     confirmed: bool = False   # True nếu context-check xác nhận thêm
     notes: List[str] = field(default_factory=list)
 
+    # Điểm thô = tổng trọng số các lần khớp, chặn trần 1.0.
     @property
     def raw_score(self) -> float:
         if not self.matches:
             return 0.0
         return min(1.0, sum(m.pattern_weight for m in self.matches))
 
+    # Điểm có trọng số = raw_score * type_weight (để cộng dồn thành static_score của cả contract).
     @property
     def weighted_score(self) -> float:
         return self.raw_score * self.type_weight
 
 
+# Ranh giới một hàm (tên, tham số, header, vị trí bắt đầu/thân/kết thúc) - dùng cho các kiểm tra ngữ nghĩa.
 @dataclass(frozen=True)
 class SolidityFunction:
     """Lightweight function boundary used by semantic checks."""
@@ -78,6 +84,7 @@ class SolidityFunction:
     end: int
 
 
+# Ranh giới một contract (tên, header kế thừa, vị trí thân) - dùng cho kiểm tra cấp contract.
 @dataclass(frozen=True)
 class SolidityContract:
     """Lightweight contract boundary used by contract-level checks."""
@@ -89,6 +96,7 @@ class SolidityContract:
     end: int
 
 
+# Ranh giới một modifier kèm thân - dùng để nhận diện modifier bảo vệ quyền truy cập.
 @dataclass(frozen=True)
 class SolidityModifier:
     """Lightweight modifier boundary used by access-control checks."""
@@ -796,6 +804,7 @@ VULNERABILITY_REGISTRY: List[Dict] = [
 # Utility helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Đổi vị trí ký tự thành (dòng, cột).
 def _get_line_col(code: str, pos: int) -> Tuple[int, int]:
     """Trả về (line, column) từ vị trí character trong chuỗi."""
     prefix = code[:pos]
@@ -804,6 +813,7 @@ def _get_line_col(code: str, pos: int) -> Tuple[int, int]:
     return line, col
 
 
+# Cắt ~120 ký tự quanh vị trí khớp để làm bằng chứng (evidence) hiển thị trong báo cáo.
 def _extract_context(code: str, pos: int, window: int = 120) -> str:
     """Trích đoạn code xung quanh vị trí pos."""
     start = max(0, pos - window)
@@ -812,6 +822,7 @@ def _extract_context(code: str, pos: int, window: int = 120) -> str:
     return snippet.replace('\n', ' ').strip()
 
 
+# Che comment bằng dấu cách (giữ nguyên offset/dòng) để regex không khớp nhầm vào comment.
 def _strip_comments(code: str) -> str:
     """Mask comments while preserving source offsets and line numbers."""
     return re.sub(
@@ -821,6 +832,7 @@ def _strip_comments(code: str) -> str:
     )
 
 
+# Che chuỗi '...'/"..." bằng dấu cách (giữ nguyên offset/dòng).
 def _strip_strings(code: str) -> str:
     """Mask string literals while preserving source offsets and line numbers."""
     code = re.sub(
@@ -835,16 +847,19 @@ def _strip_strings(code: str) -> str:
     )
 
 
+# Thay mọi ký tự (trừ xuống dòng) bằng dấu cách - nền tảng cho 2 hàm che ở trên.
 def _mask_text(value: str) -> str:
     """Replace non-newline characters with spaces so offsets stay stable."""
     return "".join("\n" if char == "\n" else " " for char in value)
 
 
+# Che cả comment lẫn chuỗi -> mã "sạch" để các regex luật chạy trên đó.
 def _clean_code(code: str) -> str:
     """Return Solidity code with comments and strings masked."""
     return _strip_comments(_strip_strings(code))
 
 
+# Tìm vị trí ngoặc đóng khớp với ngoặc mở tại open_pos ({}, (), ...).
 def _balanced_end(
     code: str,
     open_pos: int,
@@ -866,6 +881,7 @@ def _balanced_end(
     return None
 
 
+# Duyệt mọi hàm có thân (function/constructor/receive/fallback) mà không cần compiler.
 def _iter_functions(code: str) -> Iterator[SolidityFunction]:
     """Yield implemented functions without requiring a Solidity compiler."""
     clean = _clean_code(code)
@@ -899,6 +915,7 @@ def _iter_functions(code: str) -> Iterator[SolidityFunction]:
     yield from sorted(functions, key=lambda item: item.start)
 
 
+# Duyệt mọi contract (ranh giới thân) để chạy các kiểm tra cấp contract.
 def _iter_contracts(code: str) -> Iterator[SolidityContract]:
     """Yield concrete contract boundaries for contract-level checks."""
     clean = _clean_code(code)
@@ -921,6 +938,7 @@ def _iter_contracts(code: str) -> Iterator[SolidityContract]:
         )
 
 
+# Duyệt mọi modifier kèm thân của nó.
 def _iter_modifiers(code: str) -> Iterator[SolidityModifier]:
     """Yield modifier boundaries without requiring a Solidity compiler."""
     clean = _clean_code(code)
@@ -944,6 +962,9 @@ def _iter_modifiers(code: str) -> Iterator[SolidityModifier]:
         )
 
 
+# Nhiệm vụ: tìm tên các modifier có chức năng phân quyền: tên kiểu onlyXxx/auth/restricted, HOẶC thân modifier
+# có require(msg.sender == ...), if (msg.sender != ...) revert, require(owners[msg.sender]) ...
+# Mục đích: hàm có guard modifier thì không bị báo lỗi access control / withdraw / selfdestruct (giảm false positive).
 def extract_guard_modifiers(code: str) -> set[str]:
     """
     Trích xuất tên các modifier có chức năng bảo vệ truy cập (guard modifier).
@@ -976,6 +997,8 @@ def extract_guard_modifiers(code: str) -> set[str]:
     return guards
 
 
+# Nhiệm vụ: xác định một hàm đã được bảo vệ quyền truy cập chưa: private/internal, có guard modifier trong header,
+# hoặc trong thân có kiểm tra msg.sender. Dùng để bỏ qua các match SWC-101/105/106 trong hàm đã được bảo vệ.
 def is_function_guarded(
     header: str,
     body: str,
@@ -1014,6 +1037,7 @@ def is_function_guarded(
     return False
 
 
+# Tách danh sách đối số theo dấu phẩy ở mức ngoài cùng (không cắt trong ngoặc/chuỗi lồng nhau).
 def _split_top_level_arguments(value: str) -> List[str]:
     """Split a Solidity argument list while respecting nested expressions."""
     arguments: List[str] = []
@@ -1047,6 +1071,7 @@ def _split_top_level_arguments(value: str) -> List[str]:
     return arguments
 
 
+# Thu thập ánh xạ đơn giản tên biến -> kiểu (để các kiểm tra biết biến là address, bytes, mảng...).
 def _collect_symbol_types(code: str) -> Dict[str, str]:
     """Collect simple variable-to-type bindings used by focused checks."""
     clean = _clean_code(code)
@@ -1069,6 +1094,7 @@ def _collect_symbol_types(code: str) -> Dict[str, str]:
     return bindings
 
 
+# Đối số có phải kiểu động (string, bytes, mảng) không - dùng cho kiểm tra va chạm abi.encodePacked.
 def _is_dynamic_abi_argument(argument: str, symbol_types: Dict[str, str]) -> bool:
     value = argument.strip()
     if not value:
@@ -1084,6 +1110,7 @@ def _is_dynamic_abi_argument(argument: str, symbol_types: Dict[str, str]) -> boo
     return type_name in {"string", "bytes"} or "[]" in type_name
 
 
+# Đối tượng nhận lời gọi có vẻ là token ERC20 không (ép kiểu IERC20(...) hoặc biến kiểu ERC20).
 def _looks_like_erc20(receiver: str, symbol_types: Dict[str, str]) -> bool:
     compact = re.sub(r'\s+', '', receiver)
     cast = re.match(r'(?P<type>[A-Za-z_]\w*)\(', compact)
@@ -1093,6 +1120,7 @@ def _looks_like_erc20(receiver: str, symbol_types: Dict[str, str]) -> bool:
     return "erc20" in type_name
 
 
+# Phân tích danh sách tham số hàm -> {tên: (kiểu, vị trí dữ liệu memory/storage/calldata)}.
 def _parse_parameter_details(params: str) -> Dict[str, Tuple[str, str]]:
     """Return parameter name -> (type, data location)."""
     details: Dict[str, Tuple[str, str]] = {}
@@ -1112,6 +1140,7 @@ def _parse_parameter_details(params: str) -> Dict[str, Tuple[str, str]]:
     return details
 
 
+# Duyệt các câu lệnh kết thúc bằng ";" ở mức ngoài cùng của một contract (= khai báo biến trạng thái).
 def _contract_top_level_statements(
     code: str, contract: SolidityContract
 ) -> Iterator[Tuple[int, str]]:
@@ -1132,12 +1161,14 @@ def _contract_top_level_statements(
             statement_start = pos + 1
 
 
+# Như trên nhưng cho mọi contract trong file.
 def _top_level_contract_statements(code: str) -> Iterator[Tuple[int, str]]:
     """Yield semicolon-terminated state declarations outside nested blocks."""
     for contract in _iter_contracts(code):
         yield from _contract_top_level_statements(code, contract)
 
 
+# Biến trạng thái của một contract -> (kiểu, vị trí, có khởi tạo hay không).
 def _collect_contract_state_declarations(
     code: str, contract: SolidityContract
 ) -> Dict[str, Tuple[str, int, bool]]:
@@ -1174,6 +1205,7 @@ def _collect_contract_state_declarations(
     return result
 
 
+# Biến trạng thái (mọi contract) -> kiểu.
 def _collect_state_symbol_types(code: str) -> Dict[str, str]:
     """Collect simple top-level state variable declarations."""
     result: Dict[str, str] = {}
@@ -1189,6 +1221,7 @@ def _collect_state_symbol_types(code: str) -> Dict[str, str]:
     return result
 
 
+# Tên mapping -> kiểu giá trị (vd mapping(address => User) users -> "User").
 def _collect_mapping_value_types(code: str) -> Dict[str, str]:
     """Collect top-level mapping name -> direct value type."""
     result: Dict[str, str] = {}
@@ -1203,6 +1236,7 @@ def _collect_mapping_value_types(code: str) -> Dict[str, str]:
     return result
 
 
+# Mỗi struct -> (tập kiểu thành viên, có chứa mapping trực tiếp không).
 def _collect_struct_members(code: str) -> Dict[str, Tuple[set[str], bool]]:
     """Return struct member types and whether each struct directly has a mapping."""
     clean = _clean_code(code)
@@ -1221,6 +1255,7 @@ def _collect_struct_members(code: str) -> Dict[str, Tuple[set[str], bool]]:
     return structs
 
 
+# Đệ quy kiểm tra struct có chứa mapping (trực tiếp hoặc qua struct lồng) - dùng cho kiểm tra delete mapping.
 def _struct_contains_mapping(
     struct_name: str,
     structs: Dict[str, Tuple[set[str], bool]],
@@ -1242,6 +1277,7 @@ def _struct_contains_mapping(
     )
 
 
+# Duyệt vùng mã của các vòng lặp for/while trong một khoảng - dùng cho các kiểm tra "trong vòng lặp".
 def _iter_loop_ranges(code: str, start: int, end: int) -> Iterator[Tuple[int, int]]:
     """Yield for/while ranges inside a source interval."""
     clean = _clean_code(code)
@@ -1264,6 +1300,8 @@ def _iter_loop_ranges(code: str, start: int, end: int) -> Iterator[Tuple[int, in
                 yield match.start(), semicolon + 1
 
 
+# Đóng gói danh sách hit (vị trí, text, trọng số, mô tả) thành một VulnerabilityFinding đã confirmed.
+# Mọi hàm _detect_* bên dưới đều trả về kết quả qua hàm này.
 def _build_semantic_finding(
     code: str,
     vuln_id: str,
@@ -1294,6 +1332,7 @@ def _build_semantic_finding(
     return finding
 
 
+# [Kiểm tra ngữ nghĩa] SWC-130: ký tự Unicode điều khiển hướng chữ (RLO U+202E...) dùng để giấu mã độc.
 def _detect_bidirectional_controls(code: str) -> Optional[VulnerabilityFinding]:
     controls = {
         "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",
@@ -1314,6 +1353,7 @@ def _detect_bidirectional_controls(code: str) -> Optional[VulnerabilityFinding]:
     )
 
 
+# [Kiểm tra ngữ nghĩa] Dùng "^" (XOR) với hằng số khi có ý định lũy thừa "**" (vd 2^256). Đã che pragma ^0.x.
 def _detect_incorrect_exponentiation(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     # Mask pragma statements to avoid false positives on caret version specifiers (e.g. pragma solidity ^0.4.25;)
@@ -1343,6 +1383,7 @@ def _detect_incorrect_exponentiation(code: str) -> Optional[VulnerabilityFinding
     )
 
 
+# [Kiểm tra ngữ nghĩa] SWC-133: abi.encodePacked với >= 2 đối số động liền nhau -> va chạm hash.
 def _detect_encode_packed_collision(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     symbol_types = _collect_symbol_types(code)
@@ -1379,6 +1420,7 @@ def _detect_encode_packed_collision(code: str) -> Optional[VulnerabilityFinding]
     )
 
 
+# Duyệt các lời gọi transfer/transferFrom/approve trên đối tượng ERC20 trong từng hàm (dùng cho 2 kiểm tra dưới).
 def _iter_erc20_calls(
     code: str,
 ) -> Iterator[Tuple[SolidityFunction, re.Match, str, List[str], int]]:
@@ -1402,6 +1444,8 @@ def _iter_erc20_calls(
             yield function, match, match.group("method"), arguments, close_pos
 
 
+# [Kiểm tra ngữ nghĩa] transferFrom(from, ...) với "from" là tham số do caller truyền vào,
+# không ràng buộc với msg.sender -> ai cũng rút được token của người khác đã approve.
 def _detect_arbitrary_erc20_transfer_from(code: str) -> Optional[VulnerabilityFinding]:
     hits: List[Tuple[int, str, float, str]] = []
     for function, match, method, arguments, close_pos in _iter_erc20_calls(code):
@@ -1427,6 +1471,7 @@ def _detect_arbitrary_erc20_transfer_from(code: str) -> Optional[VulnerabilityFi
     )
 
 
+# [Kiểm tra ngữ nghĩa] Gọi token.transfer/transferFrom mà bỏ qua giá trị bool trả về.
 def _detect_unchecked_erc20_transfer(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     hits: List[Tuple[int, str, float, str]] = []
@@ -1463,6 +1508,7 @@ def _detect_unchecked_erc20_transfer(code: str) -> Optional[VulnerabilityFinding
     )
 
 
+# [Kiểm tra ngữ nghĩa] Contract nhận ETH (payable) nhưng không có cách nào rút ETH ra -> ETH bị khoá.
 def _detect_locked_ether(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     functions = list(_iter_functions(code))
@@ -1508,6 +1554,7 @@ def _detect_locked_ether(code: str) -> Optional[VulnerabilityFinding]:
     )
 
 
+# [Kiểm tra ngữ nghĩa] Dùng msg.value trong vòng lặp -> cùng một khoản ETH bị tính nhiều lần.
 def _detect_msg_value_in_loop(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     hits: List[Tuple[int, str, float, str]] = []
@@ -1542,6 +1589,7 @@ def _detect_msg_value_in_loop(code: str) -> Optional[VulnerabilityFinding]:
     )
 
 
+# [Kiểm tra ngữ nghĩa] SWC-112: hàm payable gọi delegatecall trong vòng lặp (msg.value được tái sử dụng).
 def _detect_delegatecall_in_loop(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     hits: List[Tuple[int, str, float, str]] = []
@@ -1574,6 +1622,8 @@ def _detect_delegatecall_in_loop(code: str) -> Optional[VulnerabilityFinding]:
     )
 
 
+# Tìm tham số address được ghi vào state hoặc dùng làm đích chuyển tiền mà không kiểm tra != address(0).
+# Chỉ báo khi tham số thực sự "chảy" vào state/lời gọi (giống Slither missing-zero-check), tránh báo tràn lan.
 def _missing_zero_address_hits(
     code: str,
 ) -> List[Tuple[int, str, float, str]]:
@@ -1639,6 +1689,7 @@ def _missing_zero_address_hits(
     return hits
 
 
+# [Kiểm tra ngữ nghĩa] Đóng gói kết quả _missing_zero_address_hits thành finding.
 def _detect_missing_zero_address(code: str) -> Optional[VulnerabilityFinding]:
     return _build_semantic_finding(
         code,
@@ -1650,6 +1701,7 @@ def _detect_missing_zero_address(code: str) -> Optional[VulnerabilityFinding]:
     )
 
 
+# [Kiểm tra ngữ nghĩa] Trong assembly (Yul), shl/shr bị đảo thứ tự tham số (shift là biến, value là hằng).
 def _detect_incorrect_shift_in_assembly(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     hits: List[Tuple[int, str, float, str]] = []
@@ -1681,6 +1733,7 @@ def _detect_incorrect_shift_in_assembly(code: str) -> Optional[VulnerabilityFind
     )
 
 
+# [Kiểm tra ngữ nghĩa] Gán độ dài mảng storage (arr.length = ...) bằng giá trị do người dùng điều khiển.
 def _detect_controlled_array_length(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     state_arrays = {
@@ -1730,6 +1783,7 @@ def _detect_controlled_array_length(code: str) -> Optional[VulnerabilityFinding]
     )
 
 
+# [Kiểm tra ngữ nghĩa] Truyền mảng storage vào hàm nhận tham số "memory" rồi sửa -> sửa bản sao, state không đổi.
 def _detect_array_by_reference(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     functions = list(_iter_functions(code))
@@ -1797,6 +1851,7 @@ def _detect_array_by_reference(code: str) -> Optional[VulnerabilityFinding]:
     )
 
 
+# [Kiểm tra ngữ nghĩa] Contract có cả constructor() lẫn hàm trùng tên contract (kiểu cũ) -> nhập nhằng constructor.
 def _detect_multiple_constructors(code: str) -> Optional[VulnerabilityFinding]:
     functions = list(_iter_functions(code))
     hits: List[Tuple[int, str, float, str]] = []
@@ -1826,6 +1881,7 @@ def _detect_multiple_constructors(code: str) -> Optional[VulnerabilityFinding]:
     )
 
 
+# [Kiểm tra ngữ nghĩa] Mapping public trỏ tới struct chứa mảng/struct lồng (getter tự sinh lỗi với solc cũ).
 def _detect_public_mapping_nested(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     if not re.search(r'\bpragma\s+solidity\s+[^;]*\b0\.4\.', clean):
@@ -1861,6 +1917,7 @@ def _detect_public_mapping_nested(code: str) -> Optional[VulnerabilityFinding]:
     )
 
 
+# [Kiểm tra ngữ nghĩa] delete một struct có chứa mapping -> mapping bên trong KHÔNG bị xoá.
 def _detect_mapping_deletion(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     structs = _collect_struct_members(code)
@@ -1895,6 +1952,7 @@ def _detect_mapping_deletion(code: str) -> Optional[VulnerabilityFinding]:
     )
 
 
+# Khoảng giá trị [min, max] của kiểu uintN/intN.
 def _integer_type_range(type_name: str) -> Optional[Tuple[int, int]]:
     match = re.fullmatch(r'(?P<unsigned>u?)int(?P<bits>\d*)', type_name)
     if not match:
@@ -1907,6 +1965,7 @@ def _integer_type_range(type_name: str) -> Optional[Tuple[int, int]]:
     return -(2 ** (bits - 1)), (2 ** (bits - 1)) - 1
 
 
+# Phép so sánh với hằng có luôn đúng/luôn sai theo khoảng giá trị của kiểu không.
 def _range_makes_comparison_constant(
     low: int, high: int, operator: str, constant: int
 ) -> bool:
@@ -1921,6 +1980,7 @@ def _range_makes_comparison_constant(
     return False
 
 
+# [Kiểm tra ngữ nghĩa] So sánh luôn đúng/luôn sai do kiểu (vd uint >= 0, uint8 < 300).
 def _detect_type_based_tautology(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     token = r'(?:[A-Za-z_]\w*|-?(?:0x[0-9A-Fa-f]+|\d+))'
@@ -1973,6 +2033,7 @@ def _detect_type_based_tautology(code: str) -> Optional[VulnerabilityFinding]:
     )
 
 
+# [Kiểm tra ngữ nghĩa] Dùng hằng true/false trong điều kiện (if (x || true)) làm điều kiện cố định/dư thừa.
 def _detect_boolean_constant_misuse(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     hits: List[Tuple[int, str, float, str]] = []
@@ -2005,6 +2066,7 @@ def _detect_boolean_constant_misuse(code: str) -> Optional[VulnerabilityFinding]
     )
 
 
+# [Kiểm tra ngữ nghĩa] So sánh bằng chặt (==) với this.balance / balanceOf -> kẻ tấn công gửi ETH để phá điều kiện.
 def _detect_dangerous_balance_equality(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     balance_source = re.compile(r'\.balance\b|\.balanceOf\s*\(')
@@ -2057,6 +2119,7 @@ def _detect_dangerous_balance_equality(code: str) -> Optional[VulnerabilityFindi
     )
 
 
+# [Kiểm tra ngữ nghĩa] Ép số nguyên sang enum không kiểm tra phạm vi (solc < 0.4.5 không revert).
 def _detect_dangerous_enum_conversion(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     if not re.search(r'\bpragma\s+solidity\s+(?:=\s*)?0\.4\.[0-4]\s*;', clean):
@@ -2086,6 +2149,7 @@ def _detect_dangerous_enum_conversion(code: str) -> Optional[VulnerabilityFindin
     )
 
 
+# Tìm các lệnh Yul return(offset, size) bên trong một hàm.
 def _assembly_return_positions(
     code: str, function: SolidityFunction
 ) -> List[Tuple[int, int]]:
@@ -2106,6 +2170,7 @@ def _assembly_return_positions(
     return results
 
 
+# [Kiểm tra ngữ nghĩa] Hàm internal/private có 2 giá trị trả về mà dùng Yul return(...) -> dừng TOÀN BỘ execution; thường ý định là "leave".
 def _detect_return_instead_of_leave(code: str) -> Optional[VulnerabilityFinding]:
     hits: List[Tuple[int, str, float, str]] = []
     for function in _iter_functions(code):
@@ -2131,6 +2196,7 @@ def _detect_return_instead_of_leave(code: str) -> Optional[VulnerabilityFinding]
     )
 
 
+# [Kiểm tra ngữ nghĩa] Gọi một hàm có Yul return() bên trong -> execution dừng luôn, code phía sau lời gọi không chạy.
 def _detect_incorrect_assembly_return(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     functions = list(_iter_functions(code))
@@ -2185,6 +2251,7 @@ def _detect_incorrect_assembly_return(code: str) -> Optional[VulnerabilityFindin
     )
 
 
+# Pragma có pin đúng các bản solc dính bug encode storage array năm 2019 không.
 def _uses_exact_vulnerable_storage_array_compiler(code: str) -> bool:
     """Recognize explicitly pinned solc versions affected by 2019 storage bugs."""
     clean = _clean_code(code)
@@ -2203,6 +2270,7 @@ def _uses_exact_vulnerable_storage_array_compiler(code: str) -> bool:
     )
 
 
+# [Kiểm tra ngữ nghĩa] ABIEncoderV2 encode sai mảng struct trong storage trên các solc bị lỗi.
 def _detect_storage_abiencoderv2_array(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     if not (
@@ -2246,11 +2314,13 @@ def _detect_storage_abiencoderv2_array(code: str) -> Optional[VulnerabilityFindi
     )
 
 
+# Lấy kiểu gốc intN của một kiểu mảng số nguyên có dấu.
 def _signed_integer_base(type_name: str) -> Optional[str]:
     match = re.match(r'(?P<base>int\d*)\[', type_name)
     return match.group("base") if match else None
 
 
+# [Kiểm tra ngữ nghĩa] Gán toàn bộ mảng số nguyên có dấu (int[]) trong storage trên solc đã pin dính bug -> ghi sai giá trị.
 def _detect_storage_signed_integer_array(code: str) -> Optional[VulnerabilityFinding]:
     if not _uses_exact_vulnerable_storage_array_compiler(code):
         return None
@@ -2291,6 +2361,7 @@ def _detect_storage_signed_integer_array(code: str) -> Optional[VulnerabilityFin
     )
 
 
+# Lấy danh sách contract cha trực tiếp từ header "contract A is B, C".
 def _direct_base_names(header: str) -> List[str]:
     inheritance = re.search(r'\bis\s+(?P<bases>[\s\S]+)$', header)
     if not inheritance:
@@ -2303,6 +2374,7 @@ def _direct_base_names(header: str) -> List[str]:
     return names
 
 
+# [Kiểm tra ngữ nghĩa] Contract con khai báo lại biến trạng thái trùng tên contract cha (che biến, sai logic).
 def _detect_state_variable_shadowing(code: str) -> Optional[VulnerabilityFinding]:
     contracts = {contract.name: contract for contract in _iter_contracts(code)}
     declarations = {
@@ -2310,6 +2382,7 @@ def _detect_state_variable_shadowing(code: str) -> Optional[VulnerabilityFinding
         for name, contract in contracts.items()
     }
 
+    # Đệ quy gom mọi biến trạng thái được kế thừa từ các contract cha (có chống vòng lặp).
     def inherited_states(contract_name: str, visiting: Optional[set[str]] = None) -> set[str]:
         if contract_name not in contracts:
             return set()
@@ -2345,6 +2418,7 @@ def _detect_state_variable_shadowing(code: str) -> Optional[VulnerabilityFinding
     )
 
 
+# [Kiểm tra ngữ nghĩa] Biến address trạng thái không bao giờ được gán mà vẫn được dùng làm đích chuyển tiền.
 def _detect_uninitialized_state_address(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     contracts = list(_iter_contracts(code))
@@ -2391,6 +2465,8 @@ def _detect_uninitialized_state_address(code: str) -> Optional[VulnerabilityFind
     )
 
 
+# Chạy lần lượt 25 kiểm tra ngữ nghĩa _detect_* ở trên, trả về danh sách finding phát hiện được.
+# Mục đích: bổ sung các lỗi mà regex đơn thuần không bắt được (cài lại logic tương tự Slither, không gọi Slither).
 def _run_semantic_checks(code: str) -> List[VulnerabilityFinding]:
     detectors = (
         _detect_bidirectional_controls,
@@ -2431,6 +2507,8 @@ def _run_semantic_checks(code: str) -> List[VulnerabilityFinding]:
 # Context checks nâng cao (CEI pattern, state-update ordering)
 # ──────────────────────────────────────────────────────────────────────────────
 
+# [Kiểm tra ngữ cảnh] Vi phạm mẫu CEI (Checks-Effects-Interactions): có external call (.call/.transfer/.send)
+# rồi SAU đó mới cập nhật balances/amount/... -> dấu hiệu reentrancy.
 def check_call_before_state_update(code: str) -> List[str]:
     """
     Phát hiện vi phạm CEI (Checks-Effects-Interactions):
@@ -2484,6 +2562,7 @@ def check_call_before_state_update(code: str) -> List[str]:
     return violations
 
 
+# [Kiểm tra ngữ cảnh] Danh sách mô tả các tham số address thiếu kiểm tra zero-address (từ _missing_zero_address_hits).
 def check_missing_zero_address(code: str) -> List[str]:
     """
     Report only address parameters that reach state or a call destination.
@@ -2499,6 +2578,8 @@ def check_missing_zero_address(code: str) -> List[str]:
 # StaticAnalyzer – class chính
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Bộ phân tích tĩnh chính: chạy bảng luật VULNERABILITY_REGISTRY (regex có trọng số + negative pattern)
+# + 25 kiểm tra ngữ nghĩa + kiểm tra ngữ cảnh, rồi tổng hợp thành static_score/verdict.
 class StaticAnalyzer:
     """
     Phân tích tĩnh Smart Contract Solidity.
@@ -2512,6 +2593,7 @@ class StaticAnalyzer:
 
     RISK_ORDER = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
 
+    # Nạp bảng luật VULNERABILITY_REGISTRY một lần.
     def __init__(self):
         # Build registry một lần
         self._registry = VULNERABILITY_REGISTRY
@@ -2523,6 +2605,10 @@ class StaticAnalyzer:
     # Public API
     # ─────────────────────────────────────────────────────────────────────────
 
+    # [HÀM CHÍNH] Phân tích một đoạn mã (cả contract hoặc một hàm):
+    # (1) với mỗi luật: khớp regex, trừ điểm theo negative pattern / guard modifier, confirmed nếu điểm > 0.25;
+    # (2) cộng thêm kết quả 25 kiểm tra ngữ nghĩa; (3) kiểm tra CEI + zero-address (+0.05 điểm mỗi vấn đề);
+    # (4) tính static_score (<= 1), verdict (> 0.25 hoặc có lỗi High/Critical -> Vulnerable), risk_level, summary.
     def analyze(self, contract_code: str, guard_modifiers: Optional[set[str]] = None) -> Dict:
         """
         Phân tích contract_code và trả về dict:
@@ -2618,6 +2704,8 @@ class StaticAnalyzer:
     # Internal helpers
     # ─────────────────────────────────────────────────────────────────────────
 
+    # Chạy các regex của MỘT luật trên mã sạch. Với SWC-101/105/106, bỏ qua các match nằm trong hàm
+    # đã được bảo vệ (is_function_guarded) hoặc hàm burn token của chính msg.sender (giảm false positive).
     def _run_pattern_check(
         self,
         entry: Dict,
@@ -2687,6 +2775,8 @@ class StaticAnalyzer:
 
         return finding
 
+    # Tính lượng trừ điểm: mỗi negative pattern khớp (vd có nonReentrant, SafeMath, require kiểm tra) trừ theo trọng số;
+    # có guard modifier thì trừ thêm 0.45 cho SWC-101/105/106.
     def _apply_negative_patterns(
         self,
         entry: Dict,
@@ -2714,6 +2804,7 @@ class StaticAnalyzer:
 
         return min(raw_score, reduction)
 
+    # Mức rủi ro cao nhất trong các finding (Critical > High > Medium > Low).
     def _get_max_risk(self, findings: Dict[str, VulnerabilityFinding]) -> str:
         if not findings:
             return "None"
@@ -2723,6 +2814,7 @@ class StaticAnalyzer:
             default="None"
         )
 
+    # Danh sách các match mức High/Critical (sắp theo rủi ro) để xuất ra kết quả.
     def _build_high_risk_list(
         self, findings: Dict[str, VulnerabilityFinding]
     ) -> List[Dict]:
@@ -2744,6 +2836,7 @@ class StaticAnalyzer:
             reverse=True,
         )
 
+    # Tạo đoạn tóm tắt văn bản: verdict, điểm, các lỗi theo từng mức rủi ro, vấn đề ngữ cảnh.
     def _build_summary(
         self,
         findings: Dict[str, VulnerabilityFinding],
@@ -2774,6 +2867,7 @@ class StaticAnalyzer:
 # Standalone runner (dùng để test nhanh)
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Hàm tiện ích: tạo StaticAnalyzer và gọi analyze(). Được static_runner.run_static gọi cho cả contract và từng hàm.
 def run_static_analysis(
     contract_code: str,
     guard_modifiers: Optional[set[str]] = None,

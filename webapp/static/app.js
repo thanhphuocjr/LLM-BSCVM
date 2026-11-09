@@ -70,16 +70,21 @@
 
   /* ---------- Helpers ---------- */
 
+  // Escape ký tự HTML (& < > " ') trước khi chèn dữ liệu vào innerHTML - chống XSS từ mã/kết quả người dùng.
   const esc = (value) =>
     String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
+  // Ép giá trị về số; rỗng/không hợp lệ -> null (để ẩn ô điểm thay vì hiện NaN).
   const num = (value) => (value === null || value === undefined || value === '' || !Number.isFinite(+value) ? null : +value);
 
+  // Kẹp số vào [0, 1] (vẽ thanh điểm rủi ro).
   const clamp01 = (value) => Math.max(0, Math.min(1, value));
 
+  // Tạo URL API của một run: /api/runs/<run_id><path>.
   const runUrl = (runId, path = '') => `/api/runs/${encodeURIComponent(runId)}${path}`;
 
   let toastTimer;
+  // Hiện thông báo nhỏ góc màn hình trong ~2.6 giây (isError = màu lỗi).
   function toast(message, isError = false) {
     el.toast.textContent = message;
     el.toast.className = 'toast show' + (isError ? ' error' : '');
@@ -87,6 +92,7 @@
     toastTimer = setTimeout(() => el.toast.classList.remove('show'), 2600);
   }
 
+  // Gọi API (fetch) và parse JSON; HTTP lỗi -> ném Error với thông báo "detail" của server.
   async function getJson(url, options) {
     const res = await fetch(url, options);
     const body = await res.json().catch(() => ({}));
@@ -94,6 +100,7 @@
     return body;
   }
 
+  // Lấy thời điểm của một run: created_at, không có thì đọc từ tiền tố run_id "YYYYmmdd-HHMMSS".
   function runDate(run) {
     const date = run.created_at ? new Date(run.created_at) : null;
     if (date && !Number.isNaN(date.getTime())) return date;
@@ -101,16 +108,19 @@
     return m ? new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : null;
   }
 
+  // Định dạng ngày giờ kiểu Việt Nam (dd/mm/yyyy hh:mm).
   function formatDate(date) {
     if (!date) return '';
     return date.toLocaleString('vi-VN', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
   }
 
+  // Đổi mili giây thành "phút:giây" cho đồng hồ chạy.
   function formatElapsed(ms) {
     const s = Math.max(0, Math.floor(ms / 1000));
     return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
   }
 
+  // Tải một đoạn text về máy thành file (dùng cho nút "Tải về" bản vá).
   function downloadText(text, fileName) {
     const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
     const a = document.createElement('a');
@@ -122,6 +132,7 @@
 
   /* ---------- Views & popovers ---------- */
 
+  // Chuyển tab giao diện ("audit" / "history"); mở tab lịch sử thì tải lại danh sách run.
   function show(view) {
     el.tabs.forEach((t) => t.setAttribute('aria-selected', String(t.dataset.view === view)));
     el.views.forEach((v) => v.classList.toggle('active', v.id === view));
@@ -130,11 +141,13 @@
 
   el.tabs.forEach((t) => t.addEventListener('click', () => show(t.dataset.view)));
 
+  // Đóng mọi popover (trạng thái máy chủ, danh sách mẫu).
   function closePops() {
     document.querySelectorAll('.pop').forEach((p) => { p.hidden = true; });
     [el.backendBtn, el.samplesBtn].forEach((b) => b.setAttribute('aria-expanded', 'false'));
   }
 
+  // Gắn nút với popover: bấm để mở/đóng, gọi onOpen khi mở (vd tải trạng thái server).
   function bindPop(button, pop, onOpen) {
     button.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -155,6 +168,7 @@
 
   /* ---------- Backend ---------- */
 
+  // Vẽ chấm trạng thái GPU server (xanh = sẵn sàng, đỏ = chưa kết nối) theo state.system.
   function renderBackend() {
     const s = state.system;
     let online = null;
@@ -167,6 +181,7 @@
     el.backendNote.textContent = note;
   }
 
+  // Gọi GET /api/system/status rồi vẽ lại trạng thái máy chủ.
   async function loadSystem() {
     try {
       state.system = await getJson('/api/system/status');
@@ -180,6 +195,7 @@
 
   /* ---------- Editor ---------- */
 
+  // Cập nhật số dòng và cột đánh số dòng (gutter) của ô soạn mã.
   function updateEditor() {
     const text = el.code.value;
     const lines = text ? text.split('\n').length : 0;
@@ -190,17 +206,20 @@
     el.gutter.scrollTop = el.code.scrollTop;
   }
 
+  // Lấy tên contract cuối cùng trong mã (để đặt tên file tự động).
   function contractName(source) {
     const names = [...source.matchAll(/\b(?:abstract\s+)?contract\s+([A-Za-z_$][\w$]*)/g)];
     return names.length ? names[names.length - 1][1] : null;
   }
 
+  // Tự đặt tên file "<Contract>.sol" theo mã, trừ khi người dùng đã tự sửa tên.
   function autoName() {
     if (state.nameLocked) return;
     const name = contractName(el.code.value);
     el.fileName.value = `${name || 'Contract'}.sol`;
   }
 
+  // Nạp mã vào ô soạn (từ mẫu, file, lịch sử), đặt tên file, xoá kết quả cũ.
   function setCode(text, fileName) {
     el.code.value = text;
     el.code.scrollTop = 0;
@@ -216,6 +235,7 @@
   }
 
   // Code copied out of JSON datasets arrives as one escaped line ("...\n...").
+  // Đổi mã dán từ dataset JSON (một dòng có \n, \t, \") về mã nhiều dòng bình thường.
   function unescapeCode(raw) {
     let text = raw.trim();
     if (/^(["`])[\s\S]*\1$/.test(text)) text = text.slice(1, -1);
@@ -227,6 +247,7 @@
       .replace(/\\\\/g, '\\');
   }
 
+  // Chèn text tại vị trí con trỏ (giữ được Undo của trình duyệt).
   function insertText(text) {
     el.code.focus();
     if (!document.execCommand('insertText', false, text)) {
@@ -275,6 +296,7 @@
     el.code.focus();
   });
 
+  // Đọc file .sol người dùng chọn/kéo thả và nạp vào ô soạn.
   function readFile(file) {
     if (state.running) return;
     const reader = new FileReader();
@@ -308,12 +330,14 @@
 
   /* ---------- Samples ---------- */
 
+  // Dòng mô tả ngắn cho một contract mẫu (loại lỗi / "Không lỗi").
   function sampleNote(example) {
     if (/safe/i.test(example.vuln_type || '')) return 'Không lỗi';
     if (!example.vuln_type || example.vuln_type === 'Unknown') return `${example.line_count} dòng`;
     return example.vuln_type;
   }
 
+  // Gọi GET /api/contracts/examples và vẽ danh sách contract mẫu trong popover "Mẫu".
   async function loadExamples() {
     try {
       state.examples = await getJson('/api/contracts/examples');
@@ -344,6 +368,7 @@
   ).join('');
   const stepEls = [...el.steps.children];
 
+  // Tô thanh tiến độ 5 bước (Phân tích, Phát hiện, Đánh giá, Vá lỗi, Báo cáo).
   function setStep(current) {
     stepEls.forEach((node, i) => {
       node.classList.toggle('done', i < current);
@@ -351,6 +376,7 @@
     });
   }
 
+  // Suy ra bước hiện tại từ log: tìm tag "[PHASE x]" mới nhất xuất hiện (bảng STEPS ánh xạ phase -> bước).
   function currentStep(logs) {
     let index = 0;
     STEPS.forEach((s, i) => {
@@ -359,6 +385,7 @@
     return index;
   }
 
+  // Bật/tắt chế độ "đang chạy": đổi nút Chạy/Dừng, khoá ô soạn và các nút.
   function setRunning(on) {
     state.running = on;
     el.runBtn.hidden = on;
@@ -370,6 +397,7 @@
     el.fileInput.disabled = on;
   }
 
+  // Hiện khung tiến độ với dòng trạng thái, đặt về bước 0.
   function showProgress(text) {
     el.progress.hidden = false;
     el.progress.classList.remove('failed');
@@ -378,6 +406,7 @@
     setStep(0);
   }
 
+  // Dừng các bộ đếm (poll log mỗi giây và đồng hồ).
   function stopTracking() {
     clearInterval(state.poll);
     clearInterval(state.clock);
@@ -385,10 +414,12 @@
     state.clock = null;
   }
 
+  // Bắt đầu theo dõi một run: đồng hồ mỗi giây + poll /logs mỗi giây (tick).
   function track(runId, startedAt) {
     stopTracking();
     state.runId = runId;
     state.startedAt = startedAt;
+    // Cập nhật đồng hồ thời gian chạy.
     const updateClock = () => {
       el.progressTime.textContent = formatElapsed(Date.now() - state.startedAt);
     };
@@ -398,6 +429,7 @@
     tick();
   }
 
+  // Một lần poll GET /api/runs/<id>/logs: cập nhật bước tiến độ + log; nếu run kết thúc thì gọi finish().
   async function tick() {
     if (state.ticking || !state.running) return;
     state.ticking = true;
@@ -421,6 +453,7 @@
     }
   }
 
+  // Kết thúc theo dõi: thành công -> mở kết quả (openRun); dừng/lỗi -> báo trạng thái và mở log.
   async function finish(status) {
     stopTracking();
     setRunning(false);
@@ -440,6 +473,7 @@
     }
   }
 
+  // Nút "Chạy": gửi POST /api/audit/submit với mã + tên file (tool Phase 5 = slither) rồi track(run_id).
   async function startRun() {
     const code = el.code.value;
     if (!code.trim()) {
@@ -468,6 +502,7 @@
     }
   }
 
+  // Tiếp tục theo dõi một run đang chạy (vd tải lại trang khi audit chưa xong).
   async function resume(run) {
     try {
       const data = await getJson(runUrl(run.run_id));
@@ -496,6 +531,7 @@
 
   /* ---------- Log ---------- */
 
+  // Hiển thị log (tự cuộn xuống cuối nếu người dùng đang ở cuối).
   function renderLog(text) {
     const pre = el.logText;
     const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
@@ -503,6 +539,7 @@
     if (atBottom) pre.scrollTop = pre.scrollHeight;
   }
 
+  // Mở khung nhật ký và tải log của run hiện tại.
   async function openLog() {
     el.logCard.hidden = false;
     if (!state.runId) {
@@ -518,6 +555,7 @@
     }
   }
 
+  // Bật/tắt khung nhật ký.
   function toggleLog() {
     if (el.logCard.hidden) {
       openLog().then(() => el.logCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' }));
@@ -528,6 +566,7 @@
 
   /* ---------- Result ---------- */
 
+  // Xoá kết quả đang hiển thị.
   function clearResult() {
     state.data = null;
     el.result.innerHTML = '';
@@ -535,6 +574,7 @@
     if (!state.running) el.progress.hidden = true;
   }
 
+  // Đổi verdict (Vulnerable/Safe/Inconclusive) thành nhãn tiếng Việt + màu.
   function verdictOf(verdict) {
     switch (String(verdict || '').toLowerCase()) {
       case 'vulnerable': return { tone: 'bad', word: 'Có lỗ hổng' };
@@ -544,6 +584,8 @@
     }
   }
 
+  // Đổi overall_verdict của Phase 5 thành nhãn bản vá: "Đã vá" / "Chưa vá" (kèm lý do: không biên dịch, sai hành vi,
+  // vẫn còn lỗ hổng...) / "Không cần" / "Cần xem lại"...
   function patchStatus(data) {
     const raw = String(data.manifest?.verification?.overall_verdict || data.verification_verdict || '');
     const v = raw.toLowerCase();
@@ -565,11 +607,14 @@
     return { label: raw, rejected: false };
   }
 
+  // Đổi mức độ (critical/high/...) thành nhãn tiếng Việt.
   function severityLabel(value) {
     const key = String(value || 'unknown').toLowerCase();
     return { key, label: SEVERITY[key] || value };
   }
 
+  // Vẽ danh sách lỗi: sắp theo mức độ rồi độ tin cậy; mỗi lỗi có hàm, dòng, mô tả, cách sửa, SWC, nguồn
+  // (Static/RAG/Slither/Qwen), độ tin cậy, CVSS (từ Phase 3).
   function renderFindings(findings, assessments) {
     const sorted = [...findings].sort((a, b) => {
       const ra = SEVERITY_RANK[String(a.severity).toLowerCase()] ?? 9;
@@ -616,6 +661,7 @@
       </div>`;
   }
 
+  // Vẽ bản vá dạng diff (+ xanh / - đỏ) kèm nút Sao chép / Tải về.
   function renderDiff(diff, rejected) {
     const lines = diff.split('\n');
     const start = lines.findIndex((l) => l.startsWith('@@'));
@@ -636,6 +682,8 @@
       </div>`;
   }
 
+  // Vẽ toàn bộ kết quả một run: verdict, điểm fusion + vạch ngưỡng, số lỗi, mức rủi ro, trạng thái bản vá,
+  // link báo cáo PDF/HTML, danh sách lỗi và diff bản vá.
   function renderResult(data) {
     const det = data.manifest?.detection || {};
     const fused = data.phases?.phase1_fused || {};
@@ -688,6 +736,7 @@
     el.result.innerHTML = html;
   }
 
+  // Tải chi tiết run (GET /api/runs/<id>) và hiển thị; fillEditor = nạp lại mã gốc vào ô soạn (mở từ lịch sử).
   async function openRun(runId, fillEditor = false) {
     try {
       const data = await getJson(runUrl(runId));
@@ -729,6 +778,7 @@
 
   /* ---------- History ---------- */
 
+  // Nhãn trạng thái của một run trong danh sách lịch sử.
   function runVerdict(run) {
     if (run.status === 'running') return { tone: 'live', word: 'Đang chạy' };
     if (run.status === 'failed') return { tone: '', word: 'Lỗi chạy' };
@@ -736,6 +786,7 @@
     return v.tone ? v : { tone: '', word: '—' };
   }
 
+  // Tải và vẽ danh sách lịch sử audit (run đang chạy lên đầu, sau đó mới nhất trước).
   async function loadHistory() {
     if (!el.runList.innerHTML) el.runList.innerHTML = '<div class="empty">Đang tải…</div>';
     try {
@@ -791,6 +842,7 @@
 
   /* ---------- Start ---------- */
 
+  // Khởi động trang: tab audit, trạng thái máy chủ, mẫu, và tự tiếp tục theo dõi run đang chạy (nếu có).
   async function init() {
     show('audit');
     renderBackend();

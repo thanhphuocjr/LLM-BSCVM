@@ -20,6 +20,13 @@ from E2E.phase2_advisor.advisor import AdvisorAgent, RepairKnowledgeBase
 MAX_LLM_ADVISOR_CALLS = int(os.getenv("MAX_LLM_ADVISOR_CALLS", "40"))
 
 
+# [HÀM CHÍNH PHASE 2] Chạy Advisor cho các finding của contract.
+#   1) Gọi LLM cho tối đa MAX_LLM_ADVISOR_CALLS (40) finding, ưu tiên mức nghiêm trọng cao.
+#   2) Finding LLM kết luận is_true_positive=false -> đưa vào false_positives (pipeline loại khỏi bước sửa).
+#   3) Finding LLM trả lời được -> suggestion có root cause, impact, fix_strategy.
+#   4) Finding LLM lỗi/không gọi -> suggestion dựng từ RepairKnowledgeBase theo SWC (không triage).
+# Trả về {suggestions, false_positives, recommendations}.
+# Gọi bởi: gpu_pipeline.run_server_gpu_pipeline (Phase 2), repair_round2.
 def _generate_advisor_section(
     findings: list[dict[str, Any]],
     code: str = "",
@@ -56,6 +63,7 @@ def _generate_advisor_section(
             reverse=True,
         )[:MAX_LLM_ADVISOR_CALLS or None]
 
+        # Gọi advise_one cho một finding, trả (finding_key, kết quả hoặc None nếu lỗi).
         def _call_advisor(finding_dict):
             f_key = finding_key(finding_dict)
             try:

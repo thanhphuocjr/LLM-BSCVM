@@ -12,6 +12,7 @@ from E2E.phase1a_static.static_runner import run_static
 from E2E.phase1b_rag.retriever import LocalRAGRetriever
 
 
+# Tính precision, recall, F1, accuracy từ tp/fp/tn/fn.
 def metrics(counts: dict[str, int]) -> dict:
     tp, fp, tn, fn = (counts[key] for key in ("tp", "fp", "tn", "fn"))
     precision = tp / (tp + fp) if tp + fp else 0.0
@@ -30,6 +31,7 @@ def metrics(counts: dict[str, int]) -> dict:
     }
 
 
+# Đọc dataset detector (mảng JSON v12 hoặc JSONL) và lọc theo split (train/val/test).
 def load_rows(dataset: Path, split: str) -> list[dict]:
     """A JSON array (the v12 detector dataset) or JSONL, filtered to one split."""
     text = dataset.read_text(encoding="utf-8")
@@ -40,6 +42,9 @@ def load_rows(dataset: Path, split: str) -> list[dict]:
     return [row for row in rows if row.get("split") == split]
 
 
+# Đánh giá RIÊNG kênh static và kênh RAG như hai bộ phân loại nhị phân trên test split của dataset detector
+# (mỗi hàm: dự đoán Vulnerable/Safe so với nhãn), tính chỉ số tổng và theo từng nguồn dữ liệu
+# (dappscan, iaudit_trustllm, kaggle_ds2). Mục đích: số liệu cho luận văn về độ tin cậy của 2 kênh phụ trợ.
 def evaluate(dataset: Path, split: str) -> dict:
     rows = load_rows(dataset, split)
     retriever = LocalRAGRetriever()
@@ -81,6 +86,7 @@ def evaluate(dataset: Path, split: str) -> dict:
     }
 
 
+# Tham số: --dataset (mặc định final-dataset-v12-train.json), --split (mặc định test), --output.
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate local static and RAG detectors.")
     parser.add_argument(
@@ -98,6 +104,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Điểm vào: chạy evaluate và ghi data/results/local_detector_eval.json.
 def main() -> None:
     args = parse_args()
     result = evaluate(args.dataset, args.split)

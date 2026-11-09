@@ -18,6 +18,7 @@ from E2E.common.io_utils import utc_now, write_json
 from E2E.config import DATA_DIR, DETECTOR_ADAPTER_DIR, PROJECT_ROOT, RESULTS_DIR, SMARTBUGS_WILD_DIR
 
 
+# SHA-256 của một file (đọc từng khối 1 MB).
 def hash_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -26,6 +27,7 @@ def hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+# Một mục manifest: đường dẫn tương đối, kích thước, SHA-256.
 def manifest_entry(path: Path) -> dict:
     return {
         "path": str(path.relative_to(PROJECT_ROOT)),
@@ -34,6 +36,7 @@ def manifest_entry(path: Path) -> dict:
     }
 
 
+# Băm cả một cây thư mục thành MỘT giá trị (dùng cho 47,398 file SmartBugs-Wild) + số file + tổng dung lượng.
 def tree_entry(path: Path) -> dict:
     digest = hashlib.sha256()
     file_count = 0
@@ -56,6 +59,8 @@ def tree_entry(path: Path) -> dict:
     }
 
 
+# Băm mọi dataset trong data/ (trừ results/) + adapter detector, ghi data/data_manifest.json.
+# Mục đích: chứng minh toàn vẹn dữ liệu (dữ liệu dùng khi chạy đúng là dữ liệu đã công bố).
 def build_manifest(output: Path) -> dict:
     corpora = [SMARTBUGS_WILD_DIR] if SMARTBUGS_WILD_DIR.exists() else []
     dataset_dirs = [
@@ -87,12 +92,14 @@ def build_manifest(output: Path) -> dict:
     return payload
 
 
+# Tham số: --output (mặc định data/data_manifest.json).
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Hash the local datasets and the detector adapter.")
     parser.add_argument("--output", type=Path, default=DATA_DIR / "data_manifest.json")
     return parser.parse_args()
 
 
+# Điểm vào: `python -m E2E.data_tools.build_data_manifest`.
 def main() -> None:
     args = parse_args()
     result = build_manifest(args.output)

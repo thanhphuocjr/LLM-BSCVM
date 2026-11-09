@@ -28,7 +28,9 @@ from E2E.pipeline.orchestrator import run_pipeline
 EXAMPLES = DEMO_CONTRACTS_DIR
 
 
+# Kiểm tra Phase 0 (tách hàm) và việc ghép bản vá theo unit_id.
 class ParserTests(unittest.TestCase):
+    # parse_code_units tách đúng hàm khi có ngoặc lồng nhau và dấu { } trong chuỗi.
     def test_parser_handles_nested_braces_and_strings(self) -> None:
         code = """
         contract C {
@@ -44,6 +46,7 @@ class ParserTests(unittest.TestCase):
         self.assertEqual([unit.unit_id for unit in units], ["C.a", "C.b"])
         self.assertIn('value = "{"', units[0].code)
 
+    # apply_unit_patches ghép bản vá đúng hàm theo unit_id.
     def test_patch_is_applied_by_stable_unit_id(self) -> None:
         code = "contract C { function a() public { uint x = 1; } }"
         units = parse_code_units(code)
@@ -56,12 +59,15 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(outcomes[0]["status"], "applied")
 
 
+# Kiểm tra các kênh phát hiện (static, RAG), fusion và helper tri thức RAG trên contract demo.
 class DetectorTests(unittest.TestCase):
+    # Đọc VulnerableBank.sol và SafeBank.sol trong demo_contracts/.
     @classmethod
     def setUpClass(cls) -> None:
         cls.vulnerable = (EXAMPLES / "VulnerableBank.sol").read_text(encoding="utf-8")
         cls.safe = (EXAMPLES / "SafeBank.sol").read_text(encoding="utf-8")
 
+    # Static thấy SWC-107 ở VulnerableBank, không báo nhầm SWC-104, và SafeBank không có finding.
     def test_static_reentrancy_and_safe_control(self) -> None:
         vulnerable = run_static(self.vulnerable)
         safe = run_static(self.safe)
@@ -69,12 +75,14 @@ class DetectorTests(unittest.TestCase):
         self.assertFalse(any(item["swc"] == "SWC-104" for item in vulnerable["findings"]))
         self.assertEqual(safe["findings"], [])
 
+    # RAG: finding đầu tiên của VulnerableBank là SWC-107; SafeBank không có finding.
     def test_rag_reentrancy_and_safe_control(self) -> None:
         vulnerable = run_rag(self.vulnerable)
         safe = run_rag(self.safe)
         self.assertEqual(vulnerable["findings"][0]["swc"], "SWC-107")
         self.assertEqual(safe["findings"], [])
 
+    # Fusion fail-closed: mọi kênh lỗi -> Inconclusive; thiếu detector -> Inconclusive; đủ kênh và an toàn -> Safe.
     def test_fusion_does_not_fail_open(self) -> None:
         error = {"status": "error", "score": 0.0, "verdict": "Error", "findings": []}
         result = fuse_detection(error, error, error)
@@ -108,6 +116,7 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(positive["verdict"], "Vulnerable")
         self.assertEqual(positive["findings"][0]["swc"], "UNMAPPED")
 
+    # Detector offline: trọng số chia 50/50 cho static/RAG và sàn bằng chứng vẫn hoạt động.
     def test_adaptive_fusion_when_detector_offline(self) -> None:
         """Kiểm tra khi detector offline/pending, RAG và Static được chia đều 50/50 và floor hoạt động."""
         rag_vuln = {
@@ -134,6 +143,7 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(result["configured_weights"]["rag"], 0.50)
         self.assertEqual(result["configured_weights"]["static"], 0.50)
 
+    # Detector cho điểm thấp (0.05) không được "dập tắt" phát hiện mạnh của RAG/static.
     def test_adaptive_fusion_prevents_detector_false_negative_suppression(self) -> None:
         """Kiểm tra khi detector trả về score thấp (0.05), phát hiện có độ tin cậy cao của RAG không bị dập tắt."""
         rag_vuln = {
@@ -166,6 +176,7 @@ class DetectorTests(unittest.TestCase):
         self.assertGreaterEqual(result["score"], 0.50)
         self.assertEqual(result["configured_weights"]["rag"], 0.40)
 
+    # _build_rag_knowledge_section ưu tiên đúng ca cùng SWC và định dạng đúng.
     def test_rag_knowledge_section_builder(self) -> None:
         """Kiểm tra helper _build_rag_knowledge_section định dạng và ưu tiên đúng case."""
         from E2E.phase4_fixer.fixer import _build_rag_knowledge_section
@@ -200,7 +211,9 @@ class DetectorTests(unittest.TestCase):
         self.assertIn("Apply CEI pattern", section)
 
 
+# Kiểm tra tích hợp Phase 5 + Phase 6: feedback, hồi quy hành vi, báo cáo, ma trận tool.
 class IntegrationTests(unittest.TestCase):
+    # build_repair_feedback ghi rõ lý do thất bại của từng kênh static / RAG / LLM.
     def test_repair_feedback_contains_failed_static_rag_and_llm_reasons(self) -> None:
         static_result = {
             "status": "ok",
@@ -243,6 +256,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("checks-effects-interactions", feedback["components"]["rag"]["findings"][0]["remediation"])
         self.assertIn("external call", feedback["components"]["llm"]["reason"])
 
+    # Bản vá làm mất hành vi -> verify_patch_behavior failed và báo cáo ghi "must not be deployed" dù model nói đã sửa.
     def test_behavioral_regression_overrides_model_narrative(self) -> None:
         original = """
         contract C {
@@ -305,12 +319,14 @@ class IntegrationTests(unittest.TestCase):
         )
         self.assertEqual(report_data["phase_rows"][0]["status"], "complete")
 
+    # normalize_recommendations đổi khuyến nghị dạng dict thành chuỗi "title: description".
     def test_report_normalizes_object_recommendations(self) -> None:
         result = normalize_recommendations(
             [{"title": "Run tests", "description": "Execute the full project suite."}]
         )
         self.assertEqual(result, ["Run tests: Execute the full project suite."])
 
+    # Báo cáo có bảng so sánh mã gốc / mã vá và đánh dấu dòng thay đổi.
     def test_fixed_code_report_renders_side_by_side_diff(self) -> None:
         original = "contract C {\n    uint x;\n    function f() public {}\n}"
         fixed = "contract C {\n    uint256 x;\n    function f() public {}\n}"
@@ -347,6 +363,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("<mark>    uint256 x;</mark>", markdown)
         self.assertIn("code-line changed", html_report)
 
+    # Mã viết trên một dòng được tách thành từng câu lệnh để diff dễ đọc.
     def test_fixed_code_diff_expands_one_line_patch_into_statements(self) -> None:
         original = """contract C {
     function transfer(address to, uint256 amount) external {
@@ -377,6 +394,7 @@ class IntegrationTests(unittest.TestCase):
             any('target.call{value: 1}("");' in row["fixed"] for row in call_rows)
         )
 
+    # Chạy run_pipeline lượt 2 với kết quả GPU giả lập -> đủ artifact, manifest, báo cáo MD/HTML.
     def test_remote_result_completes_report(self) -> None:
         code = (EXAMPLES / "VulnerableBank.sol").read_text(encoding="utf-8")
         run_id = "mock-remote"
@@ -588,6 +606,7 @@ class IntegrationTests(unittest.TestCase):
                 report_data["recommendations"],
             )
 
+    # Kiểm tra Docker không làm lỗi; tool SKIPPED đúng và _policy_verdict ra passed khi phù hợp.
     def test_docker_availability_and_tool_policy(self) -> None:
         from E2E.common.security_tools import _is_docker_available
         from E2E.phase5_verifier.tool_matrix import _evaluate_tool_result, _policy_verdict
@@ -610,6 +629,7 @@ class IntegrationTests(unittest.TestCase):
         })
         self.assertEqual(policy["verdict"], "passed")
 
+    # Slither FAIL thì báo cáo Markdown/HTML phải ghi "failed" (không bao giờ "passed").
     def test_slither_status_consistency_when_failed(self) -> None:
         from E2E.phase5_verifier.tool_matrix import _evaluate_tool_result
         from E2E.phase6_reporter.report import build_report_data, render_html, render_markdown
@@ -669,7 +689,9 @@ class IntegrationTests(unittest.TestCase):
         self.assertNotIn("Slither: <b>passed</b>", html)
 
 
+# Kiểm tra cấu hình detector v13 có trên máy (cần thư mục models/).
 class TestV13DetectorIntegration(unittest.TestCase):
+    # threshold_config.json: base model Qwen2.5-Coder-14B-Instruct, ngưỡng 0.700, max_len 1024.
     def test_v13_threshold_config_values(self):
         config_path = DETECTOR_ADAPTER_DIR / "threshold_config.json"
         self.assertTrue(config_path.exists(), "threshold_config.json must exist in DETECTOR_ADAPTER_DIR")
@@ -678,15 +700,18 @@ class TestV13DetectorIntegration(unittest.TestCase):
         self.assertEqual(data.get("best_threshold"), 0.700)
         self.assertEqual(data.get("max_len"), 1024)
 
+    # Không truyền ngưỡng -> lấy 0.700 từ threshold_config.json.
     def test_resolve_detector_threshold_default(self):
         from E2E.pipeline.orchestrator import resolve_detector_threshold
         threshold = resolve_detector_threshold(None)
         self.assertEqual(threshold, 0.700)
 
+    # Truyền ngưỡng 0.85 -> dùng đúng 0.85.
     def test_resolve_detector_threshold_explicit(self):
         from E2E.pipeline.orchestrator import resolve_detector_threshold
         self.assertEqual(resolve_detector_threshold(0.85), 0.85)
 
+    # Các file adapter v13 bắt buộc tồn tại và không rỗng.
     def test_v13_adapter_files_present(self):
         for expected in ("adapter_model.safetensors", "adapter_config.json", "threshold_config.json", "line_head.pt"):
             path = DETECTOR_ADAPTER_DIR / expected

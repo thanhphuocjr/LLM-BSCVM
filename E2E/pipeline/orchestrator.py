@@ -52,6 +52,10 @@ from E2E.phase5_verifier.final_verification import (
 from E2E.phase6_reporter.report import apply_verification_to_report, build_report_data, render_markdown, write_reports
 
 
+# Nhiệm vụ: chọn ngưỡng P(vulnerable) cho detector Phase 1C.
+# Thứ tự ưu tiên: tham số truyền vào (--detector-threshold) > "best_threshold" trong
+# models/qwen25-v13-14b-detector-final/threshold_config.json > DEFAULT_DETECTOR_THRESHOLD (0.70).
+# Mục đích: ngưỡng được ghi vào request.json để GPU server dùng khi phân loại từng hàm.
 def resolve_detector_threshold(configured: float | None = None) -> float:
     if configured is not None:
         return float(configured)
@@ -66,12 +70,17 @@ def resolve_detector_threshold(configured: float | None = None) -> float:
     return DEFAULT_DETECTOR_THRESHOLD
 
 
+# Nhiệm vụ: sinh run_id dạng "<YYYYmmdd-HHMMSS>-<tên file>-<8 ký tự SHA-256 của code>".
+# Mục đích: mỗi lần audit có một thư mục riêng data/results/audit_runs/<run_id>/, nhìn tên là biết
+# chạy lúc nào, file nào, nội dung nào.
 def make_run_id(file_name: str, code: str) -> str:
     stem = re.sub(r"[^a-zA-Z0-9_-]+", "-", Path(file_name).stem).strip("-") or "contract"
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     return f"{timestamp}-{stem}-{sha256_text(code)[:8]}"
 
 
+# Nhiệm vụ: kiểm tra run_id chỉ gồm chữ/số/._- và tối đa 128 ký tự, sai thì raise ValueError.
+# Mục đích: run_id được dùng làm tên thư mục -> chặn path traversal (vd "../../etc") từ CLI/web app.
 def validated_run_id(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
         raise ValueError(
@@ -81,6 +90,9 @@ def validated_run_id(value: str) -> str:
     return value
 
 
+# Nhiệm vụ: lấy kết quả detector (Phase 1C) từ server_result cho bản "original" hoặc "fixed".
+# Hỗ trợ cả định dạng cũ (detector là dict phẳng = kết quả bản gốc); tự điền "status" nếu thiếu.
+# Mục đích: đưa điểm detector vào fuse_detection để ra kết luận cuối của contract.
 def _remote_detector(remote: dict[str, Any], target: str) -> dict[str, Any] | None:
     detector = remote.get("phases", {}).get("detector", {})
     if target in detector and isinstance(detector[target], dict):
@@ -96,6 +108,9 @@ def _remote_detector(remote: dict[str, Any], target: str) -> dict[str, Any] | No
     return None
 
 
+# Nhiệm vụ: kiểm tra kết quả GPU trả về khớp với request: đúng schema_version, có "phases",
+# status hợp lệ, cùng run_id và cùng SHA-256 mã nguồn.
+# Mục đích: không bao giờ ghép nhầm kết quả của contract/lần chạy khác vào báo cáo.
 def validate_remote_result(request: dict[str, Any], remote: dict[str, Any]) -> None:
     if remote.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(
@@ -113,6 +128,14 @@ def validate_remote_result(request: dict[str, Any], remote: dict[str, Any]) -> N
         raise ValueError("Remote source SHA-256 does not match the submitted source")
 
 
+# [HÀM TRUNG TÂM] Chạy một contract qua Phase 0 -> 6 và ghi một file JSON cho mỗi phase.
+# Được gọi 2 lần trong một lần audit (xem main):
+#   - Lượt 1 (remote_result=None): Phase 0 tách hàm, Phase 1A static + Phase 1B RAG chạy song song,
+#     fusion tạm (chưa có detector), ghi request.json + bản xem trước phase1_preview.md.
+#   - Lượt 2 (có remote_result từ gpu_pipeline): kiểm tra kết quả GPU, fusion đầy đủ (static + RAG +
+#     detector), ghi phase2/3/4, chạy kiểm chứng cuối Phase 5 (verify_final_patch), quyết định
+#     overall_verdict, rồi xuất báo cáo Phase 6 (MD/HTML/PDF) và manifest.json.
+# Mục đích: là "xương sống" của hệ thống; CLI, web app và batch đều đi qua hàm này.
 def run_pipeline(
     code: str,
     *,
@@ -382,6 +405,8 @@ def run_pipeline(
     return manifest
 
 
+# Nhiệm vụ: khai báo tham số CLI cho `python -m E2E.run <file.sol>` (--run-id, --detector-threshold,
+# --max-fix-attempts, --tools, --full-matrix, --solidity-root).
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Audit one Solidity contract (Phase 0 -> 6) through the GPU server.")
     parser.add_argument("code_file", type=Path)
@@ -418,6 +443,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Nhiệm vụ: điểm vào CLI. Đọc file .sol, chọn bộ tool Phase 5 (mặc định chỉ Slither), rồi:
+#   1) run_pipeline lượt 1 (local: Phase 0, 1A, 1B) -> request.json
+#   2) run_server_gpu_pipeline(request) (GPU server: Phase 1C -> 5, vòng sửa <= 3 lần)
+#   3) run_pipeline lượt 2 với kết quả GPU -> fusion, kiểm chứng cuối, báo cáo.
+# Mục đích: web app cũng gọi lại đúng lệnh CLI này trong một subprocess.
 def main() -> None:
     args = parse_args()
     code = args.code_file.read_text(encoding="utf-8")

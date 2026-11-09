@@ -19,6 +19,10 @@ from E2E.common.gpu_client import detect_via_server
 from E2E.phase0_parsing.code_units import CodeUnit
 
 
+# [HÀM CHÍNH PHASE 1C] Gửi từng unit CÓ THÂN lên GPU server (/api/v1/detect) để model Qwen2.5-Coder-14B
+# + LoRA v13 chấm P(vulnerable). Nhãn = Vulnerable nếu P >= threshold (0.70), ngược lại Safe.
+# Request lỗi -> ghi status="error", label="Inconclusive", probability=None (KHÔNG bịa xác suất).
+# Gọi bởi: gpu_pipeline (chấm bản gốc) và candidate_check (chấm lại các hàm đã vá ở Phase 5).
 def score_units_via_server(
     units: list[CodeUnit],
     threshold: float,
@@ -57,6 +61,9 @@ def score_units_via_server(
     return results
 
 
+# Nhiệm vụ: tóm tắt kết quả detector cho cả contract: status ok/partial/error, verdict, xác suất lớn nhất.
+# Fail-closed: có hàm Vulnerable -> Vulnerable; mọi hàm chấm được và đều Safe -> Safe;
+# có hàm lỗi (chưa chấm được) -> Inconclusive (không bao giờ kết luận Safe khi thiếu dữ liệu).
 def summarize_detector(unit_results: list[dict[str, Any]], threshold: float) -> dict[str, Any]:
     """Contract-level detector summary that stays honest about failed units."""
     scored = [item for item in unit_results if item.get("vulnerability_probability") is not None]

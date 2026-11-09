@@ -70,6 +70,8 @@ ADVISOR_SYSTEM_INSTRUCTION = (
 # ──────────────────────────────────────────────────────────────────────────────
 # Data model
 # ──────────────────────────────────────────────────────────────────────────────
+# Kết quả Advisor cho MỘT finding: đúng/sai (is_true_positive), dòng bằng chứng, nguyên nhân gốc,
+# kịch bản tấn công, điều kiện khai thác, chiến lược sửa (fix_strategy) cho Fixer, nguồn tri thức đã dùng.
 @dataclass
 class RepairSuggestion:
     swc: str
@@ -92,11 +94,14 @@ class RepairSuggestion:
 # ──────────────────────────────────────────────────────────────────────────────
 # Repair knowledge base (RAG retrieval by SWC id — offline, deterministic)
 # ──────────────────────────────────────────────────────────────────────────────
+# Chuẩn hoá chuỗi về dạng "SWC-xxx" (bản sao cục bộ của hàm cùng tên trong swc_agents).
 def normalize_swc_id(value: object) -> str:
     match = re.search(r"SWC-\d{3}", str(value or "").upper())
     return match.group(0) if match else str(value or "").strip().upper()
 
 
+# "Bước RAG của Advisor": tra tri thức sửa lỗi THEO MÃ SWC (không chạy lại TF-IDF/embedding) từ
+# swc_registry.json (37 SWC) + knowledge_items.json (11,869 ca). Dùng ở Phase 1F (enrich) và Phase 2.
 class RepairKnowledgeBase:
     """Indexes the vulnerability knowledge store by SWC id for repair retrieval.
 
@@ -105,6 +110,7 @@ class RepairKnowledgeBase:
     knowledge-store and 37-SWC registry by the SWC id the detector already identified.
     """
 
+    # Nạp registry và các ca lỗi, lập chỉ mục theo SWC (thiếu file thì bỏ qua, không lỗi).
     def __init__(self, knowledge_dir: str | Path = DEFAULT_KNOWLEDGE_DIR) -> None:
         k_dir = Path(knowledge_dir)
         # Fall back to data/knowledge_base/built if the given directory does not exist
@@ -148,6 +154,9 @@ class RepairKnowledgeBase:
             except Exception:
                 pass
 
+    # Nhiệm vụ: gom tri thức cho một SWC: mô tả, cách sửa, checklist, ví dụ mã đã sửa từ registry;
+    # cộng thêm các ca thực tế cùng SWC, xếp theo độ giống với mã đang xét (trùng hẳn = 10, chứa nhau = 5+,
+    # còn lại SequenceMatcher). Trả best_pair (cặp mã lỗi/mã sửa gần nhất) và risk_guidance (cho Assessor).
     def retrieve(self, swc: str, limit: int = 3, code: str | None = None) -> Dict[str, Any]:
         """Aggregate remediation knowledge for a given SWC id, prioritizing empirical cases closest to the input code."""
         norm_swc = normalize_swc_id(swc)
@@ -185,6 +194,7 @@ class RepairKnowledgeBase:
             from difflib import SequenceMatcher
             query_code = code.strip()
 
+            # Điểm giống nhau giữa mã đang xét và mã lỗi của một ca trong KB (dùng để sắp xếp).
             def match_score(item: Dict[str, Any]) -> float:
                 v_code = str(item.get("vulnerable_code") or "").strip()
                 if not v_code:
@@ -296,6 +306,8 @@ class RepairKnowledgeBase:
             "record_count": total_records,
         }
 
+    # Bổ sung cho một finding: mã lỗi/mã sửa mẫu, cách sửa, root cause, checklist, empirical_pairs, risk_guidance
+    # (chỉ điền khi finding chưa có).
     def enrich_finding(self, finding: Dict[str, Any], code: str = "") -> Dict[str, Any]:
         """Enrich a finding with the most relevant empirical code, fix patterns, and evaluation knowledge."""
         norm_swc = normalize_swc_id(finding.get("swc"))
@@ -330,6 +342,8 @@ class RepairKnowledgeBase:
         enriched["risk_guidance"] = retrieved.get("risk_guidance", {})
         return enriched
 
+    # Làm giàu hàng loạt finding; gắn thêm unit_code (mã của chính hàm) để tra ca giống nhất.
+    # Gọi bởi: gpu_pipeline ngay sau fuse_findings.
     def enrich_findings(
         self,
         findings: List[Dict[str, Any]],
@@ -358,7 +372,10 @@ class RepairKnowledgeBase:
 # ──────────────────────────────────────────────────────────────────────────────
 # Advisor agent
 # ──────────────────────────────────────────────────────────────────────────────
+# Agent Advisor (Phase 2): dùng LLM trên GPU server để kiểm tra một finding là thật hay báo nhầm,
+# giải thích nguyên nhân và đề xuất chiến lược sửa, dựa trên tri thức RAG + ngữ cảnh contract.
 class AdvisorAgent:
+    # Gắn client LLM (ServerGPUClient) và kho tri thức sửa lỗi (RepairKnowledgeBase).
     def __init__(
         self,
         llm: ServerGPUClient | None = None,
@@ -369,10 +386,13 @@ class AdvisorAgent:
         self.knowledge_base = knowledge_base or RepairKnowledgeBase(knowledge_dir)
 
     # ── knowledge formatting ────────────────────────────────────────────────
+    # Cắt danh sách văn bản theo số mục và số ký tự tối đa (giữ prompt ngắn).
     @staticmethod
     def _truncate(items: List[str], max_items: int, max_chars: int) -> List[str]:
         return [item[:max_chars] for item in items[:max_items]]
 
+    # Dựng khối <RetrievedSecurityKnowledge> cho prompt: best practice, cách sửa, checklist, mẫu mã lỗi,
+    # và cặp "mã lỗi -> mã đã sửa" gần nhất từ KB 11,869 ca.
     def _build_knowledge_block(self, vulnerability: Dict[str, Any], retrieved: Dict[str, Any]) -> str:
         # Knowledge already carried from the detection phase ...
         detection_practice = str(vulnerability.get("best_practice") or "").strip()
@@ -415,6 +435,7 @@ class AdvisorAgent:
         lines.append("</RetrievedSecurityKnowledge>")
         return "\n".join(lines)
 
+    # Dựng đoạn mô tả vị trí + mã hàm lỗi + ngữ cảnh liên quan (hiện không được _build_prompt dùng).
     @staticmethod
     def _related_code_block(vulnerability: Dict[str, Any]) -> str:
         parts: List[str] = []
@@ -441,6 +462,10 @@ class AdvisorAgent:
 
         return "\n\n".join(parts).strip()
 
+    # Dựng prompt Advisor: thông tin finding (SWC, mức độ), phiên bản Solidity, schema JSON yêu cầu
+    # (is_true_positive, evidence_lines, root_cause, attack_scenario, preconditions, fix_strategy),
+    # luật triage (có onlyOwner/kiểm tra msg.sender thì lỗi access control là FALSE POSITIVE),
+    # <TargetFunction>, <Context> (build_contract_context) và <Knowledge>.
     def _build_prompt(self, code: str, vulnerability: Dict[str, Any], knowledge_block: str) -> str:
         swc = vulnerability.get("swc") or "Unknown"
         title = vulnerability.get("title") or "Unknown vulnerability"
@@ -508,6 +533,8 @@ class AdvisorAgent:
         return "\n".join(sections)
 
     # ── per-vulnerability advice ────────────────────────────────────────────
+    # [HÀM CHÍNH] Xử lý MỘT finding: tra tri thức -> dựng prompt -> gọi LLM (generate_json) -> parse thành RepairSuggestion.
+    # Lọc evidence_lines chỉ giữ dòng nằm trong hàm. LLM lỗi -> trả RepairSuggestion có error (không làm hỏng cả batch).
     def advise_one(self, code: str, vulnerability: Dict[str, Any]) -> RepairSuggestion:
         swc = vulnerability.get("swc") or "Unknown"
         title = vulnerability.get("title") or "Unknown vulnerability"
@@ -548,6 +575,7 @@ class AdvisorAgent:
                 fix_strategy="",
             )
 
+        # Ép giá trị (chuỗi/list) về list chuỗi không rỗng.
         def as_list(value: Any) -> List[str]:
             if isinstance(value, list):
                 return [str(item).strip() for item in value if str(item).strip()]

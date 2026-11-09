@@ -44,6 +44,7 @@ from E2E.phase1b_rag.swc_agents import (
 HEADING_RE = re.compile(r"^##?\s+(.+?)\s*$", re.MULTILINE)
 
 
+# Lấy nội dung một mục "## <Tên>" trong file Markdown SWC (dùng khi xây từ thư mục SWC-*.md).
 def section(markdown: str, name: str) -> str:
     matches = list(HEADING_RE.finditer(markdown))
     for index, match in enumerate(matches):
@@ -54,6 +55,7 @@ def section(markdown: str, name: str) -> str:
     return ""
 
 
+# Bỏ code block, link, ký hiệu Markdown -> văn bản thuần.
 def clean_markdown(value: str) -> str:
     value = re.sub(r"```[\s\S]*?```", " ", value)
     value = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", value)
@@ -61,6 +63,7 @@ def clean_markdown(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+# Tách phần hướng dẫn sửa lỗi thành danh sách gạch đầu dòng (tối đa 4 câu nếu không có bullet).
 def checklist(remediation: str) -> list[str]:
     items = []
     for line in remediation.splitlines():
@@ -76,6 +79,12 @@ def checklist(remediation: str) -> list[str]:
     return sentences[:4] if len(sentences) > 1 else [text]
 
 
+# [BƯỚC OFFLINE] Dựng 2 dạng tri thức đồng bộ từ data/knowledge_base/source/:
+#   1) knowledge_items: mỗi hàm lỗi (is_vulnerable) là một "ca" có SWC, root cause, lập luận audit, cách sửa,
+#      mã lỗi, mã đã sửa và retrieval_text (văn bản để vector hoá TF-IDF);
+#   2) registry_records: 37 mục SWC-100..136, lấy mô tả từ baseline_taxonomy.json và làm giàu bằng dữ liệu
+#      (tiêu đề/root cause/cách sửa phổ biến nhất, tối đa 3 mẫu có bản vá). SWC không có dữ liệu cũng được
+#      thêm 1 item từ taxonomy để vẫn truy hồi được.
 def build_knowledge_items(
     knowledge_file: Path | None,
     source_dir: Path | None = None,
@@ -296,6 +305,10 @@ def build_knowledge_items(
     return knowledge_items, registry_records
 
 
+# Nhiệm vụ: gọi build_knowledge_items rồi fit TfidfVectorizer (char_wb 3-5 gram, tối đa 60k đặc trưng)
+# trên retrieval_text, ghi ra data/knowledge_base/built/: swc_vectorizer.joblib, swc_matrix.npz,
+# knowledge_items.json, swc_registry.json, knowledge_manifest.json.
+# Mục đích: tạo "bộ nhớ" mà Phase 1B (retriever) và Phase 2 (Advisor) đọc khi chạy. Kết quả tất định (byte-identical).
 def build_knowledge_base(
     knowledge_file: Path | None,
     source_dir: Path | None,
@@ -346,6 +359,7 @@ def build_knowledge_base(
     return manifest
 
 
+# Tham số CLI: --knowledge-file, --source-dir, --baseline-taxonomy, --output-dir.
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build the vulnerability knowledge store and TF-IDF artifacts.")
     parser.add_argument(
@@ -365,6 +379,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Điểm vào: `python -m E2E.phase1b_rag.build_knowledge_base` -> build và in manifest.
 def main() -> None:
     args = parse_args()
     manifest = build_knowledge_base(args.knowledge_file, args.source_dir, args.output_dir, args.baseline_taxonomy)

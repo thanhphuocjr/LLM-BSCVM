@@ -20,6 +20,8 @@ DEFAULT_RECOMMENDATIONS = [
     "Use checks-effects-interactions and established OpenZeppelin guards for external calls.",
     "Repeat the audit after dependency, privilege, or business-logic changes.",
 ]
+# Định dạng lại mã Solidity thành các dòng ổn định (mỗi câu lệnh một dòng, thụt lề theo { }, giữ nguyên chuỗi/comment)
+# để bảng so sánh "mã gốc | mã đã vá" dễ đọc, không bị lệch do khác định dạng.
 def format_solidity_for_comparison(code: str) -> list[str]:
     """Format Solidity into stable statement lines for a readable visual diff."""
     lines: list[str] = []
@@ -35,6 +37,7 @@ def format_solidity_for_comparison(code: str) -> list[str]:
     physical_line_content = False
     index = 0
 
+    # Đẩy dòng đang gom vào kết quả (kèm thụt lề hiện tại).
     def emit(*, blank: bool = False) -> None:
         nonlocal current, pending_space
         text = "".join(current).strip()
@@ -45,6 +48,7 @@ def format_solidity_for_comparison(code: str) -> list[str]:
         current = []
         pending_space = False
 
+    # Thêm một ký tự vào dòng đang gom (tự chèn dấu cách khi cần).
     def append(char: str) -> None:
         nonlocal pending_space, physical_line_content
         if pending_space and current and not current[-1].endswith((" ", "\t")):
@@ -183,6 +187,7 @@ def format_solidity_for_comparison(code: str) -> list[str]:
     return lines
 
 
+# Dựng các dòng so sánh song song mã gốc / mã đã vá bằng SequenceMatcher; đánh dấu dòng bị thay/thêm ở bản vá.
 def build_code_comparison_rows(original_code: str, fixed_code: str) -> list[dict[str, Any]]:
     """Return side-by-side code rows with fixed-side change markers."""
     original_lines = format_solidity_for_comparison(original_code)
@@ -210,6 +215,7 @@ def build_code_comparison_rows(original_code: str, fixed_code: str) -> list[dict
     return rows or [{"source": "", "fixed": "", "fixed_changed": False}]
 
 
+# Xuất bảng so sánh mã dạng HTML-trong-Markdown (dòng thay đổi được bọc <mark>).
 def _markdown_code_compare(rows: list[dict[str, Any]]) -> str:
     source_lines = [html.escape(row["source"]) or "&nbsp;" for row in rows]
     fixed_lines = []
@@ -229,6 +235,7 @@ def _markdown_code_compare(rows: list[dict[str, Any]]) -> str:
     )
 
 
+# Xuất các dòng mã thành <span> cho báo cáo HTML (dòng thay đổi có class "changed").
 def _html_code_lines(rows: list[dict[str, Any]], key: str, highlight_key: str | None = None) -> str:
     lines = []
     for row in rows:
@@ -240,10 +247,12 @@ def _html_code_lines(rows: list[dict[str, Any]], key: str, highlight_key: str | 
     return "\n".join(lines)
 
 
+# Lấy kết quả một phase (advisor/assessor/fixer/...) từ server_result.
 def _phase(remote: dict[str, Any], name: str) -> dict[str, Any]:
     return remote.get("phases", {}).get(name, {}) if remote else {}
 
 
+# Tìm mục (suggestion/assessment/verification) ứng với một finding: theo finding_id, không có thì theo SWC + unit.
 def _match(items: list[dict[str, Any]], finding: dict[str, Any]) -> dict[str, Any]:
     for item in items:
         if str(item.get("finding_id") or "") == str(finding.get("finding_id") or ""):
@@ -255,6 +264,7 @@ def _match(items: list[dict[str, Any]], finding: dict[str, Any]) -> dict[str, An
     return {}
 
 
+# Chuẩn hoá danh sách khuyến nghị (chuỗi hoặc dict) thành list chuỗi; rỗng thì dùng DEFAULT_RECOMMENDATIONS.
 def normalize_recommendations(value: Any) -> list[str]:
     if not isinstance(value, list):
         return list(DEFAULT_RECOMMENDATIONS)
@@ -279,6 +289,8 @@ def normalize_recommendations(value: Any) -> list[str]:
     return recommendations or list(DEFAULT_RECOMMENDATIONS)
 
 
+# Dựng các dòng bảng "Verification Results" (mục 5.5): mỗi kênh (slither, mythril, smartcheck, compile, static,
+# RAG, LLM) -> PASS/FAIL/ERROR/SKIPPED + chi tiết.
 def verification_channel_rows(data: dict[str, Any]) -> list[dict[str, str]]:
     rows = []
     channels = data.get("verification_channels", {})
@@ -325,6 +337,10 @@ def verification_channel_rows(data: dict[str, Any]) -> list[dict[str, str]]:
     return rows
 
 
+# Đưa kết quả Phase 5 vào dữ liệu báo cáo: verdict bản vá, risk_delta, phiên bản solc, các kênh kiểm chứng.
+# Nếu bản vá bị từ chối/không kết luận được -> viết lại executive summary (KHÔNG được deploy bản vá, lỗi vẫn mở),
+# đánh dấu từng finding và thêm khuyến nghị "Do not deploy the generated patch" lên đầu.
+# Mục đích: báo cáo không bao giờ trình bày bản vá thất bại như đã sửa xong.
 def apply_verification_to_report(
     report_data: dict[str, Any],
     verification: dict[str, Any],
@@ -389,6 +405,10 @@ def apply_verification_to_report(
         report_data["recommendations"] = [rejection_recommendation, *recommendations]
 
 
+# [HÀM CHÍNH PHASE 6 - dữ liệu] Gom mọi thứ thành một dict báo cáo: thông tin contract, kết luận fusion,
+# từng finding ghép với gợi ý Advisor + CVSS Assessor + kết quả Verifier, finding ứng viên, phân bố mức độ,
+# bảng trạng thái các phase (phase_rows), mã gốc/mã vá, bảng tham chiếu lỗ hổng (VULNERABILITY_REFERENCE),
+# khuyến nghị, hạn chế, tuyên bố miễn trừ. Lượt 1 (remote=None) dùng để xuất bản xem trước.
 def build_report_data(
     request: dict[str, Any],
     fused: dict[str, Any],
@@ -601,6 +621,9 @@ def build_report_data(
     }
 
 
+# Xuất báo cáo Markdown theo cấu trúc: 1. Thông tin contract, 2. Tóm tắt, 3. Phương pháp (bảng phase),
+# 4. Findings (thống kê, phân bố, finding xác nhận, ứng viên), 5. Phân tích chi tiết (mã gốc, gợi ý sửa,
+# mã đã vá, kết quả kiểm chứng), 6. Kết luận & khuyến nghị, 7. Miễn trừ, 8. Phụ lục tham chiếu lỗ hổng.
 def render_markdown(data: dict[str, Any]) -> str:
     findings = data["findings"]
     dist = data["distribution"]
@@ -798,6 +821,7 @@ def render_markdown(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# Xuất báo cáo HTML (cùng nội dung với Markdown, có CSS, bảng so sánh mã tô màu dòng thay đổi).
 def render_html(data: dict[str, Any], markdown_text: str) -> str:
     code_comparison = build_code_comparison_rows(data["original_code"], data["fixed_code"])
     source_code_lines = _html_code_lines(code_comparison, "source")
@@ -955,6 +979,7 @@ generative repair agents, compilation, AST behavior-preservation checks, and det
 </body></html>"""
 
 
+# Xuất báo cáo PDF bằng reportlab (A4, bảng, khối mã, chân trang số trang). Không có reportlab -> trả (False, lý do).
 def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
     try:
         from reportlab.lib import colors
@@ -1001,13 +1026,16 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
     )
     story: list[Any] = [Paragraph(data["title"], styles["ReportTitle"]), Spacer(1, 6 * mm)]
 
+    # Thêm tiêu đề mục vào PDF.
     def heading(text: str, level: int = 1) -> None:
         story.append(Paragraph(html.escape(text), styles[f"Heading{min(level, 3)}"]))
 
+    # Thêm đoạn văn (đã escape) vào PDF.
     def paragraph(text: Any) -> None:
         story.append(Paragraph(html.escape(str(text or "")), styles["BodyText"]))
         story.append(Spacer(1, 2 * mm))
 
+    # Tạo ô chứa mã (Preformatted, tự xuống dòng) cho bảng PDF.
     def code_cell(text: str) -> Paragraph:
         wrapped = textwrap.wrap(
             text,
@@ -1021,6 +1049,7 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
         ]
         return Paragraph("<br/>".join(escaped_parts), styles["CodeCell"])
 
+    # Tạo bảng so sánh mã gốc / mã đã vá trong PDF (tô nền dòng thay đổi).
     def code_compare_table(rows: list[dict[str, Any]]) -> Table:
         table_rows = [
             [
@@ -1236,6 +1265,7 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
     )
     story.extend([table, Spacer(1, 4 * mm)])
 
+    # Vẽ chân trang mỗi trang PDF: run_id và số trang.
     def footer(canvas, document) -> None:
         canvas.saveState()
         canvas.setFont("Helvetica", 8)
@@ -1256,6 +1286,8 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
     return True, ""
 
 
+# Ghi 3 file báo cáo vào thư mục run: phase6_audit_report.md, .html, .pdf; trả về đường dẫn (pdf=None nếu lỗi).
+# Gọi bởi: orchestrator.run_pipeline (lượt 2).
 def write_reports(data: dict[str, Any], run_dir: str | Path) -> dict[str, Any]:
     output_dir = Path(run_dir)
     markdown_text = render_markdown(data)

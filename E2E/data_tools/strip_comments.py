@@ -26,6 +26,9 @@ from typing import Tuple
 from E2E.config import SMARTBUGS_WILD_DIR
 
 
+# Bỏ mọi kiểu comment (//, ///, /* */, /** */) khỏi mã Solidity nhưng GIỮ nguyên chuỗi (kể cả chuỗi chứa "//" như URL),
+# ký tự escape và cấu trúc; xoá khoảng trắng cuối dòng, gộp nhiều dòng trống thành tối đa 1.
+# Mục đích: comment trong SmartBugs-Wild có thể "lộ" đáp án (vd ghi chú SWC) hoặc gây nhiễu cho detector.
 def strip_solidity_comments(source: str) -> str:
     """
     Remove all comments from a Solidity source code string while preserving
@@ -113,6 +116,7 @@ def strip_solidity_comments(source: str) -> str:
     return (text + '\n') if text else ''
 
 
+# Xử lý một file: đọc, bỏ comment, ghi (trừ khi dry-run); trả số byte/dòng trước-sau hoặc lỗi.
 def process_single_file(args_tuple: Tuple[Path, Path | None, bool]) -> Tuple[bool, int, int, int, int, str | None]:
     """
     Worker function to process one contract file.
@@ -146,6 +150,7 @@ def process_single_file(args_tuple: Tuple[Path, Path | None, bool]) -> Tuple[boo
         return False, 0, 0, 0, 0, f"{file_path.name}: {str(e)}"
 
 
+# Chạy song song process_single_file trên mọi .sol trong thư mục (47,398 contract), in tiến độ và thống kê dung lượng giảm.
 def run_pipeline(
     target_dir: Path,
     output_dir: Path | None = None,
@@ -239,6 +244,7 @@ def run_pipeline(
         print("[SUCCESS] All contracts processed cleanly without errors!")
 
 
+# Điểm vào: `python -m E2E.data_tools.strip_comments [--target-dir ...] [--dry-run] [--workers N]`.
 def main():
     parser = argparse.ArgumentParser(description="Strip all comments from Solidity contracts in a dataset.")
     parser.add_argument(

@@ -26,6 +26,7 @@ from E2E.phase1c_detector.detector import score_units_via_server
 _ERROR_LOCATION_RE = re.compile(r"(-->\s*\S+:\d+:\d+:?|/\S+\.sol:\d+:\d+:?)")
 
 
+# Tập "chữ ký" lỗi compile (bỏ phần vị trí file:dòng:cột) để so lỗi của bản vá với lỗi sẵn có của bản gốc.
 def _compiler_error_signatures(text: str) -> set[str]:
     signatures = set()
     for line in (text or "").splitlines():
@@ -35,6 +36,10 @@ def _compiler_error_signatures(text: str) -> set[str]:
     return signatures
 
 
+# Nhiệm vụ: biên dịch bản vá so với bản gốc (baseline) -> state:
+# passed / failed / skipped (không có solc - không phải lỗi bản vá) /
+# not_applicable (bản gốc vốn không compile riêng được, vd thiếu import, và bản vá không thêm lỗi mới).
+# Mục đích: không đổ lỗi cho Fixer với những contract vốn đã không compile được.
 def evaluate_compilation(original_code: str, fixed_code: str) -> dict[str, Any]:
     """Compile against the original as a baseline.
 
@@ -71,6 +76,7 @@ def evaluate_compilation(original_code: str, fixed_code: str) -> dict[str, Any]:
 _ERROR_LINE_RE = re.compile(r"\S+?\.sol:(\d+):\d+")  # `--> a.sol:12:5` (>=0.5) and `a.sol:12:5: Error` (0.4)
 
 
+# Ánh xạ vị trí lỗi solc ("--> file:DÒNG:CỘT") sang các unit chứa dòng đó -> biết hàm vá nào làm hỏng compile.
 def units_with_compiler_errors(candidate_code: str, error_text: str) -> set[str]:
     """Map solc error locations (`--> file:LINE:COL`) to the units that contain them."""
     lines = {int(value) for value in _ERROR_LINE_RE.findall(error_text or "")}
@@ -81,6 +87,7 @@ def units_with_compiler_errors(candidate_code: str, error_text: str) -> set[str]
     }
 
 
+# Tập cặp (SWC, unit_id) từ danh sách finding - dùng để so lỗi còn sót / lỗi mới.
 def _finding_pairs(findings: list[dict[str, Any]]) -> set[tuple[str, str]]:
     return {
         (str(item.get("swc")), str(item.get("unit_id")))
@@ -89,6 +96,13 @@ def _finding_pairs(findings: list[dict[str, Any]]) -> set[tuple[str, str]]:
     }
 
 
+# [KIỂM CHỨNG TRONG VÒNG SỬA - 3 kênh, chạy trên mã đã vá]
+#   1) compiler: evaluate_compilation (so với baseline);
+#   2) neural detector: CHỈ chấm lại các hàm đã vá, hàm khác giữ điểm cũ; hàm mục tiêu vẫn Vulnerable -> fail;
+#   3) static + RAG chạy lại: finding mục tiêu (SWC, unit) còn sót -> fail; finding High/Critical MỚI trong hàm đã vá -> fail.
+# passed = compile được + không hàm nào fail + không kênh nào lỗi.
+# Trả về chi tiết từng kênh và failing_units (để lần sửa sau chỉ vá lại các hàm này).
+# Gọi bởi: gpu_pipeline.run_server_gpu_pipeline (mỗi attempt).
 def verify_candidate(
     source_code: str,
     candidate_code: str,
@@ -176,6 +190,8 @@ def verify_candidate(
     }
 
 
+# Viết feedback cho lần Fixer tiếp theo: lỗi compile (tối đa 8 dòng), hàm detector vẫn báo Vulnerable,
+# finding static/RAG còn sót hoặc mới phát sinh.
 def _verification_feedback(attempt: int, max_attempts: int, verification: dict[str, Any]) -> str:
     parts = [f"\n\n[CRITICAL RESIDUAL ERROR FEEDBACK - ATTEMPT {attempt}/{max_attempts}]"]
     compile_info = verification["compilation"]

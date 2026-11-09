@@ -38,10 +38,25 @@ from E2E.phase5_verifier.candidate_check import _finding_pairs, _verification_fe
 MAX_VERIFICATION_ATTEMPTS = 3
 
 
+# In log có kèm giờ (web app đọc dòng "[PHASE x]" này để cập nhật tiến độ).
 def _log(message: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
 
 
+# [HÀM TRUNG TÂM PHẦN GPU] Chạy Phase 1C -> 5 cho một contract từ request.json (do orchestrator ghi).
+#   1C: kiểm tra server sống (health) -> detector chấm từng unit (score_units_via_server + summarize_detector).
+#   1F: fuse_findings -> finding confirmed / candidate; RepairKnowledgeBase gắn tri thức sửa lỗi theo SWC;
+#       (tuỳ chọn) hoãn finding chỉ-detector có xác suất thấp (detector_only_min_prob).
+#   2 : Advisor -> loại false positive khỏi tập cần sửa, sinh hướng sửa (suggestions).
+#   3 : Assessor -> CVSS v3.1 (bỏ qua ở chế độ single_pass của batch).
+#   4-5: VÒNG SỬA (tối đa 3 lần): Fixer vá từng hàm mục tiêu (patch_unit); nếu model không vá được gì thì
+#       dùng vá heuristic; rồi verify_candidate kiểm tra compile + detector + static/RAG chạy lại.
+#       Chưa đạt -> tạo feedback; lần sau giữ lại các bản vá đã đạt, chỉ vá lại các hàm còn lỗi TỪ MÃ GỐC.
+#       Chọn attempt tốt nhất theo (compile được, ít hàm lỗi, nhiều hàm vá, ít thay đổi độ dài).
+# Trả về server_result: phases {detector, advisor, assessor, fixer, verifier, reporter}, fixed_code,
+# patch_outcomes, verdict PASS/WARN/UNVERIFIED/NOT_APPLICABLE, thời gian từng phần.
+# single_pass (dùng cho batch vòng 1): mỗi hàm chỉ gọi Fixer 1 lần, không Phase 3 và không Phase 5.
+# Gọi bởi: orchestrator.main, batch_audit, repair_round2.
 def run_server_gpu_pipeline(
     request: dict[str, Any],
     *,

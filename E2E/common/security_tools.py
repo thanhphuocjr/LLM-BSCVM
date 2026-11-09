@@ -26,6 +26,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SMARTBUGS_HOME = PROJECT_ROOT / ".tools" / "smartbugs"
 
 
+# Chạy một lệnh ngoài (subprocess) có timeout, trả dict status/return_code/stdout/stderr/thời gian.
+# Không bao giờ ném lỗi (timeout, thiếu lệnh -> status="error").
 def _run(command: list[str], timeout: int = 120, cwd: Path | None = None) -> dict[str, Any]:
     try:
         started = time.perf_counter()
@@ -58,6 +60,7 @@ def _run(command: list[str], timeout: int = 120, cwd: Path | None = None) -> dic
         return {"status": "error", "error": str(error), "command": command, "elapsed_ms": 0.0}
 
 
+# Rút danh sách detector từ JSON của Slither: check, impact, confidence, mô tả, các dòng code liên quan.
 def _slither_findings(payload: dict[str, Any]) -> list[dict[str, Any]]:
     detectors = payload.get("results", {}).get("detectors", [])
     findings = []
@@ -77,6 +80,8 @@ def _slither_findings(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return findings
 
 
+# Chép mã nguồn (và các file .sol phụ thuộc trong source_root, nếu có) vào thư mục tạm.
+# Mục đích: Slither/SmartBugs cần file thật trên đĩa và cần thấy các file được import.
 def _copy_source_tree(
     temp_root: Path,
     code: str,
@@ -98,6 +103,7 @@ def _copy_source_tree(
     return source_path, dependency_count
 
 
+# Chuẩn hoá mức độ của tool về High/Medium/Low/Informational/Unknown.
 def _normalise_severity(value: Any) -> str:
     text = str(value or "Unknown").strip()
     if not text:
@@ -108,6 +114,8 @@ def _normalise_severity(value: Any) -> str:
     return lowered.capitalize()
 
 
+# Gom finding của mọi tool vào nhóm lỗ hổng chung (reentrancy, arithmetic, access_control, tx_origin...)
+# bằng từ khoá trong tên/mô tả. Mục đích: so sánh được kết quả giữa các tool khác nhau.
 def _classify_category(*parts: Any) -> str:
     text = " ".join(str(part or "") for part in parts).lower()
     checks = (
@@ -130,6 +138,7 @@ def _classify_category(*parts: Any) -> str:
     return "other"
 
 
+# Kiểm tra Docker daemon có chạy không (SmartBugs chạy Mythril/SmartCheck trong container Docker).
 def _is_docker_available() -> bool:
     docker_bin = shutil.which("docker")
     if not docker_bin:
@@ -146,6 +155,8 @@ def _is_docker_available() -> bool:
         return False
 
 
+# Tìm file chạy SmartBugs (tham số > SMARTBUGS_HOME > .tools/smartbugs > PATH); trả (path, lý do).
+# Không có Docker hoặc chưa cài virtualenv thì trả None kèm lý do.
 def _smartbugs_executable(smartbugs_home: str | Path | None = None) -> tuple[Path | None, str]:
     if not _is_docker_available():
         return None, "SmartBugs unavailable: Docker daemon is not running"
@@ -167,6 +178,7 @@ def _smartbugs_executable(smartbugs_home: str | Path | None = None) -> tuple[Pat
     return None, "SmartBugs executable not found"
 
 
+# Chuẩn hoá một finding của SmartBugs về dạng chung {tool, name, severity, line, message, category}.
 def _normalise_smartbugs_finding(tool: str, item: dict[str, Any]) -> dict[str, Any]:
     name = item.get("name") or item.get("check") or item.get("title") or "unknown"
     message = item.get("message") or item.get("description") or item.get("extra") or ""
@@ -182,6 +194,7 @@ def _normalise_smartbugs_finding(tool: str, item: dict[str, Any]) -> dict[str, A
     }
 
 
+# Đọc mọi result.json SmartBugs sinh ra -> (danh sách finding, lỗi, fail).
 def _read_smartbugs_results(tool: str, result_dir: Path) -> tuple[list[dict[str, Any]], list[str], list[str]]:
     findings: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -200,6 +213,7 @@ def _read_smartbugs_results(tool: str, result_dir: Path) -> tuple[list[dict[str,
     return findings, errors, fails
 
 
+# Chuẩn hoá một finding Slither về dạng chung {tool, name, check, severity, line, message, category}.
 def _normalise_slither_finding(item: dict[str, Any]) -> dict[str, Any]:
     check = item.get("check") or "slither"
     description = item.get("description") or ""
@@ -216,6 +230,9 @@ def _normalise_slither_finding(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Nhiệm vụ: chạy Slither trực tiếp trên máy (slither <file> --solc <solc chọn theo pragma> --json).
+# Trả run_status (completed/unavailable/error) + danh sách finding đã chuẩn hoá.
+# Mục đích: dùng ở Phase 1A (bằng chứng static) và trong ma trận tool Phase 5.
 def _run_native_slither(
     code: str,
     file_name: str,
@@ -271,6 +288,9 @@ def _run_native_slither(
         }
 
 
+# Nhiệm vụ: chạy một tool qua SmartBugs (Docker): mythril, smartcheck, ... trên một file;
+# đọc result.json và chuẩn hoá finding.
+# Mục đích: ma trận tool Phase 5 (--full-matrix) và benchmark 9 tool.
 def _run_smartbugs_tool(
     tool: str,
     code: str,

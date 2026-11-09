@@ -121,10 +121,12 @@ BLIND_DROP = set(JUDGE_COLUMNS)
 _stop_requested = False
 
 
+# Lỗi "GPU server sập giữa chừng khi đang xử lý một hàm" -> hàm được xếp lại hàng đợi, không lưu kết quả.
 class ServerOutage(RuntimeError):
     """The GPU server failed mid-function: the function is re-queued, never saved."""
 
 
+# Ctrl+C / SIGTERM: lần 1 dừng sau khi xong hàm hiện tại, lần 2 dừng ngay.
 def _request_stop(signum, frame) -> None:  # noqa: ARG001
     global _stop_requested
     if _stop_requested:
@@ -141,11 +143,13 @@ _TOO_LARGE_MARKERS = ("http error 413", "content too large", "context length exc
 OUTAGE_REPEAT_LIMIT = 5
 
 
+# Lỗi có phải do prompt vượt 4096 token (HTTP 413) không - lỗi này thử lại không giúp gì, KHÔNG tính là server sập.
 def _too_large(text: str) -> bool:
     lowered = (text or "").lower()
     return any(marker in lowered for marker in _TOO_LARGE_MARKERS)
 
 
+# Lỗi có phải do server sập/mất kết nối không (và không phải lỗi prompt quá dài).
 def _is_outage(text: str) -> bool:
     lowered = (text or "").lower()
     return not _too_large(lowered) and any(marker in lowered for marker in OUTAGE_MARKERS)
@@ -154,12 +158,14 @@ def _is_outage(text: str) -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 # Input + state
 # ──────────────────────────────────────────────────────────────────────────────
+# Đọc CSV đầu vào vòng 2 (data/results/round1_judge/ham_can_sua_lan_2.csv) -> {stt_goc: dòng}.
 def read_input(path: Path) -> dict[int, dict[str, str]]:
     csv.field_size_limit(sys.maxsize)
     with path.open(newline="", encoding="utf-8") as handle:
         return {int(row["stt_goc"]): row for row in csv.DictReader(handle)}
 
 
+# Mở/tạo state.sqlite của vòng 2 (bảng functions: trạng thái, số lần thử, kết quả Advisor, kết quả cuối); hàm đang dở -> pending.
 def connect(batch_dir: Path) -> sqlite3.Connection:
     batch_dir.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(batch_dir / "state.sqlite")
@@ -183,6 +189,8 @@ def connect(batch_dir: Path) -> sqlite3.Connection:
     return db
 
 
+# Khoá các tuỳ chọn (score_detector, on_all_dismissed, group, self_check) theo lần chạy đầu của batch,
+# để mọi dòng kết quả được tạo theo cùng một cách; đổi tuỳ chọn -> bắt dùng --batch khác.
 def lock_options(db: sqlite3.Connection, args: argparse.Namespace) -> None:
     """A batch keeps the options it was started with, so every row is produced the same way."""
     wanted = {"score_detector": str(bool(args.score_detector)), "on_all_dismissed": args.on_all_dismissed,
@@ -203,6 +211,7 @@ def lock_options(db: sqlite3.Connection, args: argparse.Namespace) -> None:
         raise SystemExit(f"Batch was started with different options {changed}; use another --batch.")
 
 
+# Đếm số hàm theo trạng thái.
 def counts(db: sqlite3.Connection) -> dict[str, int]:
     return {row["status"]: row["n"] for row in db.execute(
         "SELECT status, COUNT(*) AS n FROM functions GROUP BY status")}
@@ -214,6 +223,7 @@ def counts(db: sqlite3.Connection) -> dict[str, int]:
 _round1_cache: dict[str, dict[str, Any]] = {}
 
 
+# Đọc artifact vòng 1 của một contract (server_result, phase1a_static, phase1b_rag); cache 1 contract trong bộ nhớ.
 def load_round1(runs_dir: Path, run_id: str) -> dict[str, Any]:
     if run_id not in _round1_cache:
         run_dir = runs_dir / run_id
@@ -226,6 +236,7 @@ def load_round1(runs_dir: Path, run_id: str) -> dict[str, Any]:
     return _round1_cache[run_id]
 
 
+# Rút gọn finding còn (swc, unit_id, title, line, source).
 def _compact(findings: list[dict[str, Any]], source: str) -> list[dict[str, Any]]:
     return [
         {"swc": item.get("swc"), "unit_id": item.get("unit_id"), "title": item.get("title") or item.get("name"),
@@ -235,6 +246,8 @@ def _compact(findings: list[dict[str, Any]], source: str) -> list[dict[str, Any]
     ]
 
 
+# Chạy lại static + RAG (local, không cần GPU) trên contract ĐÃ VÁ ở vòng 1; cache vào <batch>/rescan/<run_id>.json.
+# Mục đích: biết bản vá vòng 1 còn sót lỗi gì / sinh lỗi mới gì.
 def get_rescan(batch_dir: Path, runs_dir: Path, run_id: str) -> dict[str, Any]:
     """Static + RAG on the round-1 patched contract (cached per contract; local only)."""
     path = batch_dir / "rescan" / f"{run_id}.json"
@@ -257,6 +270,7 @@ def get_rescan(batch_dir: Path, runs_dir: Path, run_id: str) -> dict[str, Any]:
     return result
 
 
+# Lọc kết quả re-scan cho MỘT hàm: residual (SWC mục tiêu vẫn còn) và introduced (SWC mới mà bản gốc không có).
 def rescan_for_unit(rescan: dict[str, Any], unit_id: str, target_swcs: set[str]) -> tuple[list, list]:
     known = {tuple(pair) for pair in rescan.get("original_pairs", [])}
     seen: set[str] = set()
@@ -272,6 +286,7 @@ def rescan_for_unit(rescan: dict[str, Any], unit_id: str, target_swcs: set[str])
     return residual, introduced
 
 
+# Viết danh sách finding re-scan thành một dòng văn bản ngắn cho prompt.
 def _fmt_rescan(items: list[dict[str, Any]]) -> str:
     return "; ".join(f"{item['swc']} {item.get('title') or ''} [{item['source']}]".strip() for item in items)
 
@@ -295,12 +310,15 @@ _GUARD_RE = re.compile(r"\b(only[A-Z]\w*|nonReentrant|whenNotPaused|whenPaused|o
 _ACCESS_CONTROL_SWCS = {"SWC-105", "SWC-106", "SWC-115"}
 
 
+# Finding có thuộc nhóm phân quyền (SWC-105/106/115 hoặc tiêu đề có "access control"/"unprotected") không.
 def _is_access_control(finding: dict[str, Any]) -> bool:
     title = str(finding.get("title") or "").lower()
     return finding.get("swc") in _ACCESS_CONTROL_SWCS or any(
         word in title for word in ("access control", "authorization", "unprotected"))
 
 
+# Kiểm tra kết luận "false positive" của Advisor có căn cứ không: nếu Advisor viện dẫn guard (onlyOwner...) KHÔNG có
+# trong hàm, hoặc dùng guard để bác một lỗi KHÔNG phải access control -> trả lý do bác bỏ (finding vẫn được sửa).
 def ungrounded_fp_reason(finding: dict[str, Any], root_cause: str) -> str:
     """Why a false-positive verdict that rests on an authorization guard cannot stand ('' if it can)."""
     cited = set(_GUARD_RE.findall(root_cause or ""))
@@ -314,10 +332,13 @@ def ungrounded_fp_reason(finding: dict[str, Any], root_cause: str) -> str:
     return ""
 
 
+# Advisor của vòng 2: kế thừa AdvisorAgent nhưng siết luật 2 (guard chỉ bác được lỗi access control) và
+# cho xem bản vá vòng 1 (<PreviousRepairAttempt>) để nói rõ lần trước thiếu/hỏng gì.
 class Round2Advisor(AdvisorAgent):
     previous_attempt: str = ""
     previous_attempt_short: str = ""  # without the code, used when the full prompt is too large
 
+    # Lấy prompt Advisor gốc, thay luật 2 bằng bản siết chặt, rồi nối thêm khối <PreviousRepairAttempt>.
     def _build_prompt(self, code: str, vulnerability: dict[str, Any], knowledge_block: str) -> str:
         prompt = super()._build_prompt(code, vulnerability, knowledge_block)
         if _ROUND1_RULE_2 not in prompt:
@@ -335,6 +356,8 @@ class Round2Advisor(AdvisorAgent):
         )
 
 
+# Dựng khối mô tả lần sửa vòng 1: mã bản vá (ẩn nếu dài bất thường), kết quả re-scan (còn sót / mới phát sinh),
+# ghi chú guard hành vi.
 def previous_attempt_block(job: dict[str, Any], residual: list, introduced: list, show_code: bool = True) -> str:
     code, raw = job["fixed_lan1"].strip(), job["raw_function_code"].strip()
     if not show_code:
@@ -355,6 +378,8 @@ def previous_attempt_block(job: dict[str, Any], residual: list, introduced: list
     return "\n".join(lines)
 
 
+# Chạy Round2Advisor cho TỪNG finding của hàm (không giới hạn số lần gọi). Prompt quá dài -> bỏ dần phần mã vòng 1.
+# Gắn cờ fp_overridden khi kết luận false positive không có căn cứ (ungrounded_fp_reason).
 def run_advisor(agent: Round2Advisor, job: dict[str, Any], findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     results = []
     full = agent.previous_attempt
@@ -389,10 +414,13 @@ def run_advisor(agent: Round2Advisor, job: dict[str, Any], findings: list[dict[s
 # ──────────────────────────────────────────────────────────────────────────────
 # One function
 # ──────────────────────────────────────────────────────────────────────────────
+# Dòng có thuộc nhóm bị loại khỏi nhóm chính không (18 hàm mà bản vá vòng 1 sinh lỗi mới).
 def is_excluded(row: dict[str, str]) -> bool:
     return row.get("claude_ly_do_chon") == EXCLUDED_LABEL
 
 
+# Chỉ lấy các cột vòng 1 mà HỆ THỐNG được phép dùng (mã gốc, bản vá vòng 1, lý do, SWC...).
+# Các cột claude_* (nhận xét của giám khảo) KHÔNG bao giờ được đưa vào prompt -> tránh rò rỉ đáp án.
 def build_job(row: dict[str, str]) -> dict[str, Any]:
     """The only round-1 fields the system may use. claude_* columns stay out of here."""
     job = {
@@ -409,6 +437,7 @@ def build_job(row: dict[str, str]) -> dict[str, Any]:
     return job
 
 
+# Mọi finding của hàm ở vòng 1 (đã xác nhận + bị Advisor loại), mỗi SWC một finding, kèm mã và dòng của hàm.
 def target_findings(round1: dict[str, Any], job: dict[str, Any], unit: CodeUnit) -> list[dict[str, Any]]:
     """Every finding reported for the function in round 1 (confirmed + Advisor-dismissed), one per SWC."""
     detector = round1["server"].get("phases", {}).get("detector", {})
@@ -424,6 +453,7 @@ def target_findings(round1: dict[str, Any], job: dict[str, Any], unit: CodeUnit)
     return list(found.values())
 
 
+# Hướng dẫn sửa lỗi từ KB theo từng SWC (cách sửa + cặp mã lỗi/mã sửa mẫu) - vòng 1 Fixer chỉ thấy tiêu đề lỗi.
 def kb_guidance(swcs: list[str], unit_code: str) -> str:
     """Knowledge-base remediation per SWC (the same retrieval the Advisor sees); round 1 gave the fixer titles only."""
     kb = _knowledge_base()
@@ -443,12 +473,15 @@ def kb_guidance(swcs: list[str], unit_code: str) -> str:
             + "\n".join(blocks))
 
 
+# Luật chung: chỉ sha3 bị thay bằng keccak256; sha256/ripemd160 phải giữ nguyên.
 def general_rules(raw_code: str) -> str:
     if re.search(r"\b(sha256|ripemd160)\s*\(", raw_code):
         return "Only `sha3` is deprecated (-> keccak256); keep `sha256` / `ripemd160` calls unchanged."
     return ""
 
 
+# Dựng phần "feedback" cho prompt Fixer vòng 2: chẩn đoán của Advisor (root cause, dòng, kịch bản tấn công),
+# các finding bị coi là false positive, hướng dẫn KB, luật chung, và lần sửa vòng 1 (hiện mã, hoặc chỉ mô tả khi gọi lại).
 def build_feedback_note(tp: list[dict], fp: list[dict], job: dict[str, Any], residual: list, introduced: list,
                         show_previous_code: bool = True, guidance: str = "") -> str:
     parts = []
@@ -497,12 +530,14 @@ def build_feedback_note(tp: list[dict], fp: list[dict], job: dict[str, Any], res
     return "\n\n".join(parts)
 
 
+# Chỉ giữ các ca RAG cùng SWC với hàm này (vòng 1 đưa ca RAG của cả contract cho mọi hàm).
 def unit_rag_section(round1: dict[str, Any], swcs: set[str]) -> str:
     """Round 1 fed the contract-level RAG cases to every function; keep only cases of this function's SWCs."""
     context = [item for item in round1["rag"].get("retrieved_context", []) if item.get("swc") in swcs]
     return _build_rag_knowledge_section(context, target_swc=next(iter(sorted(swcs)), None))
 
 
+# Bản vá có xoá lời gọi sha256/ripemd160 không (làm thay đổi mọi hash contract đã lưu).
 def removed_hash_calls(raw_code: str, new_code: str) -> str:
     """sha256/ripemd160 are not deprecated; replacing them changes every hash the contract stores."""
     lost = [name for name in ("sha256", "ripemd160")
@@ -510,6 +545,7 @@ def removed_hash_calls(raw_code: str, new_code: str) -> str:
     return f"removed {'/'.join(lost)} call(s)" if lost else ""
 
 
+# Khôi phục câu trả lời bị escape kiểu JSON (\n, \" dạng chữ) về mã bình thường.
 def unescape_reply(code: str) -> str:
     """Undo a JSON-escaped reply (literal \\n, \\" instead of newlines/quotes); seen once in round 2 (#239)."""
     if not code or code.count("\\n") <= code.count("\n"):
@@ -520,6 +556,7 @@ def unescape_reply(code: str) -> str:
         return code.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
 
 
+# Hai đoạn mã có giống nhau khi bỏ khoảng trắng không (phát hiện model chép lại bản vá vòng 1).
 def _same_code(left: str | None, right: str | None) -> bool:
     return bool(left) and "".join(left.split()) == "".join((right or "").split())
 
@@ -530,6 +567,7 @@ def _same_code(left: str | None, right: str | None) -> bool:
 _compiler_cache: dict[str, tuple[Path | None, bool, str]] = {}
 
 
+# Chọn solc mà contract GỐC compile được (không có pragma thì thử từ bản cũ nhất) -> (solc, gốc compile được?, nhãn).
 def _original_compiler(run_id: str, raw_contract: str) -> tuple[Path | None, bool, str]:
     """(solc, original compiles?, label). Without a pragma select_best_solc picks the newest solc, which rejects
     0.4 syntax; then the oldest installed version the original contract compiles with is used."""
@@ -546,6 +584,7 @@ def _original_compiler(run_id: str, raw_contract: str) -> tuple[Path | None, boo
     return _compiler_cache[run_id]
 
 
+# Contract không có pragma -> ghi chú cho Fixer biết phiên bản solc thật + luật cú pháp tương ứng.
 def compiler_note(job: dict[str, Any]) -> str:
     """The fixer prompt takes its version rules from the pragma; without one, name the solc the original
     compiles with (#1130: no pragma, so the fixer wrote `require(x, "msg")`, which 0.4.11 rejects)."""
@@ -558,12 +597,16 @@ def compiler_note(job: dict[str, Any]) -> str:
             if rules else "")
 
 
+# Rút gọn lỗi solc thành một dòng ngắn (tối đa 4 dòng, 400 ký tự).
 def _solc_errors(text: str) -> str:
     text = re.sub(r"(/\S+?\.sol|<stdin>):(\d+):(\d+):", r"line \2:", text or "")
     lines = [line.rstrip() for line in text.splitlines() if line.strip()]
     return " | ".join(lines[:4])[:400]
 
 
+# [SELF-CHECK - chỉ dùng tool local, không LLM] Kiểm tra câu trả lời so với contract GỐC: ghép được không, compile được
+# với solc của bản gốc không, qua guard hành vi không, có xoá sha256 không, re-scan static+RAG có lỗi MỚI không.
+# Trả danh sách vấn đề mà bản gốc không có.
 def self_check(job: dict[str, Any], unit: CodeUnit, reply: str, original_pairs: list) -> dict[str, Any]:
     """Problems the reply has that the original contract does not (local tools only, no LLM)."""
     issues: list[str] = []
@@ -598,6 +641,7 @@ def self_check(job: dict[str, Any], unit: CodeUnit, reply: str, original_pairs: 
     return check
 
 
+# Viết feedback từ kết quả self-check để gọi Fixer thêm 1 lần.
 def self_check_feedback(reply: str, check: dict[str, Any]) -> str:
     return (
         "Automated self-check of your previous reply (shown below) found problems that the ORIGINAL function "
@@ -607,6 +651,7 @@ def self_check_feedback(reply: str, check: dict[str, Any]) -> str:
     )
 
 
+# Chấm P(vulnerable) của một hàm bằng detector v13 (chỉ ghi nhận khi bật --score-detector).
 def _detector_prob(unit: CodeUnit | None, server_url: str | None) -> float | None:
     if unit is None:
         return None
@@ -618,10 +663,19 @@ def _detector_prob(unit: CodeUnit | None, server_url: str | None) -> float | Non
     return result[0].get("vulnerability_probability") if result else None
 
 
+# Tìm unit theo unit_id trong một mã nguồn.
 def _unit_in(code: str, unit_id: str) -> CodeUnit | None:
     return next((unit for unit in parse_code_units(code) if unit.unit_id == unit_id), None)
 
 
+# [XỬ LÝ MỘT HÀM - VÒNG 2]
+#   1) re-scan bản vá vòng 1 (residual / introduced);
+#   2) Advisor cho từng finding (cache vào SQLite);
+#   3) Fixer sửa lại TỪ MÃ GỐC với chẩn đoán + lần thử vòng 1 + hướng dẫn KB; prompt quá dài thì bỏ dần
+#      (mã vòng 1 -> ca RAG -> hướng dẫn KB); trả về y nguyên / chép bản vòng 1 / xoá sha256 -> gọi lại 1 lần;
+#   4) (--self-check) nếu câu trả lời có vấn đề mới -> gọi Fixer thêm 1 lần, giữ bản ít vấn đề hơn;
+#   5) (--score-detector) ghi xác suất detector của bản vòng 1 và vòng 2.
+# Không có verifier: kết quả Fixer là kết quả vòng 2 (giám khảo ngoài chấm CSV).
 def process_function(job: dict[str, Any], cached_advisor: list | None, args: argparse.Namespace,
                      db: sqlite3.Connection, batch_dir: Path) -> dict[str, Any]:
     round1 = load_round1(args.round1_runs, job["run_id"])
@@ -679,6 +733,7 @@ def process_function(job: dict[str, Any], cached_advisor: list | None, args: arg
         trim_steps = ["previous code dropped", "RAG cases dropped", "KB guidance dropped"]
         trim = 0
 
+        # Một lần gọi Fixer (patch_unit, single_pass) với feedback vòng 2; tự cắt prompt khi gặp lỗi 413, báo ServerOutage khi server sập.
         def fix(show_previous_code: bool, extra: str = "") -> dict[str, Any]:
             nonlocal trim
             while True:
@@ -763,6 +818,7 @@ def process_function(job: dict[str, Any], cached_advisor: list | None, args: arg
 _kb: RepairKnowledgeBase | None = None
 
 
+# Tạo RepairKnowledgeBase một lần và dùng lại (singleton).
 def _knowledge_base() -> RepairKnowledgeBase:
     global _kb
     if _kb is None:
@@ -773,6 +829,7 @@ def _knowledge_base() -> RepairKnowledgeBase:
 # ──────────────────────────────────────────────────────────────────────────────
 # Commands
 # ──────────────────────────────────────────────────────────────────────────────
+# Chờ đến khi trong khung giờ cho phép và GPU server sẵn sàng (giống batch vòng 1).
 def wait_until_runnable(args: argparse.Namespace, stop_file: Path, log) -> bool:
     window = parse_active_hours(args.active_hours)
     waiting_for = None
@@ -795,11 +852,13 @@ def wait_until_runnable(args: argparse.Namespace, stop_file: Path, log) -> bool:
     return False
 
 
+# Dòng thuộc nhóm nào: main = các hàm vòng 2 sửa lại (614); regress = 18 hàm mà bản vá vòng 1 sinh lỗi mới.
 def in_group(row: dict[str, str], group: str) -> bool:
     """main = the functions round 2 repairs; regress = the 18 whose round-1 patch introduced a new problem."""
     return is_excluded(row) == (group == "regress")
 
 
+# Đưa các hàm của nhóm đang chạy vào bảng functions (mỗi hàm một lần).
 def register(db: sqlite3.Connection, rows: dict[int, dict[str, str]], group: str) -> int:
     runnable = [stt for stt in sorted(rows) if in_group(rows[stt], group)]
     db.executemany("INSERT OR IGNORE INTO functions (stt) VALUES (?)", [(stt,) for stt in runnable])
@@ -807,6 +866,8 @@ def register(db: sqlite3.Connection, rows: dict[int, dict[str, str]], group: str
     return len(runnable)
 
 
+# [LỆNH "run"] Vòng lặp chính vòng 2: khoá tuỳ chọn, đăng ký hàm, rồi lần lượt từng hàm: chờ server ->
+# process_function -> lưu done/failed; server sập -> xếp lại (quá 5 lần liên tiếp mà /health vẫn ready -> failed).
 def command_run(args: argparse.Namespace) -> None:
     batch_dir = BATCH_RUNS_DIR / args.batch
     db = connect(batch_dir)
@@ -888,6 +949,7 @@ def command_run(args: argparse.Namespace) -> None:
     log(f"Stopped: {counts(db)}.")
 
 
+# [LỆNH "prepare"] Re-scan trước mọi contract đã vá ở vòng 1 (chỉ cần máy local, không cần GPU).
 def command_prepare(args: argparse.Namespace) -> None:
     """Re-scan every round-1 patched contract (local static + RAG, no GPU needed)."""
     batch_dir = BATCH_RUNS_DIR / args.batch
@@ -903,6 +965,7 @@ def command_prepare(args: argparse.Namespace) -> None:
             print(f"[{index}/{len(run_ids)}] {run_id} FAILED: {type(error).__name__}: {error}", flush=True)
 
 
+# [LỆNH "preview"] In ra prompt Advisor và Fixer của một hàm (không gọi LLM) - để kiểm tra/minh hoạ.
 def command_preview(args: argparse.Namespace) -> None:
     """Print what the Advisor and Fixer would receive for one function (no LLM call)."""
     batch_dir = BATCH_RUNS_DIR / args.batch
@@ -936,6 +999,7 @@ def command_preview(args: argparse.Namespace) -> None:
     ))
 
 
+# [LỆNH "status"] In tiến độ vòng 2.
 def command_status(args: argparse.Namespace) -> None:
     batch_dir = BATCH_RUNS_DIR / args.batch
     if not (batch_dir / "state.sqlite").exists():
@@ -954,6 +1018,7 @@ def command_status(args: argparse.Namespace) -> None:
         print(f"  failed #{row['stt']}: {(row['error'] or '').splitlines()[0][:150]}")
 
 
+# Dựng một dòng CSV đầu ra: thông tin vòng 1 + kết quả vòng 2 (trạng thái, mã vá, lý do, Advisor, re-scan, self-check...).
 def _row_out(row: dict[str, str], state: sqlite3.Row | None, group: str = "main") -> dict[str, Any]:
     excluded = group == "main" and is_excluded(row)
     out: dict[str, Any] = {
@@ -1017,6 +1082,8 @@ def _row_out(row: dict[str, str], state: sqlite3.Row | None, group: str = "main"
     return out
 
 
+# [LỆNH "export"] Xuất CSV kết quả: nhóm main = cả 632 dòng (18 dòng regress ghi "excluded"); nhóm regress = 18 dòng.
+# --blind: bỏ các cột nhận xét/điểm của giám khảo vòng 1 (JUDGE_COLUMNS) -> bản để chấm "mù" vòng 2.
 def export(batch: str, input_path: Path, group: str = "main", out: Path | None = None, blind: bool = False,
            quiet: bool = False) -> Path:
     """main: all 632 rows (the regress group as `excluded`); regress: only its 18 rows."""
@@ -1040,6 +1107,7 @@ def export(batch: str, input_path: Path, group: str = "main", out: Path | None =
     return path
 
 
+# Nhóm (main/regress) mà batch đã được khởi chạy (để export không cần --group).
 def _batch_group(batch: str, fallback: str) -> str:
     """The group a batch was started with (so `export` needs no --group)."""
     path = BATCH_RUNS_DIR / batch / "state.sqlite"
@@ -1050,6 +1118,7 @@ def _batch_group(batch: str, fallback: str) -> str:
     return row[0] if row else fallback
 
 
+# [LỆNH "retry-failed"] Đưa các hàm failed về pending.
 def command_retry_failed(args: argparse.Namespace) -> None:
     db = connect(BATCH_RUNS_DIR / args.batch)
     changed = db.execute("UPDATE functions SET status = 'pending', attempts = 0 WHERE status = 'failed'").rowcount
@@ -1057,10 +1126,13 @@ def command_retry_failed(args: argparse.Namespace) -> None:
     print(f"{changed} failed function(s) re-queued.")
 
 
+# Tham số CLI vòng 2: run / prepare / preview / status / export / retry-failed, --group, --self-check,
+# --score-detector, --on-all-dismissed, --wait, --active-hours...
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Round-2 repair of the functions sent back by the evaluation.")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    # Thêm các tham số chung (--batch, --input, --round1-runs, --group) cho một lệnh con.
     def common(command: argparse.ArgumentParser) -> None:
         command.add_argument("--batch", default="round2", help="Folder under data/results/.")
         command.add_argument("--input", type=Path, default=DEFAULT_INPUT)
@@ -1069,6 +1141,7 @@ def parse_args() -> argparse.Namespace:
                              help="main: the functions round 1 did not repair; regress: the 18 whose round-1 "
                                   "patch introduced a new problem (run in their own batch).")
 
+    # Thêm các tuỳ chọn ảnh hưởng tới kết quả (--score-detector, --on-all-dismissed, --self-check).
     def options(command: argparse.ArgumentParser) -> None:
         command.add_argument("--score-detector", action="store_true",
                              help="Record the v13 detector probability of the round-1 and round-2 function "
@@ -1107,6 +1180,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Điểm vào: `python -m E2E.experiments.repair_round2 <lệnh>` (scripts/run_round2.sh gọi hàm này).
 def main() -> None:
     args = parse_args()
     if args.command == "run":

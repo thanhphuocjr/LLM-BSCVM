@@ -38,6 +38,11 @@ SLITHER_CHECK_TO_SWC: dict[str, tuple[str, str, str]] = {
 }
 
 
+# Nhiệm vụ: chuyển kết quả thô của StaticAnalyzer thành các "dòng finding" chuẩn của pipeline
+# {source, swc, title, severity, confidence, confirmed, line, unit_id, evidence, notes}.
+# Điểm quan trọng: với các loại lỗi dễ báo nhầm (SIGNAL_GATED_TYPES: reentrancy, overflow, ...),
+# finding chỉ được "confirmed" khi SWC agent tương ứng (phase1b_rag/swc_agents.py) cũng thấy tín hiệu.
+# Dòng (line) được đổi từ dòng trong hàm sang dòng trong cả file (unit.start_line + line - 1).
 def _finding_rows(
     result: dict[str, Any],
     analysis_code: str,
@@ -87,6 +92,13 @@ def _finding_rows(
     return rows
 
 
+# [HÀM CHÍNH PHASE 1A] Phân tích tĩnh toàn contract.
+# Các bước: (1) tìm guard modifier (onlyOwner...), (2) chạy bộ luật trên cả contract và trên từng unit,
+# (3) chạy Slither thật (nếu đã cài) và ánh xạ check -> SWC bằng SLITHER_CHECK_TO_SWC,
+# (4) khử trùng lặp theo (SWC, dòng) - ưu tiên Slither/finding có unit_id,
+# (5) chỉ giữ finding confirmed; finding chưa xác nhận để ở "candidates".
+# Trả về: score (= confidence cao nhất), verdict, risk_level, findings, unit_results (kết quả từng hàm).
+# Gọi bởi: orchestrator.run_pipeline (song song với run_rag), candidate_check/final_verification (chạy lại trên bản vá).
 def run_static(code: str, units: list[CodeUnit] | None = None) -> dict[str, Any]:
     parsed_units = units or parse_code_units(code)
     guard_modifiers = extract_guard_modifiers(code)

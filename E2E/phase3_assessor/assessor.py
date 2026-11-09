@@ -28,6 +28,7 @@ from E2E.common.gpu_client import ServerGPUClient
 RISK_LEVELS = ("Critical", "High", "Medium", "Low")
 
 # Fallback mapping when the LLM returns a CVSS score but an off-vocabulary level.
+# Đổi điểm CVSS thành mức rủi ro: >= 9.0 Critical, >= 7.0 High, >= 4.0 Medium, còn lại Low (theo chuẩn CVSS v3.1).
 def cvss_to_level(score: float) -> str:
     if score >= 9.0:
         return "Critical"
@@ -38,6 +39,7 @@ def cvss_to_level(score: float) -> str:
     return "Low"
 
 
+# Chuẩn hoá mức rủi ro do LLM trả về; nếu không thuộc 4 mức chuẩn thì suy ra từ điểm CVSS (mặc định Medium).
 def normalize_level(level: object, cvss_score: float | None = None) -> str:
     text = str(level or "").strip().title()
     if text in RISK_LEVELS:
@@ -47,6 +49,9 @@ def normalize_level(level: object, cvss_score: float | None = None) -> str:
     return "Medium"
 
 
+# Nhiệm vụ: tính điểm CVSS v3.1 base score bằng CÔNG THỨC chuẩn FIRST từ 8 metric
+# (AV, AC, PR, UI, S, C, I, A): ISS -> Impact, Exploitability -> làm tròn lên 1 chữ số. Trả (điểm, vector).
+# Mục đích: LLM chỉ CHỌN metric, điểm số luôn được tính tất định (không để model "bịa" điểm).
 def compute_cvss_31_base_score(
     av: str = "N",
     ac: str = "L",
@@ -139,6 +144,8 @@ RISK_RESPONSE_SCHEMA: Dict[str, Any] = {
 }
 
 
+# Kết quả đánh giá rủi ro của MỘT lỗ hổng: mức rủi ro, điểm + vector CVSS, khả năng xảy ra (likelihood),
+# mức tác động, có nguy cơ mất tiền không (funds_at_risk), lý giải, thứ tự ưu tiên sửa.
 @dataclass
 class RiskAssessment:
     swc: str
@@ -155,7 +162,9 @@ class RiskAssessment:
     error: str | None = None
 
 
+# Agent Assessor (Phase 3): dùng LLM để chọn các metric CVSS v3.1 theo ngữ cảnh smart contract.
 class AssessorAgent:
+    # Gắn client LLM và (nếu có) RepairKnowledgeBase để lấy risk_guidance theo SWC.
     def __init__(
         self,
         llm: ServerGPUClient | None = None,
@@ -172,6 +181,9 @@ class AssessorAgent:
                 self.knowledge_base = None
 
     # ── prompt ──────────────────────────────────────────────────────────────
+    # Dựng prompt Assessor: thông tin lỗ hổng (SWC, tên, mức độ, root cause, impact từ Advisor),
+    # hướng dẫn từ KB (mức độ chuẩn của SWC, CWE, checklist), mã contract (<= 10k ký tự) và schema JSON
+    # với giải thích từng metric CVSS theo ngữ cảnh blockchain.
     @staticmethod
     def _build_prompt(
         code: str,
@@ -249,6 +261,9 @@ class AssessorAgent:
         return "\n".join(sections)
 
     # ── single assessment ───────────────────────────────────────────────────
+    # [HÀM CHÍNH] Đánh giá MỘT lỗ hổng: false positive -> trả rủi ro Low, CVSS 0; ngược lại gọi LLM chọn metric
+    # -> compute_cvss_31_base_score -> mức rủi ro; suy ra likelihood (AC/PR) và impact_rating (I/A/funds_at_risk).
+    # LLM lỗi -> trả RiskAssessment có error (phase sẽ dùng CVSS mặc định theo SWC).
     def assess_one(self, code: str, item: Dict[str, Any]) -> RiskAssessment:
         swc = item.get("swc") or "Unknown"
         name = item.get("vulnerability_name") or item.get("title") or "Unknown vulnerability"

@@ -6,11 +6,14 @@ from E2E.phase1a_static.static_analyzer import run_static_analysis
 from E2E.phase1a_static.static_runner import run_static
 
 
+# Tập loại lỗ hổng (vuln_type) mà run_static_analysis tìm thấy trong đoạn mã.
 def finding_types(code: str) -> set[str]:
     return set(run_static_analysis(code)["findings"])
 
 
+# Kiểm tra 25 kiểm tra ngữ nghĩa kiểu Slither trong static_analyzer: có lỗi thì báo, ca an toàn tương tự thì không.
 class SlitherDerivedStaticRuleTests(unittest.TestCase):
+    # Ký tự Unicode đảo chiều (U+202E) bị phát hiện kể cả nằm trong comment.
     def test_bidirectional_control_is_detected_even_inside_comment(self) -> None:
         code = "// hidden direction: \u202e\ncontract C {}"
         result = run_static_analysis(code)
@@ -20,6 +23,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
         self.assertEqual(finding.vuln_id, "SWC-130")
         self.assertEqual(finding.matches[0].line, 1)
 
+    # "^" chỉ bị báo khi đi với hằng số thập phân (không báo pragma ^0.x).
     def test_incorrect_exponentiation_requires_decimal_constant(self) -> None:
         vulnerable = """
         contract C {
@@ -43,6 +47,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
             "incorrect_exponentiation_operator", finding_types(xor_mask)
         )
 
+    # abi.encodePacked chỉ bị báo khi có 2 đối số động liền nhau.
     def test_encode_packed_requires_adjacent_dynamic_arguments(self) -> None:
         vulnerable = """
         contract C {
@@ -66,6 +71,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
         self.assertIn("abi_encode_packed_collision", finding_types(vulnerable))
         self.assertNotIn("abi_encode_packed_collision", finding_types(separated))
 
+    # transferFrom với "from" tuỳ ý và transfer bỏ qua kết quả bị báo; dạng an toàn thì không.
     def test_arbitrary_and_unchecked_erc20_transfer_from(self) -> None:
         vulnerable = """
         interface IERC20 {
@@ -97,6 +103,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
         self.assertNotIn("arbitrary_erc20_transfer_from", checked_types)
         self.assertNotIn("unchecked_erc20_transfer", checked_types)
 
+    # Locked ether: nhận ETH mà không có đường rút -> báo; có đường rút -> không.
     def test_ether_must_have_an_outgoing_path(self) -> None:
         locked = """
         contract Vault {
@@ -116,6 +123,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
         self.assertIn("locked_ether", finding_types(locked))
         self.assertNotIn("locked_ether", finding_types(withdrawable))
 
+    # msg.value / delegatecall trong vòng lặp của hàm payable bị báo.
     def test_msg_value_and_delegatecall_in_payable_loops(self) -> None:
         vulnerable = """
         contract Batch {
@@ -152,6 +160,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
         self.assertNotIn("msg_value_in_loop", control_types)
         self.assertNotIn("delegatecall_in_loop", control_types)
 
+    # Thiếu kiểm tra zero-address chỉ báo khi tham số thực sự được ghi vào state / dùng làm đích.
     def test_zero_address_check_is_usage_based(self) -> None:
         vulnerable = """
         contract Owned {
@@ -195,6 +204,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
             "missing_zero_address_validation", finding_types(custom_error_check)
         )
 
+    # Lỗi gõ "=+", so sánh với chính nó, cú pháp lỗi thời (throw, sha3, msg.gas...) bị báo.
     def test_logic_typo_and_deprecated_usage_rules(self) -> None:
         code = """
         pragma solidity 0.4.26;
@@ -223,6 +233,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
             "incorrect_unary_expression", finding_types(legitimate_negative)
         )
 
+    # Chữ ký transfer chuẩn không bị báo nhầm là short-address.
     def test_standard_transfer_signature_is_not_short_address_finding(self) -> None:
         code = """
         pragma solidity 0.8.20;
@@ -234,6 +245,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
 
         self.assertNotIn("short_address_attack", finding_types(code))
 
+    # Che chuỗi/comment không làm lệch số dòng của finding.
     def test_semantic_match_keeps_original_line_after_string_masking(self) -> None:
         code = """contract C {
             string constant TEXT = "a long string that changes columns";
@@ -246,6 +258,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
 
         self.assertEqual(match.line, 4)
 
+    # Luật ngữ nghĩa mới đi qua run_static thành finding confirmed.
     def test_new_rule_flows_through_static_runner_as_confirmed_finding(self) -> None:
         code = """
         contract C {
@@ -263,6 +276,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
             any(item["swc"] == "SWC-133" for item in result["findings"])
         )
 
+    # shl/shr đảo tham số chỉ bị báo trong assembly.
     def test_incorrect_shift_only_inside_assembly_with_reversed_shape(self) -> None:
         vulnerable = """
         contract C {
@@ -282,6 +296,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
         self.assertIn("incorrect_shift_in_assembly", finding_types(vulnerable))
         self.assertNotIn("incorrect_shift_in_assembly", finding_types(correct))
 
+    # Độ dài mảng chỉ bị báo khi là mảng state và giá trị từ caller.
     def test_controlled_array_length_requires_state_array_and_caller_input(self) -> None:
         vulnerable = """
         pragma solidity 0.5.16;
@@ -305,6 +320,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
         self.assertIn("controlled_array_length", finding_types(vulnerable))
         self.assertNotIn("controlled_array_length", finding_types(constant_resize))
 
+    # Truyền mảng storage vào tham số memory bị báo; tham số storage thì không.
     def test_array_by_reference_distinguishes_memory_and_storage(self) -> None:
         vulnerable = """
         contract C {
@@ -328,6 +344,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
         self.assertIn("array_by_reference", finding_types(vulnerable))
         self.assertNotIn("array_by_reference", finding_types(correct))
 
+    # Chỉ báo khi có CẢ constructor() lẫn hàm trùng tên contract.
     def test_multiple_constructor_schemes_require_both_forms(self) -> None:
         vulnerable = """
         pragma solidity 0.4.22;
@@ -348,6 +365,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
             "multiple_constructor_schemes", finding_types(one_constructor)
         )
 
+    # Mapping public trỏ struct lồng chỉ bị báo với Solidity 0.4.
     def test_public_nested_mapping_is_limited_to_solidity_04(self) -> None:
         vulnerable = """
         pragma solidity 0.4.25;
@@ -373,6 +391,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
             "public_mapping_with_nested_struct", finding_types(modern)
         )
 
+    # delete struct chứa mapping (kể cả lồng nhiều lớp) bị báo.
     def test_delete_struct_with_mapping_is_detected_recursively(self) -> None:
         vulnerable = """
         contract Registry {
@@ -393,6 +412,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
         self.assertIn("mapping_deletion_in_struct", finding_types(vulnerable))
         self.assertNotIn("mapping_deletion_in_struct", finding_types(simple_struct))
 
+    # So sánh luôn đúng/sai theo miền giá trị kiểu số bị báo.
     def test_type_based_tautology_uses_integer_range(self) -> None:
         vulnerable = """
         contract C {
@@ -424,6 +444,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
         """
         self.assertNotIn("type_based_tautology", finding_types(shadowed_names))
 
+    # Dùng true/false sai trong điều kiện bị báo; return true hợp lệ thì không.
     def test_boolean_constant_misuse_keeps_legitimate_bare_constants(self) -> None:
         vulnerable = """
         contract C {
@@ -445,6 +466,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
         self.assertIn("boolean_constant_misuse", finding_types(vulnerable))
         self.assertNotIn("boolean_constant_misuse", finding_types(legitimate))
 
+    # So sánh == với balance bị báo; so sánh >= (ngưỡng) thì không.
     def test_balance_equality_flags_exact_target_not_threshold(self) -> None:
         vulnerable = """
         contract Vault {
@@ -465,6 +487,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
         self.assertIn("dangerous_balance_equality", finding_types(vulnerable))
         self.assertNotIn("dangerous_balance_equality", finding_types(threshold))
 
+    # Ép kiểu enum chỉ bị báo với solc bị lỗi (<= 0.4.4).
     def test_enum_conversion_is_limited_to_vulnerable_exact_compiler(self) -> None:
         vulnerable = """
         pragma solidity 0.4.2;
@@ -480,6 +503,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
         self.assertIn("dangerous_enum_conversion", finding_types(vulnerable))
         self.assertNotIn("dangerous_enum_conversion", finding_types(fixed_compiler))
 
+    # Hàm internal 2 giá trị trả về dùng Yul return() bị báo (nên dùng leave).
     def test_internal_two_value_assembly_return_should_use_leave(self) -> None:
         vulnerable = """
         contract C {
@@ -495,6 +519,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
             "return_instead_of_leave", finding_types(external_function)
         )
 
+    # Gọi hàm có Yul return() mà phía sau còn code -> bị báo.
     def test_assembly_return_with_following_caller_code_is_detected(self) -> None:
         vulnerable = """
         contract C {
@@ -515,6 +540,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
         self.assertIn("incorrect_assembly_return", finding_types(vulnerable))
         self.assertNotIn("incorrect_assembly_return", finding_types(terminal_call))
 
+    # Bug ABIEncoderV2 chỉ báo khi pin đúng solc bị lỗi.
     def test_abiencoderv2_storage_array_bug_requires_pinned_bad_compiler(self) -> None:
         vulnerable = """
         pragma solidity 0.5.9;
@@ -533,6 +559,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
             "storage_abiencoderv2_array", finding_types(fixed_compiler)
         )
 
+    # Bug mảng int storage chỉ báo khi gán cả mảng, không báo khi gán từng phần tử.
     def test_signed_storage_array_bug_ignores_element_assignment(self) -> None:
         vulnerable = """
         pragma solidity 0.5.9;
@@ -558,6 +585,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
             "signed_storage_array_compiler_bug", finding_types(fixed_compiler)
         )
 
+    # Che biến state chỉ báo khi contract cha (đã biết) có biến cùng tên.
     def test_state_shadowing_requires_same_name_in_known_base(self) -> None:
         vulnerable = """
         contract Base { address internal owner; }
@@ -576,6 +604,7 @@ class SlitherDerivedStaticRuleTests(unittest.TestCase):
         self.assertNotIn("state_variable_shadowing", finding_types(distinct))
         self.assertNotIn("state_variable_shadowing", finding_types(upgrade_gap))
 
+    # Biến address chưa khởi tạo chỉ báo khi được dùng làm đích chuyển ETH/call.
     def test_uninitialized_state_address_requires_dangerous_read(self) -> None:
         vulnerable = """
         contract Payout {

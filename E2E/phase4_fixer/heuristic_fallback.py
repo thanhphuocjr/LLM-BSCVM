@@ -18,6 +18,7 @@ from E2E.phase4_fixer.behavior_guard import validate_observable_behavior
 from E2E.phase4_fixer.patching import apply_unit_patches
 
 
+# Gộp mọi khoảng trắng liên tiếp thành một dấu cách (so sánh mã không phụ thuộc định dạng).
 def _normalize_ws(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
@@ -26,6 +27,12 @@ def _normalize_ws(value: str) -> str:
 MIN_EMPIRICAL_SNIPPET_CHARS = 40
 
 
+# [VÁ DỰ PHÒNG TẤT ĐỊNH] Dùng khi Fixer LLM không cho bản vá nào áp dụng được (không dùng ở single_pass). Thứ tự:
+#   1) bản sửa từ KB khi đoạn mã lỗi trong KB khớp CHÍNH XÁC (>= 40 ký tự) với contract hoặc với cả hàm;
+#   2) fixed_code của Advisor cho hàm đó (phải qua guard hành vi);
+#   3) 2 luật kinh điển: thêm onlyOwner cho setOwner (SWC-105) và đảo thứ tự CEI cho reentrancy (SWC-107).
+# Mỗi outcome gắn "engine" (rag_empirical_patch / advisor_fixed_code / rule_based_fallback) để báo cáo
+# không bao giờ trình bày nó như là kết quả của model.
 def _apply_heuristic_security_patch(
     code: str,
     findings: list[dict[str, Any]],
@@ -46,6 +53,7 @@ def _apply_heuristic_security_patch(
     patch_outcomes: list[dict[str, Any]] = []
     patched_units: set[str] = set()
 
+    # Ghép bản thay thế vào một unit nếu: chưa vá, có tên hàm, khác bản gốc và qua guard hành vi.
     def splice(unit: CodeUnit, replacement: str, summary: str) -> bool:
         nonlocal fixed_code
         if unit.unit_id in patched_units or unit.name not in replacement:
@@ -105,6 +113,7 @@ def _apply_heuristic_security_patch(
     if patch_outcomes:
         return fixed_code, patch_outcomes
 
+    # Tìm unit theo tên (chỉ khi tên là duy nhất).
     def unit_named(name: str) -> CodeUnit | None:
         matches = [unit for unit in units if unit.name == name]
         return matches[0] if len(matches) == 1 else None

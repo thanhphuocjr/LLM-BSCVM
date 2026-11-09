@@ -38,10 +38,12 @@ _LOCAL_DECL_RE = re.compile(
 _STATE_WRITE_RE = re.compile(r"([A-Za-z_$][\w$]*)(?:\s*\[[^\]]+\])*\s*(\+=|-=|\*=|/=|%=|=)(?!=)")
 
 
+# Bỏ comment // và /* */ trước khi so sánh hành vi.
 def _strip_comments(code: str) -> str:
     return re.sub(r"/\*.*?\*/", "", re.sub(r"//[^\n]*", "", code), flags=re.DOTALL)
 
 
+# Tên tham số và biến cục bộ (không phải storage): gán lại chúng KHÔNG phải là thay đổi state.
 def _local_names(code: str) -> set[str]:
     """Parameters and non-storage local variables: rewriting them is not a state change."""
     names = set()
@@ -53,6 +55,7 @@ def _local_names(code: str) -> set[str]:
     return names
 
 
+# Tập tên biến state bị ghi trong hàm (=, +=, -=, ...), đã loại biến cục bộ.
 def _state_writes(code: str) -> set[str]:
     local = _local_names(code)
     return {
@@ -62,6 +65,7 @@ def _state_writes(code: str) -> set[str]:
     }
 
 
+# Tập event được phát: "emit X(...)" hoặc câu lệnh "X(...);" kiểu Solidity cũ (< 0.4.21), không tính ép kiểu.
 def _emitted_events(code: str) -> set[str]:
     """`emit X(...)`, or a legacy (<0.4.21) statement `X(...);` that is a call on its own.
 
@@ -85,6 +89,11 @@ def _emitted_events(code: str) -> set[str]:
     return events
 
 
+# [GUARD HÀNH VI] So sánh hàm gốc và bản vá; raise ValueError nếu bản vá làm MẤT:
+#   - chuyển ETH (call{value}/transfer/send - chấp nhận dạng an toàn tương đương như sendValue, safeTransfer),
+#   - lệnh return, event đã phát, hoặc lệnh ghi biến state.
+# Mục đích: chặn bản vá "sửa lỗi bằng cách xoá chức năng". Là kiểm tra cú pháp, không phải chứng minh tương đương.
+# Dùng ở: Fixer (trước khi ghép), vá heuristic, Phase 5 và self-check của vòng 2.
 def validate_observable_behavior(original: str, replacement: str) -> None:
     """
     Guard bảo toàn hành vi (Phase 4 / Phase 5) — kiểm tra cú pháp các tín hiệu observable:

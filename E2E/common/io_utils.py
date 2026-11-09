@@ -10,14 +10,18 @@ from pathlib import Path
 from typing import Any
 
 
+# Trả về thời điểm hiện tại theo UTC dạng ISO-8601 (ghi vào created_at / completed_at của artifact).
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# Băm SHA-256 một chuỗi. Dùng để định danh mã nguồn (run_id, kiểm tra kết quả GPU khớp đúng source).
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+# Chuyển đệ quy dataclass / Path / set / tuple thành kiểu JSON được (dict, list, str).
+# Mục đích: write_json ghi được mọi đối tượng của pipeline (CodeUnit, Path...) mà không lỗi.
 def jsonable(value: Any) -> Any:
     if is_dataclass(value):
         return jsonable(asdict(value))
@@ -30,11 +34,14 @@ def jsonable(value: Any) -> Any:
     return value
 
 
+# Đọc một file JSON (UTF-8) và trả về đối tượng Python.
 def read_json(path: str | Path) -> Any:
     with Path(path).open("r", encoding="utf-8") as handle:
         return json.load(handle)
 
 
+# Ghi JSON "nguyên tử": ghi vào file tạm cùng thư mục rồi os.replace sang tên thật.
+# Mục đích: nếu tiến trình bị dừng giữa chừng (batch chạy nhiều giờ) thì không để lại file JSON hỏng/nửa vời.
 def write_json(path: str | Path, value: Any) -> Path:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -53,6 +60,7 @@ def write_json(path: str | Path, value: Any) -> Path:
     return output_path
 
 
+# Ghi một file văn bản UTF-8 (tự tạo thư mục cha). Dùng cho báo cáo Markdown/HTML.
 def write_text(path: str | Path, value: str) -> Path:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

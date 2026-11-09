@@ -26,6 +26,7 @@ import semantic_version
 SOLC_SELECT_ARTIFACTS = Path.home() / ".solc-select" / "artifacts"
 
 
+# Liệt kê các bản solc đã cài qua solc-select (~/.solc-select/artifacts), sắp xếp tăng dần theo phiên bản.
 def get_installed_solc_versions() -> List[Tuple[semantic_version.Version, Path]]:
     """Liệt kê tất cả các phiên bản solc thực thi được trong ~/.solc-select/artifacts."""
     installed: List[Tuple[semantic_version.Version, Path]] = []
@@ -48,6 +49,7 @@ def get_installed_solc_versions() -> List[Tuple[semantic_version.Version, Path]]
     return installed
 
 
+# Đọc dòng "pragma solidity ...;" và chuyển thành NpmSpec (vd "^0.4.24") để so khớp phiên bản.
 def parse_pragma_spec(code: str) -> Tuple[Optional[str], Optional[semantic_version.NpmSpec]]:
     """Trích xuất chuỗi pragma và tạo NpmSpec từ code Solidity."""
     match = re.search(r"pragma\s+solidity\s+([^;]+);", code)
@@ -69,6 +71,9 @@ def parse_pragma_spec(code: str) -> Tuple[Optional[str], Optional[semantic_versi
             return raw_spec, None
 
 
+# Nhiệm vụ: chọn solc phù hợp với pragma: bản THẤP NHẤT thoả pragma -> nếu không có thì bản thấp nhất
+# cùng minor (0.4.x...) -> cuối cùng là bản mới nhất. Trả (đường dẫn solc, lý do, pragma gốc).
+# Mục đích: contract SmartBugs-Wild trải từ 0.4 tới 0.8, dùng sai compiler sẽ báo lỗi giả.
 def select_best_solc(code: str) -> Tuple[Optional[Path], str, Optional[str]]:
     """
     Chọn trình biên dịch solc thích hợp nhất cho code.
@@ -110,6 +115,8 @@ def select_best_solc(code: str) -> Tuple[Optional[Path], str, Optional[str]]:
     return fallback[1], f"default latest available {fallback[0]}", raw_pragma
 
 
+# Lọc output của solc, chỉ giữ các khối "Error:" (bỏ Warning), tối đa 5 lỗi.
+# Mục đích: phản hồi lỗi biên dịch ngắn gọn cho Fixer ở vòng sửa sau.
 def extract_solc_errors(stderr_or_output: str) -> str:
     """
     Trích xuất các dòng lỗi thực sự ('Error:') và ngữ cảnh kèm theo từ stderr của solc.
@@ -149,6 +156,9 @@ def extract_solc_errors(stderr_or_output: str) -> str:
     return stderr_or_output.strip()[:1500]
 
 
+# Nhiệm vụ: biên dịch một chuỗi mã Solidity bằng solc (tuỳ chọn xuất AST JSON).
+# Trả dict chuẩn: passed (True/False/None=không có solc), status, compiler, error, ast.
+# Mục đích: Phase 5 kiểm tra bản vá còn compile được; behavior_verifier lấy AST để so sánh.
 def compile_solidity_code(
     code: str,
     solc_path: Optional[Path] = None,
@@ -237,6 +247,9 @@ def compile_solidity_code(
             pass
 
 
+# Nhiệm vụ: biên dịch CẢ bản gốc lẫn bản vá bằng cùng một solc.
+# Nếu bản gốc đã không compile được -> đánh dấu baseline_failed (không đổ lỗi cho Fixer).
+# Mục đích: kiểm tra công bằng trong vòng sửa (candidate_check) và kiểm chứng cuối.
 def check_compilation_with_baseline(
     original_code: str,
     fixed_code: str,

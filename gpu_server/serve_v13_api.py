@@ -67,11 +67,13 @@ INSTRUCTION_PROMPT = (
 SERVER_START_TIME = time.time()
 
 # ─── Pydantic Models ───
+# Body của POST /api/v1/detect: mã một hàm + ngưỡng (tuỳ chọn).
 class DetectRequest(BaseModel):
     code: str = Field(..., description="Solidity code or function snippet to analyze")
     threshold: Optional[float] = Field(default=DEFAULT_THRESHOLD, description="Vulnerability classification threshold")
 
 
+# Kết quả detect: verdict, P(vulnerable), P(safe), ngưỡng, điểm từng dòng (line_scores), thời gian.
 class DetectResponse(BaseModel):
     status: str = "ok"
     verdict: str
@@ -83,11 +85,13 @@ class DetectResponse(BaseModel):
     elapsed_ms: float
 
 
+# Một tin nhắn (role + content) theo định dạng chat.
 class ChatMessage(BaseModel):
     role: str
     content: str
 
 
+# Body của POST /api/v1/generate: prompt, system prompt, temperature, top_p, max_tokens.
 class ChatRequest(BaseModel):
     prompt: str = Field(..., description="User prompt or instructions")
     system_prompt: Optional[str] = Field(default="", description="Optional system prompt")
@@ -96,12 +100,14 @@ class ChatRequest(BaseModel):
     top_p: Optional[float] = Field(default=0.9, description="Nucleus sampling top_p")
 
 
+# Kết quả sinh văn bản: response + thời gian.
 class ChatResponse(BaseModel):
     status: str = "ok"
     response: str
     elapsed_ms: float
 
 
+# Body của endpoint tương thích OpenAI /v1/chat/completions.
 class OpenAIChatRequest(BaseModel):
     model: Optional[str] = "qwen25-v13-14b"
     messages: List[ChatMessage]
@@ -131,6 +137,7 @@ API_KEY = os.environ.get("SERVER_GPU_API_KEY", "").strip()
 PUBLIC_PATHS = {"/", "/health", "/api/v1/health"}
 
 
+# Middleware: nếu đặt SERVER_GPU_API_KEY thì mọi endpoint (trừ "/" và health) bắt buộc header X-API-Key đúng -> sai thì 401.
 @app.middleware("http")
 async def require_api_key(request: Request, call_next):
     if API_KEY and request.url.path not in PUBLIC_PATHS and request.headers.get("X-API-Key") != API_KEY:
@@ -143,7 +150,10 @@ async def require_api_key(request: Request, call_next):
 GPU_LOCK = threading.Lock()
 
 # ─── Global Model State ───
+# Giữ MỘT bản model duy nhất trong VRAM: Qwen2.5-Coder-14B-Instruct 4-bit + LoRA v13 + score_head (phân loại)
+# + line_head (điểm từng dòng). Dùng chung cho cả detect (bật LoRA) và generate (tắt LoRA) -> chỉ tốn ~8.5 GB VRAM.
 class ModelContainer:
+    # Khởi tạo trạng thái rỗng (thiết bị, tokenizer, model, các head, ngưỡng), is_ready=False.
     def __init__(self):
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.tokenizer = None
@@ -155,6 +165,9 @@ class ModelContainer:
         self.best_threshold = DEFAULT_THRESHOLD
         self.is_ready = False
 
+    # Nạp model khi server khởi động: đọc ngưỡng từ threshold_config.json -> tokenizer -> backbone 4-bit NF4 -> gắn LoRA
+    # -> đọc score_head từ adapter_model.safetensors (KHÔNG có thì từ chối khởi động, tránh head ngẫu nhiên)
+    # -> line_head.pt nếu có -> is_ready=True.
     def load(self, base_model_name: str = DEFAULT_BASE_MODEL, adapter_dir: Path = DEFAULT_ADAPTER_DIR):
         start_t = time.time()
         self.base_model_name = base_model_name
@@ -260,6 +273,7 @@ CONTAINER = ModelContainer()
 
 
 # ─── API Endpoints ───
+# GET /: thông tin chung của server.
 @app.get("/")
 def root():
     return {
@@ -275,6 +289,7 @@ def root():
     }
 
 
+# GET /api/v1/health: trạng thái (ready/loading), GPU, VRAM, tên model. Client local dùng để biết server sẵn sàng chưa.
 @app.get("/api/v1/health")
 @app.get("/health")
 def health_check():
@@ -296,6 +311,9 @@ def health_check():
     }
 
 
+# [PHASE 1C trên server] POST /api/v1/detect: ghép INSTRUCTION_PROMPT + mã (giống hệt lúc train), cắt MAX_LEN token,
+# forward lấy hidden state của token CUỐI -> score_head -> softmax -> P(vulnerable); line_head -> xác suất từng token
+# -> gộp về từng dòng mã (qua offset của tokenizer). verdict = Vulnerable nếu P >= ngưỡng. Dùng GPU_LOCK (1 request/lần).
 @app.post("/api/v1/detect", response_model=DetectResponse)
 def detect_vulnerability(req: DetectRequest):
     if not CONTAINER.is_ready:
@@ -366,6 +384,7 @@ def detect_vulnerability(req: DetectRequest):
     )
 
 
+# Tham số sinh: temperature <= 0 -> greedy (do_sample=False); ngược lại sample với temperature + top_p (mặc định 0.9).
 def _sampling_kwargs(temperature: Optional[float], top_p: Optional[float]) -> Dict[str, Any]:
     """temperature=0 means greedy decoding (0.0 must not fall back to the 0.2 default)."""
     temperature = 0.2 if temperature is None else float(temperature)
@@ -374,6 +393,8 @@ def _sampling_kwargs(temperature: Optional[float], top_p: Optional[float]) -> Di
     return {"do_sample": True, "temperature": temperature, "top_p": 0.9 if top_p is None else top_p}
 
 
+# [PHASE 2/3/4 trên server] POST /api/v1/generate (và /api/v1/chat): áp chat template, từ chối prompt > 4096 token
+# (HTTP 413), sinh văn bản với LoRA TẮT (disable_adapter -> model Instruct gốc), trả câu trả lời.
 @app.post("/api/v1/generate", response_model=ChatResponse)
 @app.post("/api/v1/chat", response_model=ChatResponse)
 def generate_text(req: ChatRequest):
@@ -430,6 +451,7 @@ def generate_text(req: ChatRequest):
     )
 
 
+# POST /v1/chat/completions: endpoint tương thích OpenAI (để cắm vào client agent bất kỳ), cũng tắt LoRA khi sinh.
 @app.post("/v1/chat/completions")
 def openai_chat_completions(req: OpenAIChatRequest):
     """Endpoint tương thích chuẩn OpenAI để cắm trực tiếp vào bất kỳ agent client nào."""
@@ -494,6 +516,7 @@ def openai_chat_completions(req: OpenAIChatRequest):
     }
 
 
+# Điểm vào: đọc tham số (host, port 6868, base model, adapter), nạp model rồi chạy uvicorn.
 def main():
     parser = argparse.ArgumentParser(description="Start v13 Unified AI Inference Server")
     parser.add_argument(

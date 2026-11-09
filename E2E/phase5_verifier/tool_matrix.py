@@ -68,6 +68,7 @@ SEVERITY_ORDER = {
 }
 
 
+# Đổi mức độ (critical/high/...) thành số để so sánh.
 def _severity_rank(value: Any) -> int:
     return SEVERITY_ORDER.get(str(value or "unknown").strip().lower(), 0)
 
@@ -136,6 +137,7 @@ TOOL_COVERAGE = {
 }
 
 
+# Lấy (major, minor, patch) từ pragma solidity.
 def _pragma_version(code: str) -> tuple[int, int, int] | None:
     match = re.search(r"pragma\s+solidity\s+([^;]+);", code)
     if not match:
@@ -146,6 +148,7 @@ def _pragma_version(code: str) -> tuple[int, int, int] | None:
     return int(version.group(1)), int(version.group(2)), int(version.group(3) or 0)
 
 
+# Danh sách solc đã cài qua solc-select (phiên bản, đường dẫn), sắp tăng dần.
 def _installed_solc() -> list[tuple[tuple[int, int, int], Path]]:
     versions = []
     for path in SOLC_SELECT_ARTIFACTS.glob("solc-*/solc-*"):
@@ -155,6 +158,7 @@ def _installed_solc() -> list[tuple[tuple[int, int, int], Path]]:
     return sorted(versions)
 
 
+# Chọn solc cho ma trận tool: bản MỚI NHẤT cùng minor với pragma -> bản gần nhất tương thích -> bản mới nhất.
 def choose_solc(code: str) -> tuple[Path | None, str]:
     installed = _installed_solc()
     if not installed:
@@ -174,6 +178,7 @@ def choose_solc(code: str) -> tuple[Path | None, str]:
 _ERROR_LOCATION_RE = re.compile(r"(-->\s*\S+:\d+:\d+:?|\S+\.sol:\d+:\d+:?)")
 
 
+# Tập dòng lỗi compile đã bỏ vị trí (để so lỗi bản vá với lỗi bản gốc).
 def _error_lines(text: str) -> set[str]:
     return {
         _ERROR_LOCATION_RE.sub("", line).strip()
@@ -182,6 +187,7 @@ def _error_lines(text: str) -> set[str]:
     }
 
 
+# Biên dịch mã (kèm file phụ thuộc) bằng solc --ast-compact-json trong thư mục tạm; trả trạng thái compile.
 def _compile_source(
     solc: Path,
     code: str,
@@ -198,6 +204,8 @@ def _compile_source(
     return result
 
 
+# Từ các finding mục tiêu -> tập nhóm lỗ hổng (reentrancy, arithmetic...) qua SWC_CATEGORY_ALIASES + từ khoá.
+# Mục đích: biết finding nào của tool là "cùng loại lỗi đã sửa".
 def _target_categories(target_findings: list[dict[str, Any]] | None) -> set[str]:
     categories: set[str] = set()
     for finding in target_findings or []:
@@ -208,6 +216,7 @@ def _target_categories(target_findings: list[dict[str, Any]] | None) -> set[str]
     return categories
 
 
+# Lấy tập số dòng từ một finding của tool (line có thể là int, list hoặc chuỗi).
 def _finding_lines(finding: dict[str, Any]) -> set[int]:
     value = finding.get("line") if finding.get("line") is not None else finding.get("lines")
     if isinstance(value, int):
@@ -219,6 +228,7 @@ def _finding_lines(finding: dict[str, Any]) -> set[int]:
     return set()
 
 
+# Tập các dòng của bản vá thuộc những hàm đã được nhắm sửa.
 def _target_line_ranges(fixed_code: str, target_findings: list[dict[str, Any]] | None) -> set[int]:
     """Lines of the patched source that belong to the units the findings targeted."""
     from E2E.phase0_parsing.code_units import parse_code_units
@@ -231,6 +241,7 @@ def _target_line_ranges(fixed_code: str, target_findings: list[dict[str, Any]] |
     return lines
 
 
+# Finding của tool là "còn sót" (residual) khi cùng nhóm lỗi mục tiêu VÀ (nếu có số dòng) nằm trong hàm đã vá.
 def _finding_matches_target(
     finding: dict[str, Any],
     targets: set[str],
@@ -255,6 +266,8 @@ def _finding_matches_target(
 _LOCATION_IN_MESSAGE_RE = re.compile(r"(\S*\.sol(?:#\d+(?:-\d+)?|:\d+(?::\d+)?)?|#\d+(?:-\d+)?|\blines?\s+\d+(?:-\d+)?)")
 
 
+# Định danh finding không phụ thuộc vị trí (nhóm, tên check, thông điệp đã bỏ số dòng/đường dẫn).
+# Mục đích: bản vá làm lệch số dòng thì finding cũ không bị coi là "mới phát sinh".
 def _finding_signature(finding: dict[str, Any]) -> tuple[str, str, str]:
     """Location-independent identity of a tool finding: a patch that shifts line numbers
     must not make every pre-existing finding look newly introduced."""
@@ -267,6 +280,8 @@ def _finding_signature(finding: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
+# Chấm MỘT tool: residual (lỗi mục tiêu còn sót) hoặc introduced (lỗi High+ mới) -> FAIL; còn finding khác -> WARN;
+# sạch -> PASS; tool lỗi -> ERROR; không chạy -> SKIPPED. Ghi thêm tool có "phủ" loại lỗi mục tiêu không (applicable).
 def _evaluate_tool_result(
     tool: str,
     run_status: str,
@@ -326,6 +341,9 @@ def _evaluate_tool_result(
     }
 
 
+# Gộp kết quả các tool thành passed/failed/inconclusive: có tool FAIL -> failed; Slither/Mythril lỗi -> inconclusive;
+# không tool nào chạy xong -> inconclusive; không tool nào phủ loại lỗi mục tiêu -> inconclusive
+# (chạy sạch nhưng tool không phát hiện được loại lỗi đó thì không phải bằng chứng đã sửa); còn lại -> passed.
 def _policy_verdict(
     tool_results: dict[str, dict[str, Any]],
     policy: str = "balanced",
@@ -370,6 +388,8 @@ def _policy_verdict(
     }
 
 
+# Chạy MỘT tool trên cả bản gốc và bản vá: Slither chạy native (hoặc qua Docker nếu ưu tiên SmartBugs),
+# các tool khác qua SmartBugs. Trả (kết quả bản gốc, kết quả bản vá).
 def _run_security_tool_pair(
     tool: str,
     original_code: str,
@@ -448,6 +468,10 @@ def _run_security_tool_pair(
     return unavailable, unavailable
 
 
+# [HÀM CHÍNH MA TRẬN TOOL] Compile bản vá (so baseline với bản gốc) -> chạy song song các tool (tối đa 4 luồng)
+# trên bản gốc và bản vá -> chấm từng tool (_evaluate_tool_result) -> _policy_verdict -> policy_verdict + summary
+# (pass/fail/warn/error) + tóm tắt riêng cho Slither.
+# Gọi bởi: final_verification.verify_final_patch.
 def verify_security_tool_matrix(
     original_code: str,
     fixed_code: str,
@@ -488,6 +512,7 @@ def verify_security_tool_matrix(
     result_root = Path(results_dir) if results_dir else Path(tempfile.mkdtemp(prefix="e2e-smartbugs-results-"))
     tool_results: dict[str, dict[str, Any]] = {}
 
+    # Chạy và chấm một tool (bỏ qua nếu bản vá không compile được).
     def _execute_single_tool(tool: str) -> tuple[str, dict[str, Any]]:
         timeout = DEFAULT_TOOL_TIMEOUTS.get(tool, 240)
         if compile_result.get("status") != "passed":

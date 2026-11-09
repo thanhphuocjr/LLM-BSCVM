@@ -65,6 +65,7 @@ INFORMATIONAL_NAMES = {
 }
 
 
+# Bọc đoạn hàm rời (snippet) thành một contract Solidity compile được (thêm pragma đoán theo cú pháp, contract bọc ngoài).
 def prepare_contract_code(raw_code: str) -> str:
     """Intelligently wrap raw function snippets into valid Solidity contracts."""
     code = raw_code.strip()
@@ -107,6 +108,7 @@ contract EvaluationTarget {{
     return wrapped
 
 
+# Chạy MỘT tool SmartBugs (Docker) trên một mẫu, đọc kết quả -> status, verdict, có báo lỗi không, số finding, thời gian.
 def run_single_tool_on_code(
     smartbugs_bin: Path,
     tool: str,
@@ -187,6 +189,8 @@ def run_single_tool_on_code(
         }
 
 
+# Chạy mọi tool đã chọn trên một mẫu và tính thống kê tổng hợp: bao nhiêu tool báo lỗi, đa số có báo không,
+# mọi tool đều báo Safe trên mẫu có lỗi (false negative đồng thuận)...
 def evaluate_sample(
     sample: dict[str, Any],
     smartbugs_bin: Path,
@@ -267,6 +271,7 @@ def evaluate_sample(
     return row_data
 
 
+# Tính TP/FP/TN/FN, accuracy, precision, recall, F1, detection rate, FPR (bỏ qua mẫu tool lỗi).
 def compute_metrics(y_true: list[int], y_pred: list[int | None]) -> dict[str, Any]:
     """Compute binary classification metrics ignoring None/Error predictions."""
     valid_pairs = [(t, p) for t, p in zip(y_true, y_pred) if p is not None]
@@ -305,6 +310,7 @@ def compute_metrics(y_true: list[int], y_pred: list[int | None]) -> dict[str, An
     }
 
 
+# Xuất báo cáo tổng hợp CSV + Markdown: chỉ số từng tool và của tổ hợp (ensemble any / majority).
 def generate_summary_report(
     rows: list[dict[str, Any]],
     tools: list[str],
@@ -433,6 +439,7 @@ def generate_summary_report(
     return summary_csv_path, report_md_path
 
 
+# Tham số: --dataset, --split, --limit, --tools, --workers, --timeout, --results-dir, --resume.
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run 9 Docker security tools benchmark on Solodit dataset.")
     parser.add_argument(
@@ -485,6 +492,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# [ĐIỂM VÀO] Kiểm tra Docker + SmartBugs -> đọc data/solodit_eval/iaudit_solodit.jsonl -> chạy song song
+# evaluate_sample (ghi CSV dần, có resume) -> generate_summary_report. Mục đích: so sánh 9 công cụ truyền thống
+# (Slither, Mythril, Osiris, HoneyBadger, Manticore, Maian, Oyente, Securify, SmartCheck) làm baseline cho luận văn.
 def main() -> None:
     from E2E.common.security_tools import _is_docker_available, _smartbugs_executable
 

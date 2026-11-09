@@ -27,6 +27,7 @@ from E2E.phase5_verifier.behavior_verifier import verify_patch_behavior
 from E2E.phase5_verifier.tool_matrix import verify_security_tool_matrix
 
 
+# Một kênh (static/RAG/detector) được coi là "đạt" khi status=ok và verdict=Safe.
 def _verification_passed(result: dict[str, Any] | None) -> bool:
     if not result or result.get("status") != "ok":
         return False
@@ -34,6 +35,7 @@ def _verification_passed(result: dict[str, Any] | None) -> bool:
     return verdict == "Safe"
 
 
+# Rút gọn finding chỉ còn các trường cần thiết để đưa vào feedback/báo cáo.
 def _compact_feedback_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     fields = (
         "finding_id",
@@ -57,6 +59,7 @@ def _compact_feedback_findings(findings: list[dict[str, Any]]) -> list[dict[str,
     ]
 
 
+# Tìm lý do vì sao detector vẫn coi bản vá là lỗi (lý do có sẵn, bằng chứng verifier, hoặc liệt kê hàm + xác suất).
 def _llm_vulnerability_reason(
     detector: dict[str, Any] | None,
     verifier: dict[str, Any] | None,
@@ -94,6 +97,7 @@ def _llm_vulnerability_reason(
     return str(detector.get("error") or "The neural detector verification did not return a Safe verdict.")
 
 
+# Tổng hợp kết quả 3 kênh static / RAG / detector trên bản vá thành {passed, components{static, rag, llm}}.
 def build_repair_feedback(
     fixed_static: dict[str, Any],
     fixed_rag: dict[str, Any],
@@ -143,6 +147,7 @@ def build_repair_feedback(
     }
 
 
+# Chạy lại static (Phase 1A) và RAG (Phase 1B) trên MÃ ĐÃ VÁ (không dùng lại kết quả Phase 1 của bản gốc).
 def rerun_local_channels(fixed_code: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """Static and RAG evidence for the *patched* source (verification channels must not reuse
     the original contract's Phase 1 results)."""
@@ -153,6 +158,8 @@ def rerun_local_channels(fixed_code: str) -> tuple[dict[str, Any], dict[str, Any
     )
 
 
+# Chỉ giữ finding còn sót trùng (SWC, unit) với lỗi đã nhắm sửa. Finding cũ ở chỗ khác của contract
+# không phải bằng chứng bản vá thất bại nên không được chặn kết quả.
 def scope_to_targets(result: dict[str, Any], target_findings: list[dict[str, Any]]) -> dict[str, Any]:
     """Keep only residual findings that match an original target (same SWC in the same unit).
 
@@ -179,6 +186,7 @@ def scope_to_targets(result: dict[str, Any], target_findings: list[dict[str, Any
     }
 
 
+# Rút gọn finding của tool (tool, name, check, category, severity, line, message, swc).
 def _compact_tool_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     fields = (
         "tool",
@@ -196,6 +204,9 @@ def _compact_tool_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any
     ]
 
 
+# Nhiệm vụ: gộp mọi kênh kiểm chứng (từng tool của ma trận, compile, static, RAG, detector) thành tóm tắt theo kênh
+# (passed/verdict/findings/lý do) + danh sách tool FAIL/ERROR.
+# Mục đích: hiển thị "verification_channels" trong báo cáo Phase 6 (và có thể làm feedback cho lần sửa sau).
 def build_tool_repair_feedback(
     tool_result: dict[str, Any],
     *,
@@ -285,6 +296,11 @@ def build_tool_repair_feedback(
     }
 
 
+# [KIỂM CHỨNG CUỐI - orchestrator gọi ở lượt 2] Trên bản vá cuối cùng:
+#   1) ma trận tool (Slither, + Mythril/SmartCheck nếu bật) trên bản gốc và bản vá - verify_security_tool_matrix;
+#   2) kiểm tra hành vi bằng so sánh AST - verify_patch_behavior;
+#   3) chạy lại static + RAG, chỉ xét các finding của hàm đã vá (scope_to_targets).
+# Mỗi bước bọc trong safe_run. Trả (tool_result, behavioral_result, fixed_static, fixed_rag).
 def verify_final_patch(
     code: str,
     fixed_code: str,
@@ -335,6 +351,7 @@ def verify_final_patch(
     return tool_result, behavioral_result, fixed_static, fixed_rag
 
 
+# Kết quả tool/hành vi "inconclusive" khi không có bản vá nào để kiểm chứng.
 def skipped_verification() -> tuple[dict[str, Any], dict[str, Any]]:
     """Tool and behaviour results when there is no patch to verify."""
     tool_result = {
@@ -356,6 +373,12 @@ def skipped_verification() -> tuple[dict[str, Any], dict[str, Any]]:
     return tool_result, behavioral_result
 
 
+# [KẾT LUẬN DUY NHẤT của phase5_verification.json] Xét các luật theo thứ tự, luật khớp đầu tiên thắng:
+# chưa có kết quả GPU -> Inconclusive; gốc Safe & không vá -> No patch required; hồi quy hành vi -> rejected;
+# không compile -> rejected; không có bản vá hiệu lực -> rejected; ma trận tool FAIL -> rejected;
+# static/RAG vẫn thấy lỗi mục tiêu -> rejected; không compile riêng được -> Inconclusive;
+# ma trận tool passed -> "Patch accepted by security tool matrix"; còn lại -> Inconclusive.
+# (Detector vẫn báo lỗi KHÔNG chặn chấp nhận - chỉ ghi detector_disagreement, vì detector hay báo nhầm hàm an toàn.)
 def decide_overall_verdict(
     *,
     remote: dict[str, Any],

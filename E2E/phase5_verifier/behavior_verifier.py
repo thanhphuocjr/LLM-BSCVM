@@ -46,6 +46,7 @@ CALL_LABELS = {
 }
 
 
+# Lấy đối tượng JSON AST từ output của solc --ast-compact-json.
 def _extract_ast_dict(raw_ast_stdout: str) -> Optional[dict]:
     """Trích xuất đối tượng JSON AST từ output của solc --ast-compact-json."""
     if not raw_ast_stdout:
@@ -60,6 +61,8 @@ def _extract_ast_dict(raw_ast_stdout: str) -> Optional[dict]:
         return None
 
 
+# Duyệt AST của MỘT hàm, thu đặc trưng hành vi: biến state bị ghi (kèm toán tử), lời gọi ngoài
+# (call/transfer/send/delegatecall), event được phát, các lệnh return.
 def _collect_function_ast_features(fn_node: dict, state_vars: Set[str] | None = None) -> dict[str, Any]:
     """
     Thu thập các đặc trưng hành vi của một hàm từ AST:
@@ -73,6 +76,7 @@ def _collect_function_ast_features(fn_node: dict, state_vars: Set[str] | None = 
     events: Set[str] = set()
     return_exprs: List[str] = []
 
+    # Lấy tên biến gốc từ một nút AST (Identifier / IndexAccess / MemberAccess) - vd balances[msg.sender] -> balances.
     def get_var_name(node: dict) -> str:
         nt = node.get("nodeType")
         if nt == "Identifier":
@@ -87,6 +91,7 @@ def _collect_function_ast_features(fn_node: dict, state_vars: Set[str] | None = 
             return f"{expr_name}.{member}" if expr_name else member
         return ""
 
+    # Duyệt đệ quy cây AST và ghi nhận các đặc trưng ở trên.
     def walk(node: Any):
         if not isinstance(node, dict):
             return
@@ -150,6 +155,7 @@ def _collect_function_ast_features(fn_node: dict, state_vars: Set[str] | None = 
     }
 
 
+# Tạo map unit_id -> nút AST của hàm (hàm trùng tên được thêm hậu tố "#n" giống Phase 0).
 def _extract_ast_functions_map(ast_dict: dict) -> Dict[str, dict]:
     """Tạo map unit_id -> function AST node (overloads get the same `#n` suffix as the parser)."""
     fn_map: Dict[str, dict] = {}
@@ -170,6 +176,7 @@ def _extract_ast_functions_map(ast_dict: dict) -> Dict[str, dict]:
     return fn_map
 
 
+# Tập tên biến trạng thái khai báo trong các contract (từ AST).
 def _state_variable_names(ast_dict: dict) -> Set[str]:
     names: Set[str] = set()
     for node in (ast_dict or {}).get("nodes", []):
@@ -180,6 +187,8 @@ def _state_variable_names(ast_dict: dict) -> Set[str]:
     return names
 
 
+# So sánh đặc trưng AST của hàm gốc và hàm đã vá: mất hẳn lệnh ghi một biến state / mất lời gọi chuyển giá trị
+# (High), mất event / mất return (Medium). Trả danh sách vi phạm.
 def _compare_unit_behavior_ast(
     orig_fn_ast: dict,
     fixed_fn_ast: dict,
@@ -243,6 +252,11 @@ def _compare_unit_behavior_ast(
     return findings
 
 
+# [KIỂM TRA HỒI QUY HÀNH VI - Phase 5] Với các hàm đã vá:
+#   1) compile cả 2 bản lấy AST và so sánh từng hàm (_compare_unit_behavior_ast);
+#   2) hàm không so được bằng AST -> dùng guard regex validate_observable_behavior (của Phase 4);
+#   3) thêm cảnh báo Slither "locked-ether" nếu có.
+# status = failed nếu có bất kỳ vi phạm nào -> decide_overall_verdict sẽ ra "Patch rejected: behavioral regression".
 def verify_patch_behavior(
     original_code: str,
     fixed_code: str,

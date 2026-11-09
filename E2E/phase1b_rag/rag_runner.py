@@ -7,6 +7,12 @@ from E2E.phase0_parsing.code_units import CodeUnit, parse_code_units
 from E2E.phase1b_rag.retriever import LocalRAGRetriever
 
 
+# [HÀM CHÍNH PHASE 1B] Chạy RAG cho từng code unit của contract.
+# Với mỗi unit: LocalRAGRetriever.analyze(unit.code) -> các finding theo SWC; gắn unit_id + dòng;
+# chỉ finding "vulnerable" (confidence >= 0.60) được đưa vào danh sách findings của contract (khoá = (SWC, unit)).
+# Trả về: score (confidence cao nhất), verdict, findings, unit_results, retrieved_context (top-8 ca tương tự
+# cho cả contract - Fixer/Advisor dùng làm ví dụ sửa lỗi).
+# Gọi bởi: orchestrator.run_pipeline (song song với run_static), candidate_check/final_verification (chạy lại trên bản vá).
 def run_rag(
     code: str,
     units: list[CodeUnit] | None = None,

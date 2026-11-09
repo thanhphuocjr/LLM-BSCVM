@@ -36,6 +36,7 @@ app.add_middleware(
 )
 
 
+# Middleware: thêm header no-cache cho mọi response để trình duyệt luôn lấy trạng thái/log mới nhất.
 @app.middleware("http")
 async def add_no_cache_headers(request, call_next):
     response = await call_next(request)
@@ -53,6 +54,7 @@ RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 ALLOWED_TOOLS = {"slither", "mythril", "smartcheck"}
 
 
+# Trả thư mục data/results/audit_runs/<run_id>; từ chối run_id có ".." hoặc ký tự lạ (chống path traversal) -> HTTP 400.
 def run_dir_for(run_id: str) -> Path:
     """Resolve a run directory, rejecting ids that could escape RUNS_DIR (e.g. '..')."""
     if not RUN_ID_RE.fullmatch(run_id) or ".." in run_id:
@@ -60,12 +62,14 @@ def run_dir_for(run_id: str) -> Path:
     return RUNS_DIR / run_id
 
 
+# Làm sạch tên file người dùng gửi lên thành "<tên>.sol" đơn giản (không thư mục, không traversal, tối đa 64 ký tự).
 def safe_contract_file_name(file_name: str) -> str:
     """Keep only a plain `<stem>.sol` name: no directories, no traversal."""
     stem = re.sub(r"[^A-Za-z0-9_-]+", "-", Path(file_name or "").stem).strip("-") or "Contract"
     return f"{stem[:64]}.sol"
 
 
+# Body của POST /api/audit/submit: mã Solidity, tên file, ngưỡng detector (mặc định 0.70), tool Phase 5 ("slither" hoặc "all").
 class AuditRequest(BaseModel):
     code: str = Field(..., description="Solidity smart contract code")
     file_name: str = Field(default="Contract.sol", description="Contract filename")
@@ -73,11 +77,15 @@ class AuditRequest(BaseModel):
     tools: str = Field(default="slither", description="Security tools: slither or all")
 
 
+# Body của POST /api/contract/prepare: mã Solidity + tên file.
 class PrepareRequest(BaseModel):
     code: str = Field(..., description="Solidity smart contract code to decompose")
     file_name: str = Field(default="Contract.sol", description="Contract filename")
 
 
+# [Phase 0 xem trước trên web] Tách contract thành các hàm (parse_code_units) và trích "khung" contract:
+# pragma, import, tên contract, biến trạng thái, modifier, event, ngữ cảnh từng hàm, skeleton.
+# Mục đích: ngay khi dán mã, giao diện hiển thị được danh sách hàm trước khi chạy audit thật.
 def prepare_contract_context(code: str, file_name: str = "Contract.sol") -> Dict[str, Any]:
     """Phase 0 Prepare: Decomposes full contract into individual functions and extracts contract skeleton context."""
     from E2E.phase0_parsing.code_units import parse_code_units
@@ -215,6 +223,7 @@ def prepare_contract_context(code: str, file_name: str = "Contract.sol") -> Dict
     }
 
 
+# Đọc file JSON; file không có hoặc hỏng -> None (giao diện không bị lỗi khi run đang chạy dở).
 def read_json_safe(path: Path) -> Any:
     if not path.exists():
         return None
@@ -227,6 +236,8 @@ def read_json_safe(path: Path) -> Any:
 load_env_file(override=True)
 
 
+# GET /api/system/status: trạng thái GPU server (online, GPU, VRAM, model - KHÔNG lộ IP/port ra trình duyệt),
+# thông tin adapter v13 (ngưỡng, LoRA rank...), số ca trong KB.
 @app.get("/api/system/status")
 def get_system_status() -> Dict[str, Any]:
     """Returns system status, active models, and environment readiness."""
@@ -274,6 +285,7 @@ def get_system_status() -> Dict[str, Any]:
     }
 
 
+# GET /api/phases: danh sách phase (tên, engine, mô tả) từ E2E/pipeline/phases.py để giao diện hiển thị.
 @app.get("/api/phases")
 def get_pipeline_phases() -> List[Dict[str, Any]]:
     """Single Source of Truth cho các Phase của pipeline."""
@@ -281,6 +293,7 @@ def get_pipeline_phases() -> List[Dict[str, Any]]:
     return PHASES
 
 
+# GET /api/contracts/examples: trả 3 contract mẫu trong demo_contracts/ (nút "Mẫu" trên giao diện).
 @app.get("/api/contracts/examples")
 def get_example_contracts() -> List[Dict[str, Any]]:
     """Demo contracts shown under "Mẫu" (demo_contracts/)."""
@@ -306,6 +319,7 @@ def get_example_contracts() -> List[Dict[str, Any]]:
     return examples
 
 
+# POST /api/contract/prepare: gọi prepare_contract_context (Phase 0 xem trước).
 @app.post("/api/contract/prepare")
 def prepare_contract_endpoint(req: PrepareRequest) -> Dict[str, Any]:
     """Phase 0 Prepare: Immediately decomposes contract into individual functions and extracts contract skeleton context."""
@@ -315,6 +329,10 @@ def prepare_contract_endpoint(req: PrepareRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Failed to prepare contract AST: {str(e)}")
 
 
+# [ENDPOINT CHÍNH] POST /api/audit/submit: kiểm tra đầu vào, tạo run_id + thư mục run, lưu file .sol, rồi chạy
+# lệnh CLI `python -m E2E.run <file> --run-id ... --detector-threshold ... --max-fix-attempts 3 [--tools|--full-matrix]`
+# trong một subprocess ở luồng nền; stdout được ghi vào execution.log. Trả về run_id ngay để giao diện theo dõi.
+# Mục đích: web app KHÔNG có logic audit riêng - nó tái sử dụng đúng CLI orchestrator.
 @app.post("/api/audit/submit")
 def submit_audit(req: AuditRequest) -> Dict[str, Any]:
     """Submits a new contract audit job and starts processing in the background."""
@@ -364,6 +382,7 @@ def submit_audit(req: AuditRequest) -> Dict[str, Any]:
             "started_at": time.time(),
         }
 
+    # Luồng nền: chạy subprocess CLI, ghi từng dòng log vào execution.log, cập nhật trạng thái completed/failed khi xong.
     def run_worker():
         with open(log_file, "w", encoding="utf-8") as out:
             out.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting E2E audit run: {run_id}\n")
@@ -412,6 +431,7 @@ def submit_audit(req: AuditRequest) -> Dict[str, Any]:
     }
 
 
+# GET /api/runs: liệt kê các lần audit (mới nhất trước) với tên file, verdict, điểm, trạng thái - cho trang lịch sử.
 @app.get("/api/runs")
 def list_runs() -> List[Dict[str, Any]]:
     """Returns list of all audit runs from newest to oldest."""
@@ -483,6 +503,8 @@ def list_runs() -> List[Dict[str, Any]]:
     return runs
 
 
+# GET /api/runs/{run_id}: đọc mọi artifact phase (phase0 ... phase5, manifest, report) của một run và gom lại
+# cho giao diện hiển thị chi tiết (findings, bản vá, kết quả kiểm chứng, link báo cáo).
 @app.get("/api/runs/{run_id}")
 def get_run_detail(run_id: str) -> Dict[str, Any]:
     """Returns all detail artifacts and phase states for a run."""
@@ -623,6 +645,8 @@ def get_run_detail(run_id: str) -> Dict[str, Any]:
     }
 
 
+# GET /api/runs/{run_id}/logs: trả log realtime + trạng thái (running/completed/failed) + phase nào đã có file thật
+# (để giao diện tô sáng tiến độ từng phase).
 @app.get("/api/runs/{run_id}/logs")
 def get_run_logs(run_id: str) -> Dict[str, Any]:
     """Returns realtime logs of a run."""
@@ -659,6 +683,7 @@ def get_run_logs(run_id: str) -> Dict[str, Any]:
                 if manifest.get("status") == "complete":
                     status = "completed"
 
+    # File phase có tồn tại và không phải trạng thái "pending" không (phase đã chạy thật).
     def is_phase_real(filename: str) -> bool:
         p = run_dir / filename
         if not p.exists():
@@ -696,6 +721,7 @@ def get_run_logs(run_id: str) -> Dict[str, Any]:
     }
 
 
+# GET /api/runs/{run_id}/report/html: trả báo cáo HTML của Phase 6.
 @app.get("/api/runs/{run_id}/report/html")
 def get_report_html(run_id: str):
     """Serves the generated HTML audit report."""
@@ -705,6 +731,7 @@ def get_report_html(run_id: str):
     return HTMLResponse(content=path.read_text(encoding="utf-8"))
 
 
+# GET /api/runs/{run_id}/report/pdf: tải báo cáo PDF.
 @app.get("/api/runs/{run_id}/report/pdf")
 def get_report_pdf(run_id: str):
     """Downloads the generated PDF audit report."""
@@ -714,6 +741,7 @@ def get_report_pdf(run_id: str):
     return FileResponse(path, media_type="application/pdf", filename=f"audit_report_{run_id}.pdf")
 
 
+# GET /api/runs/{run_id}/report/md: trả báo cáo Markdown dạng text.
 @app.get("/api/runs/{run_id}/report/md")
 def get_report_md(run_id: str):
     """Returns markdown report text."""
@@ -723,6 +751,7 @@ def get_report_md(run_id: str):
     return PlainTextResponse(content=path.read_text(encoding="utf-8"))
 
 
+# POST /api/runs/{run_id}/cancel: dừng subprocess audit đang chạy (terminate, sau 0.5s thì kill).
 @app.post("/api/runs/{run_id}/cancel")
 def cancel_run(run_id: str) -> Dict[str, Any]:
     """Cancels a currently active run process."""
@@ -746,6 +775,7 @@ STATIC_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
+# GET /: trả trang giao diện webapp/static/index.html.
 @app.api_route("/", methods=["GET", "HEAD"])
 def serve_index():
     index_file = STATIC_DIR / "index.html"

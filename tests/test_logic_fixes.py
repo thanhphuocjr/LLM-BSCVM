@@ -70,12 +70,15 @@ UNFIXED_WITHDRAW_ALL = """function withdrawAll() external {
     }"""
 
 
+# Detector giả lập: trả 0.95 (lỗi) nếu lời gọi chuyển ETH đứng trước lệnh cập nhật số dư, ngược lại 0.05.
 def _reentrancy_probability(code: str) -> float:
     """Fake detector: vulnerable iff a value call precedes the balance update."""
     return 0.95 if re.search(r"call\{value[\s\S]*balances\[msg\.sender\]\s*(=|-=)", code) else 0.05
 
 
+# Fusion không bao giờ kết luận Safe khi detector thiếu dữ liệu.
 class FusionFailClosedTests(unittest.TestCase):
+    # Mọi hàm detector lỗi -> không bao giờ Safe.
     def test_all_detector_units_errored_is_never_safe(self) -> None:
         detector = {
             "status": "ok",
@@ -91,6 +94,7 @@ class FusionFailClosedTests(unittest.TestCase):
         self.assertEqual(fused["status"], "partial")
         self.assertIn("detector_incomplete_no_safe_verdict", fused["decision_rules"])
 
+    # Detector chấm thiếu một số hàm -> không bao giờ Safe.
     def test_partially_scored_detector_is_never_safe(self) -> None:
         summary = detector.summarize_detector(
             [
@@ -103,6 +107,7 @@ class FusionFailClosedTests(unittest.TestCase):
         self.assertEqual(summary["verdict"], "Inconclusive")
         self.assertEqual(fuse_detection(OK_EMPTY, OK_EMPTY, summary)["verdict"], "Inconclusive")
 
+    # Detector chấm đủ và đều an toàn -> vẫn ra Safe được.
     def test_complete_detector_can_still_report_safe(self) -> None:
         summary = detector.summarize_detector(
             [{"unit_id": "A.f", "status": "ok", "label": "Safe", "vulnerability_probability": 0.1}],
@@ -111,7 +116,9 @@ class FusionFailClosedTests(unittest.TestCase):
         self.assertEqual(fuse_detection(OK_EMPTY, OK_EMPTY, summary)["verdict"], "Safe")
 
 
+# Quy tắc "hai kênh xác nhận nhau" (corroborated).
 class CorroborationTests(unittest.TestCase):
+    # Static + Slither cùng báo KHÔNG tính là corroborated (cùng kênh static).
     def test_static_and_slither_are_one_channel(self) -> None:
         static = {
             "status": "ok",
@@ -125,19 +132,23 @@ class CorroborationTests(unittest.TestCase):
         fused = fuse_detection(static, OK_EMPTY, None)
         self.assertNotIn("static_rag_corroboration_floor", fused["decision_rules"])
 
+    # Static + RAG cùng báo -> corroborated.
     def test_static_and_rag_are_corroborated(self) -> None:
         static = {"findings": [{"source": "slither", "swc": "SWC-107", "unit_id": "A.w", "confidence": 0.9}]}
         rag = {"findings": [{"source": "rag", "swc": "SWC-107", "unit_id": "A.w", "confidence": 0.7}]}
         self.assertTrue(merge_findings(static, rag)[0]["corroborated"])
 
 
+# Fusion theo từng finding (fuse_findings).
 class FuseFindingsTests(unittest.TestCase):
+    # Hàm chỉ detector báo lỗi vẫn thành finding UNMAPPED để được sửa.
     def test_detector_only_unit_reaches_repair_agents(self) -> None:
         units = [{"unit_id": "A.f", "label": "Vulnerable", "vulnerability_probability": 0.9, "start_line": 3}]
         confirmed, _ = fuse_findings(units, {"findings": []}, {"findings": []})
         self.assertEqual([item["unit_id"] for item in confirmed], ["A.f"])
         self.assertEqual(confirmed[0]["swc"], "UNMAPPED")
 
+    # Hàm detector lỗi nhận p_detector = 0.5 (trung lập), không bị coi là an toàn.
     def test_errored_unit_is_neutral_not_safe(self) -> None:
         units = [{"unit_id": "A.w", "status": "error", "vulnerability_probability": None}]
         static = {"findings": [{"source": "static", "swc": "SWC-107", "unit_id": "A.w", "severity": "High", "confidence": 0.9}]}
@@ -147,17 +158,22 @@ class FuseFindingsTests(unittest.TestCase):
         self.assertTrue(finding["p_detector_missing"])
 
 
+# Điều kiện "trùng khớp chính xác" của RAG.
 class RagExactMatchTests(unittest.TestCase):
+    # Getter ngắn không được coi là trùng khớp với ca trong KB.
     def test_short_getter_is_not_an_exact_match(self) -> None:
         getter = "function totalSupply() public view returns (uint256) { return _totalSupply; }"
         self.assertFalse(_is_exact_code_match(getter + " extra body " * 20, getter))
         self.assertFalse(_is_exact_code_match(getter, getter))
 
+    # Hàm giống hệt ca trong KB -> trùng khớp.
     def test_identical_function_is_an_exact_match(self) -> None:
         self.assertTrue(_is_exact_code_match(FIXED_WITHDRAW, FIXED_WITHDRAW))
 
 
+# Guard hành vi của Phase 4.
 class BehaviourGuardTests(unittest.TestCase):
+    # Đổi tên biến cục bộ / thay transfer bằng dạng an toàn tương đương -> chấp nhận.
     def test_accepts_local_rename_and_safe_transfer(self) -> None:
         validate_observable_behavior(
             "function f(uint a) public { uint x = a; total += x; emit E(x); }",
@@ -168,6 +184,7 @@ class BehaviourGuardTests(unittest.TestCase):
             "function g() public { SafeERC20.safeTransfer(IERC20(t), a, 1); }",
         )
 
+    # Xoá lời gọi chuyển ETH / lệnh ghi state / event -> từ chối.
     def test_rejects_removed_value_call_state_write_and_event(self) -> None:
         with self.assertRaisesRegex(ValueError, "ETH value call"):
             validate_observable_behavior(UNFIXED_WITHDRAW_ALL, "function withdrawAll() external { balances[msg.sender] = 0; }")
@@ -177,7 +194,9 @@ class BehaviourGuardTests(unittest.TestCase):
             validate_observable_behavior("function t() { Transfer(a, b, 1); }", "function t() { }")
 
 
+# Tách hàm thay thế từ câu trả lời của model.
 class ExtractionTests(unittest.TestCase):
+    # JSON hỏng do dấu " không escape vẫn lấy được trường "replacement".
     def test_invalid_json_with_unescaped_quotes_is_decoded(self) -> None:
         from E2E.phase4_fixer.patching import extract_declaration_body
 
@@ -192,7 +211,9 @@ class ExtractionTests(unittest.TestCase):
         self.assertIn('require(ok, "failed");', body)
 
 
+# CVSS (Phase 3) và triage của Advisor (Phase 2).
 class CvssAndAgentsTests(unittest.TestCase):
+    # Điểm CVSS mặc định khớp với công thức tính từ vector.
     def test_fallback_cvss_matches_its_vector(self) -> None:
         for swc in ("SWC-107", "SWC-105", "SWC-115", "SWC-114", "SWC-102", "SWC-999"):
             meta = get_cvss_defaults(swc, "High")
@@ -200,20 +221,26 @@ class CvssAndAgentsTests(unittest.TestCase):
             expected, _ = compute_cvss_31_base_score(**{k.lower(): v for k, v in metrics.items()})
             self.assertEqual(meta["cvss_score"], expected, swc)
 
+    # Assessor khi không có LLM dùng điểm tính bằng công thức.
     def test_assessor_fallback_uses_computed_score(self) -> None:
         result = _generate_assessor_section([{"swc": "SWC-107", "unit_id": "A.w"}])
         self.assertEqual(result["assessments"][0]["cvss_score"], 9.1)
         self.assertEqual(result["assessments"][0]["severity"], "Critical")
 
+    # Advisor kết luận false positive -> finding nằm trong false_positives và không có suggestion.
     def test_advisor_false_positive_is_reported_to_caller(self) -> None:
+        # Kết quả Advisor giả (is_true_positive=False).
         class FakeSuggestion:
             error = None
             is_true_positive = False
 
+        # AdvisorAgent giả, luôn trả FakeSuggestion.
         class FakeAgent:
+            # Bỏ qua tham số khởi tạo.
             def __init__(self, *args, **kwargs) -> None:
                 pass
 
+            # Trả FakeSuggestion cho mọi finding.
             def advise_one(self, code, finding):
                 return FakeSuggestion()
 
@@ -224,13 +251,16 @@ class CvssAndAgentsTests(unittest.TestCase):
         self.assertEqual(advisor["suggestions"], [])
 
 
+# Chính sách ma trận tool (Phase 5).
 class ToolPolicyTests(unittest.TestCase):
+    # Tool không phủ loại lỗi mục tiêu chạy sạch -> inconclusive, không phải passed.
     def test_clean_run_of_non_covering_tool_is_inconclusive(self) -> None:
         result = _evaluate_tool_result("slither", "completed", [], [], {"front_running"})
         self.assertFalse(result["applicable"])
         policy = _policy_verdict({"slither": result}, require_applicable=True)
         self.assertEqual(policy["verdict"], "inconclusive")
 
+    # Finding còn sót chỉ tính khi nằm trong dòng của hàm đã vá.
     def test_residual_is_scoped_to_patched_unit_lines(self) -> None:
         finding = {"tool": "slither", "name": "reentrancy-eth", "category": "reentrancy", "line": [40], "severity": "High"}
         outside = _evaluate_tool_result("slither", "completed", [finding], [finding], {"reentrancy"}, None, {10, 11, 12})
@@ -239,7 +269,9 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertEqual(len(inside["residual_target_findings"]), 1)
 
 
+# Định danh finding không phụ thuộc vị trí.
 class FindingSignatureTests(unittest.TestCase):
+    # Đổi đường dẫn tạm / số dòng không làm finding cũ bị coi là mới.
     def test_signature_ignores_paths_and_line_numbers(self) -> None:
         from E2E.phase5_verifier.tool_matrix import _finding_signature
 
@@ -250,7 +282,9 @@ class FindingSignatureTests(unittest.TestCase):
         self.assertEqual(_finding_signature(before), _finding_signature(after))
 
 
+# Kiểm tra compile so với bản gốc (candidate_check.evaluate_compilation).
 class CompileBaselineTests(unittest.TestCase):
+    # Không có solc -> skipped, không phải failed.
     def test_missing_compiler_is_skipped_not_failed(self) -> None:
         skipped = {"passed": None, "status": "skipped", "error": "solc compiler not found"}
         with patch.object(
@@ -262,6 +296,7 @@ class CompileBaselineTests(unittest.TestCase):
         self.assertEqual(result["state"], "skipped")
         self.assertFalse(result["failed"])
 
+    # Bản gốc vốn không compile -> not_applicable, không đổ lỗi bản vá.
     def test_original_that_cannot_compile_does_not_blame_the_patch(self) -> None:
         error = {"passed": False, "status": "failed", "error": 'ParserError: Source "x.sol" not found'}
         with patch.object(
@@ -273,6 +308,7 @@ class CompileBaselineTests(unittest.TestCase):
         self.assertEqual(result["state"], "not_applicable")
         self.assertFalse(result["failed"])
 
+    # Bản vá sinh lỗi compile MỚI -> failed.
     def test_new_compiler_error_is_a_failure(self) -> None:
         baseline = {"passed": False, "error": 'ParserError: Source "x.sol" not found'}
         fixed = {"passed": False, "error": baseline["error"] + "\nTypeError: Wrong argument count"}
@@ -284,7 +320,9 @@ class CompileBaselineTests(unittest.TestCase):
             self.assertTrue(candidate_check.evaluate_compilation("a", "b")["failed"])
 
 
+# Các hàm hỗ trợ batch/Fixer.
 class BatchSupportTests(unittest.TestCase):
+    # _version_rules sinh luật cú pháp đúng theo pragma.
     def test_version_rules_follow_the_pragma(self) -> None:
         rules_0424 = fixer._version_rules("pragma solidity ^0.4.24;")
         rules_0418 = fixer._version_rules("pragma solidity ^0.4.18;")
@@ -293,6 +331,7 @@ class BatchSupportTests(unittest.TestCase):
         self.assertIn("DO NOT use the `constructor` keyword", rules_0418)
         self.assertEqual(fixer._version_rules("pragma solidity ^0.8.0;"), "")
 
+    # Lỗi solc được ánh xạ đúng về hàm chứa dòng lỗi.
     def test_compiler_errors_are_mapped_to_units(self) -> None:
         new_style = "Error: Invalid token.\n  --> /tmp/x.sol:11:35:\n"
         old_style = "/tmp/x.sol:17:9: Error: Undeclared identifier."
@@ -300,7 +339,9 @@ class BatchSupportTests(unittest.TestCase):
         self.assertEqual(candidate_check.units_with_compiler_errors(BANK, old_style), {"Bank.withdrawAll"})
 
 
+# Khung giờ chạy của batch.
 class BatchScheduleTests(unittest.TestCase):
+    # Khung "19:00-07:30" vắt qua nửa đêm được xử lý đúng.
     def test_active_hours_window_crossing_midnight(self) -> None:
         import time as _time
 
@@ -308,6 +349,7 @@ class BatchScheduleTests(unittest.TestCase):
 
         window = parse_active_hours("19:00-07:30")
 
+        # Tạo thời điểm giả (giờ:phút) để kiểm tra.
         def at(hour, minute):
             return _time.struct_time((2026, 1, 1, hour, minute, 0, 0, 1, -1))
 
@@ -319,12 +361,14 @@ class BatchScheduleTests(unittest.TestCase):
         self.assertTrue(within_active_hours(None, at(12, 0)))
 
 
+# Chạy thật gpu_pipeline với server GPU GIẢ (detector giả + Fixer giả) để kiểm tra vòng sửa.
 class ServerGpuRepairLoopTests(unittest.TestCase):
     """End-to-end run of the GPU runner against a fake server."""
 
     # The RAG channel is stubbed out so these tests exercise the repair loop itself.
     EMPTY_RAG = {"status": "ok", "findings": [], "retrieved_context": []}
 
+    # Dựng request.json cho contract Bank (RAG để trống).
     def _request(self) -> dict:
         from E2E.phase1a_static.static_runner import run_static
 
@@ -337,13 +381,17 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
             "execution": {"detector_threshold": 0.7, "repair": {"max_attempts": 3}},
         }
 
+    # Chạy run_server_gpu_pipeline với các phụ thuộc được patch (health, detect, generate, Advisor, Assessor...).
     def _run(self, generate, detect=None, repair=None) -> dict:
+        # Detector giả dùng _reentrancy_probability.
         def fake_detect(code, threshold=0.7, server_url=None, timeout=60):
             return {"vulnerable_probability": _reentrancy_probability(code)}
 
+        # Advisor không dùng LLM (dựng từ KB).
         def deterministic_advisor(findings, code="", **kwargs):
             return _generate_advisor_section(findings, code)
 
+        # Assessor không dùng LLM (CVSS mặc định).
         def deterministic_assessor(findings, code="", **kwargs):
             return _generate_assessor_section(findings, code)
 
@@ -359,9 +407,11 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
             request["execution"]["repair"].update(repair or {})
             return gpu_pipeline.run_server_gpu_pipeline(request)
 
+    # single_pass: lấy bản vá đầu tiên, gọi Fixer đúng 1 lần, không kiểm chứng.
     def test_single_pass_keeps_first_patch_without_verification(self) -> None:
         prompts: list[str] = []
 
+        # Fixer giả trả bản vá đúng (CEI).
         def generate(prompt, **kwargs):
             prompts.append(prompt)
             if "Target vulnerable function: `withdrawAll`" in prompt:
@@ -381,7 +431,9 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
         )
         self.assertEqual(result["phases"]["detector"]["fixed"]["unit_results"], [])
 
+    # single_pass: bản vá vi phạm guard vẫn được giữ, chỉ ghi guard_warning.
     def test_single_pass_keeps_guard_violation_as_warning(self) -> None:
+        # Fixer giả trả bản vá xoá mất hành vi.
         def generate(prompt, **kwargs):
             if "Target vulnerable function: `withdraw`" in prompt:
                 return json.dumps({"replacement": (
@@ -396,9 +448,11 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
         self.assertEqual(outcome["status"], "applied")
         self.assertIn("removed", outcome["guard_warning"])
 
+    # single_pass: model trả nguyên hàm cũ -> status "unchanged" kèm lý do của model.
     def test_single_pass_reports_unchanged_reply_with_rationale(self) -> None:
         original_withdraw_all = next(u.code for u in parse_code_units(BANK) if u.name == "withdrawAll")
 
+        # Fixer giả trả lại hàm gốc.
         def generate(prompt, **kwargs):
             if "Target vulnerable function: `withdrawAll`" in prompt:
                 return json.dumps({"replacement": original_withdraw_all, "why": "Not exploitable here."})
@@ -412,9 +466,11 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
         self.assertEqual({item["engine"] for item in by_unit.values()}, {"llm_fixer"})
         self.assertEqual(result["phases"]["assessor"]["status"], "skipped")
 
+    # Vòng sửa: lần 2 giữ bản vá đã đạt của lần 1, chỉ vá lại hàm còn lỗi.
     def test_second_attempt_keeps_first_attempt_patch(self) -> None:
         calls = {"withdrawAll": 0}
 
+        # Fixer giả: lần đầu vá đúng một hàm, sai hàm kia.
         def generate(prompt, **kwargs):
             if "Target vulnerable function: `withdrawAll`" in prompt:
                 calls["withdrawAll"] += 1
@@ -436,7 +492,9 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
         self.assertEqual(applied, {"Bank.withdraw", "Bank.withdrawAll"})
         self.assertEqual(result["phases"]["detector"]["fixed"]["verdict"], "Safe")
 
+    # Detector không gọi được -> hàm ghi status error (không bịa xác suất).
     def test_unreachable_detector_is_reported_as_error(self) -> None:
+        # Detector giả luôn ném lỗi kết nối.
         def broken_detect(*args, **kwargs):
             raise ConnectionError("server down")
 

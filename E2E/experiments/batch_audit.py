@@ -111,6 +111,7 @@ OUTAGE_MARKERS = (
 _stop_requested = False
 
 
+# Xử lý Ctrl+C / SIGTERM: lần 1 -> chạy nốt contract hiện tại rồi dừng sạch; lần 2 -> dừng ngay (contract sẽ được xếp lại).
 def _request_stop(signum, frame) -> None:  # noqa: ARG001
     global _stop_requested
     if _stop_requested:
@@ -123,6 +124,7 @@ def _request_stop(signum, frame) -> None:  # noqa: ARG001
 # ──────────────────────────────────────────────────────────────────────────────
 # State
 # ──────────────────────────────────────────────────────────────────────────────
+# Mở/tạo CSDL SQLite state.sqlite của batch (bảng contracts, rows, meta) - nơi lưu tiến độ để dừng/tiếp tục bất kỳ lúc nào.
 def connect(batch_dir: Path) -> sqlite3.Connection:
     batch_dir.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(batch_dir / "state.sqlite")
@@ -152,6 +154,7 @@ def connect(batch_dir: Path) -> sqlite3.Connection:
     return db
 
 
+# Đưa mọi file .sol trong thư mục đầu vào vào hàng đợi (mỗi file một lần, thứ tự cố định để resume ổn định; tuỳ chọn xáo trộn có seed).
 def register_contracts(db: sqlite3.Connection, input_dir: Path, shuffle: bool, seed: int) -> int:
     """Queue every .sol file once. The order is fixed at registration so resumes are stable."""
     existing = {row["file"] for row in db.execute("SELECT file FROM contracts")}
@@ -171,6 +174,7 @@ def register_contracts(db: sqlite3.Connection, input_dir: Path, shuffle: bool, s
     return len(new_files)
 
 
+# Đếm số contract theo trạng thái (pending / in_progress / done / failed).
 def counts(db: sqlite3.Connection) -> dict[str, int]:
     return {row["status"]: row["n"] for row in db.execute(
         "SELECT status, COUNT(*) AS n FROM contracts GROUP BY status"
@@ -180,10 +184,12 @@ def counts(db: sqlite3.Connection) -> dict[str, int]:
 # ──────────────────────────────────────────────────────────────────────────────
 # One contract
 # ──────────────────────────────────────────────────────────────────────────────
+# GPU server có đang "ready" không (gọi /health).
 def _server_ready() -> bool:
     return check_server_health().get("status") == "ready"
 
 
+# Đọc khung giờ chạy "19:00-07:30" -> (phút bắt đầu, phút kết thúc); khung có thể vắt qua nửa đêm.
 def parse_active_hours(spec: str | None) -> tuple[int, int] | None:
     """'19:00-07:30' -> (start, end) in minutes since midnight; the window may cross midnight."""
     if not spec:
@@ -195,6 +201,7 @@ def parse_active_hours(spec: str | None) -> tuple[int, int] | None:
     return h1 * 60 + m1, h2 * 60 + m2
 
 
+# Thời điểm hiện tại có nằm trong khung giờ cho phép chạy không.
 def within_active_hours(window: tuple[int, int] | None, now: time.struct_time | None = None) -> bool:
     if window is None:
         return True
@@ -204,6 +211,8 @@ def within_active_hours(window: tuple[int, int] | None, now: time.struct_time | 
     return start <= minute < end if start < end else (minute >= start or minute < end)
 
 
+# Chờ đến khi vào khung giờ cho phép VÀ GPU server sẵn sàng; trả False nếu cần kết thúc (có yêu cầu dừng,
+# hoặc server tắt mà không bật --wait).
 def wait_until_runnable(args: argparse.Namespace, stop_file: Path, log) -> bool:
     """Block until inside the active hours and the GPU server is ready.
 
@@ -230,6 +239,7 @@ def wait_until_runnable(args: argparse.Namespace, stop_file: Path, log) -> bool:
     return False
 
 
+# Kết quả GPU có dấu hiệu server sập giữa chừng không (lỗi kết nối/timeout/502/503 trong detector hoặc fixer).
 def _looks_like_outage(server_result: dict[str, Any]) -> bool:
     phases = server_result.get("phases", {})
     texts = [
@@ -240,10 +250,15 @@ def _looks_like_outage(server_result: dict[str, Any]) -> bool:
     return any(marker in text.lower() for text in texts for marker in OUTAGE_MARKERS)
 
 
+# Lấy mã của một hàm theo unit_id từ mã nguồn (dùng điền cột mã gốc/mã vá trong CSV).
 def _unit_code(code: str, unit_id: str) -> str:
     return next((unit.code for unit in parse_code_units(code) if unit.unit_id == unit_id), "")
 
 
+# Nhiệm vụ: từ kết quả GPU của một contract, tạo MỖI HÀM ĐƯỢC NHẮM SỬA một dòng CSV: SWC, tiêu đề, mức độ,
+# p_detector, mã gốc, mã đã vá, trạng thái (applied / unchanged_by_model / rejected / not_patched),
+# lý do của model; kèm các hàm Advisor loại (false positive) / bị bỏ qua do ngân sách. Trả (rows, summary).
+# Mục đích: tạo dữ liệu round1_functions.csv để giám khảo ngoài chấm chất lượng bản vá.
 def build_function_rows(
     contract_file: Path,
     source: str,
@@ -381,10 +396,14 @@ def build_function_rows(
     return rows, summary
 
 
+# Lỗi riêng báo "GPU server sập trong lúc chạy contract" -> contract bị bỏ kết quả và xếp lại hàng đợi.
 class ServerOutage(RuntimeError):
     pass
 
 
+# Audit MỘT contract trong batch: run_pipeline lượt 1 (local) -> chỉnh request (single_pass mặc định,
+# max_target_units, detector_only_min_prob) -> run_server_gpu_pipeline -> kiểm tra server không sập giữa chừng
+# -> (nếu --verify) run_pipeline lượt 2 để kiểm chứng -> build_function_rows. Log của contract ghi vào execution.log.
 def audit_contract(path: Path, runs_dir: Path, args: argparse.Namespace) -> tuple[str, list[dict], dict]:
     source = path.read_text(encoding="utf-8", errors="replace")
     run_id = re.sub(r"[^A-Za-z0-9_.-]", "-", path.stem)[:100] + "-" + sha256_text(source)[:8]
@@ -430,10 +449,12 @@ def audit_contract(path: Path, runs_dir: Path, args: argparse.Namespace) -> tupl
 TARGETED_STATUSES = ("applied", "unchanged_by_model", "rejected", "not_patched")
 
 
+# Tạo hàm log vừa in ra màn hình vừa ghi kèm thời gian vào <batch>/progress.log.
 def progress_logger(batch_dir: Path):
     """Print a message and append it, timestamped, to <batch>/progress.log."""
     path = batch_dir / "progress.log"
 
+    # In một thông điệp và ghi thêm vào progress.log.
     def log(message: str) -> None:
         print(f"[batch] {message}", flush=True)
         with path.open("a", encoding="utf-8") as handle:
@@ -442,6 +463,7 @@ def progress_logger(batch_dir: Path):
     return log
 
 
+# Đếm số hàm theo trạng thái bản vá trong toàn batch.
 def function_counts(db: sqlite3.Connection) -> dict[str, int]:
     return {
         status: n for status, n in db.execute(
@@ -450,6 +472,7 @@ def function_counts(db: sqlite3.Connection) -> dict[str, int]:
     }
 
 
+# Dòng tổng kết tiến độ: số contract xong/lỗi/còn lại, số hàm theo trạng thái, tiến độ tới mục tiêu/snapshot kế tiếp.
 def totals_text(db: sqlite3.Connection, target: int | None, snapshot_every: int | None = None) -> str:
     """Cumulative totals; progress is shown toward the target, else toward the next snapshot."""
     state = counts(db)
@@ -475,6 +498,10 @@ def totals_text(db: sqlite3.Connection, target: int | None, snapshot_every: int 
     return text
 
 
+# [LỆNH "run" - VÒNG 1] Vòng lặp chính của batch: khoá chế độ (single_pass/verify) cho batch, đăng ký contract,
+# xếp lại contract dở dang, rồi lần lượt TỪNG contract: chờ khung giờ + server -> audit_contract -> lưu rows vào SQLite
+# (done) hoặc failed / xếp lại nếu server sập; định kỳ export CSV và snapshot; dừng khi có file STOP, Ctrl+C,
+# đủ --limit hoặc --target-done.
 def command_run(args: argparse.Namespace) -> None:
     batch_dir = BATCH_ROOT / args.batch
     db = connect(batch_dir)
@@ -613,6 +640,7 @@ def command_run(args: argparse.Namespace) -> None:
     log(totals_text(db, args.target_done, args.snapshot_every))
 
 
+# [LỆNH "status"] In tiến độ batch.
 def command_status(args: argparse.Namespace) -> None:
     db = connect(BATCH_ROOT / args.batch)
     stored = db.execute("SELECT value FROM meta WHERE key='mode'").fetchone()
@@ -629,10 +657,13 @@ def command_status(args: argparse.Namespace) -> None:
         print(f"  snapshot: {path}")
 
 
+# Đường dẫn file snapshot "<batch>_first<N>_<loại>.csv".
 def snapshot_path(batch: str, first: int) -> Path:
     return BATCH_ROOT / batch / f"{batch}_first{first}_functions.csv"
 
 
+# Xuất kết quả ra CSV (hàm, tóm tắt contract) + JSONL, ghi nguyên tử (file mở giữa chừng không bao giờ bị dở).
+# first=N: chỉ xuất N contract hoàn thành đầu tiên (snapshot cố định, chỉ CSV).
 def export_batch(batch: str, out: str | None = None, quiet: bool = False, first: int | None = None) -> Path:
     """Write the CSV/JSONL files atomically, so a file opened mid-run is never half-written.
 
@@ -657,17 +688,20 @@ def export_batch(batch: str, out: str | None = None, quiet: bool = False, first:
         placeholders = ",".join("?" * len(chosen)) or "NULL"
         contract_query = (f"SELECT * FROM contracts WHERE file IN ({placeholders}) ORDER BY finished_at, seq", chosen)
 
+    # Ghi file qua file tạm rồi đổi tên (nguyên tử).
     def write_atomic(path: Path, writer_fn) -> None:
         tmp = path.with_name(path.name + ".tmp")
         with tmp.open("w", encoding="utf-8", newline="") as handle:
             writer_fn(handle)
         tmp.replace(path)
 
+    # Ghi CSV mỗi hàm một dòng.
     def write_functions(handle) -> None:
         writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
+    # Ghi CSV tóm tắt mỗi contract một dòng.
     def write_summary(handle) -> None:
         writer = csv.DictWriter(handle, fieldnames=SUMMARY_COLUMNS, extrasaction="ignore")
         writer.writeheader()
@@ -681,6 +715,7 @@ def export_batch(batch: str, out: str | None = None, quiet: bool = False, first:
                 "error": (item["last_error"] or "").splitlines()[0] if item["last_error"] else "",
             })
 
+    # Ghi JSONL (bản đầy đủ của các dòng).
     def write_jsonl(handle) -> None:
         for item in rows:
             handle.write(json.dumps(item, ensure_ascii=False) + "\n")
@@ -697,6 +732,8 @@ def export_batch(batch: str, out: str | None = None, quiet: bool = False, first:
     return out_path
 
 
+# Tạo snapshot "<batch>_first{N}" một lần cho mỗi mốc N (bội số của --snapshot-every) đã đạt; mốc cuối lưu trong meta
+# nên snapshot đã xoá không bị tạo lại.
 def ensure_snapshots(db: sqlite3.Connection, args: argparse.Namespace, log) -> None:
     """Write `<batch>_first{N}_*` once for every multiple N of --snapshot-every reached.
 
@@ -717,10 +754,12 @@ def ensure_snapshots(db: sqlite3.Connection, args: argparse.Namespace, log) -> N
         db.commit()
 
 
+# [LỆNH "export"] Xuất CSV/JSONL (tuỳ chọn --first N).
 def command_export(args: argparse.Namespace) -> None:
     export_batch(args.batch, args.out, first=args.first)
 
 
+# [LỆNH "retry-failed"] Đưa các contract failed về pending để chạy lại.
 def command_retry_failed(args: argparse.Namespace) -> None:
     db = connect(BATCH_ROOT / args.batch)
     changed = db.execute("UPDATE contracts SET status='pending', attempts=0 WHERE status='failed'").rowcount
@@ -728,6 +767,8 @@ def command_retry_failed(args: argparse.Namespace) -> None:
     print(f"[batch] {changed} failed contract(s) re-queued.")
 
 
+# Tham số CLI của batch: run/status/export/retry-failed, --batch, --input-dir, --limit, --verify, --active-hours,
+# --wait, --target-done, --snapshot-every, --max-target-units, --detector-only-min-prob...
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Resumable batch audit over the GPU server pipeline.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -784,6 +825,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Điểm vào: `python -m E2E.experiments.batch_audit <lệnh>` (scripts/run_batch.sh gọi hàm này).
 def main() -> None:
     args = parse_args()
     {

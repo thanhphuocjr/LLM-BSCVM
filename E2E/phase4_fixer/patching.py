@@ -16,6 +16,7 @@ from typing import Iterable
 from E2E.phase0_parsing.code_units import CodeUnit
 
 
+# Căn lề lại hàm thay thế theo thụt lề của contract gốc (mỗi cấp { } thêm 4 dấu cách).
 def format_solidity_declaration_for_insertion(decl: str, base_indent: str = "    ") -> str:
     """Format and adjust replacement function declaration to match contract base indentation and Solidity Style Guide."""
     raw_lines = [l.rstrip() for l in decl.strip().split("\n") if l.strip()]
@@ -42,6 +43,9 @@ def format_solidity_declaration_for_insertion(decl: str, base_indent: str = "   
     return "\n".join(formatted)
 
 
+# Nhiệm vụ: ghép các hàm thay thế vào mã nguồn theo unit_id. Từ chối patch trùng, unit không tồn tại, rỗng
+# hoặc giống hệt bản gốc. Ghép từ cuối file lên đầu để offset của các unit phía trước không bị lệch.
+# Trả về (mã đã vá, danh sách outcome applied/rejected).
 def apply_unit_patches(code: str, units: Iterable[CodeUnit], patches: Iterable[dict]) -> tuple[str, list[dict]]:
     by_id = {unit.unit_id: unit for unit in units}
     accepted: list[tuple[CodeUnit, str, dict]] = []
@@ -88,6 +92,8 @@ def apply_unit_patches(code: str, units: Iterable[CodeUnit], patches: Iterable[d
 _JSON_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "/": "/"}
 
 
+# Đọc giá trị chuỗi của một trường JSON ngay cả khi model quên escape dấu " bên trong
+# (giá trị kết thúc ở dấu " đứng trước "," hoặc "}").
 def lenient_json_string_field(text: str, field: str) -> str | None:
     """Read a JSON string value even when the model left inner quotes unescaped.
 
@@ -112,6 +118,9 @@ def lenient_json_string_field(text: str, field: str) -> str | None:
     return None
 
 
+# Nhiệm vụ: lấy ĐÚNG MỘT khai báo hàm từ câu trả lời của model, theo thứ tự:
+# (1) JSON {"replacement": ...} (kể cả JSON hỏng), (2) code fence ```solidity có chứa tên hàm,
+# (3) tìm "function <tên>(" rồi đếm ngoặc (bỏ qua chuỗi/comment); nếu dính thêm hàm khác thì cắt bỏ.
 def extract_declaration_body(text: str, target_name: str | None = None) -> str:
     """
     Trích xuất một khai báo hàm/constructor duy nhất từ phản hồi của model.

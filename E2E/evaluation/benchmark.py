@@ -67,6 +67,9 @@ BENCHMARK_CONTRACTS = {
 }
 
 
+# Chạy kiểm tra hồi quy trên MỘT contract tham chiếu (Coinage, TRUEToken, elixir): chọn solc đúng chưa,
+# tách hàm (có thân / view-pure), chạy static + fuse_findings, rồi so với kỳ vọng (vd không có finding Critical
+# giả, số candidate tối đa, SWC-115...). Trả PASS/FAIL kèm danh sách lỗi.
 def evaluate_contract(key: str, config: dict[str, Any]) -> dict[str, Any]:
     path = config["path"]
     if not path.exists():
@@ -169,6 +172,8 @@ def evaluate_contract(key: str, config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Chạy evaluate_contract cho cả 3 contract (hoặc 1) và in kết luận "ALL BENCHMARKS PASSED" / "REGRESSION DETECTED".
+# Mục đích: đảm bảo sửa luật static/fusion không làm quay lại các lỗi báo nhầm đã fix.
 def run_benchmark(target: str = "all") -> dict[str, Any]:
     targets = BENCHMARK_CONTRACTS if target == "all" else {target: BENCHMARK_CONTRACTS[target]}
     results = {}
@@ -210,6 +215,7 @@ def run_benchmark(target: str = "all") -> dict[str, Any]:
     }
 
 
+# Điểm vào: `python -m E2E.evaluation.benchmark [--contract ...] [--json] [--check-regression]`.
 def main() -> None:
     parser = argparse.ArgumentParser(description="LLM-BSCVM Benchmark Suite")
     parser.add_argument(

@@ -30,6 +30,7 @@ from E2E.config import (
 )
 
 
+# Lấy điểm của một kênh (static/RAG/detector) từ score / final_score / vulnerability_probability.
 def _score(component: dict[str, Any]) -> float:
     return float(
         component.get("score")
@@ -39,6 +40,7 @@ def _score(component: dict[str, Any]) -> float:
     )
 
 
+# Kênh có "hoạt động" không: status="ok" hoặc đã có verdict kèm điểm. Kênh lỗi/pending không được tính trọng số.
 def _active(component: dict[str, Any]) -> bool:
     if not isinstance(component, dict):
         return False
@@ -52,6 +54,8 @@ def _active(component: dict[str, Any]) -> bool:
     return False
 
 
+# Detector chỉ được coi là đầy đủ khi MỌI unit đều có xác suất (không unit nào error/not_run).
+# Mục đích: chặn kết luận "Safe" khi detector chấm thiếu hàm (fail-closed).
 def _detector_complete(component: dict[str, Any]) -> bool:
     """A detector only counts as complete when every scored unit returned a probability.
 
@@ -74,10 +78,15 @@ def _detector_complete(component: dict[str, Any]) -> bool:
 _CHANNEL_BY_SOURCE = {"static": "static", "slither": "static", "rag": "rag"}
 
 
+# Đổi danh sách nguồn thành kênh bằng chứng: "slither" và "static" là CÙNG kênh static, "rag" là kênh riêng.
+# Mục đích: static + Slither cùng báo không được tính là "hai kênh xác nhận nhau" (corroborated).
 def _channels(sources: list[str] | set[str]) -> set[str]:
     return {_CHANNEL_BY_SOURCE.get(source, source) for source in sources}
 
 
+# Nhiệm vụ: gộp finding của static và RAG theo khoá (SWC, unit_id): lấy mức nghiêm trọng cao nhất, confidence
+# cao nhất, danh sách nguồn, corroborated (>= 2 kênh khác nhau), dòng, mô tả, cách sửa, mã sửa mẫu từ RAG...
+# Mục đích: mỗi lỗ hổng (một SWC tại một hàm) chỉ còn MỘT finding, kèm toàn bộ bằng chứng (evidence).
 def merge_findings(static_result: dict[str, Any], rag_result: dict[str, Any]) -> list[dict[str, Any]]:
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for component in (static_result, rag_result):
@@ -147,6 +156,13 @@ def merge_findings(static_result: dict[str, Any], rag_result: dict[str, Any]) ->
     )
 
 
+# [FUSION THEO TỪNG FINDING - dùng trong gpu_pipeline trước Phase 2]
+# Với mỗi finding (SWC, unit) đã gộp: lấy p_detector của chính unit đó (lỗi -> 0.5, không chạy -> 0.05), rồi
+#   p_final = logistic(intercept + w_det*p_detector + w_static*static_conf + w_rag*rag_conf + corroborated + severity)
+# với trọng số trong fusion_calibration.json (đặt tay). p_final >= tau_agent (0.45) -> confirmed (đi tiếp tới
+# Advisor/Assessor/Fixer); còn lại -> candidates. Dùng line_scores của detector để chỉ ra dòng nghi ngờ nhất.
+# Unit chỉ detector báo lỗi (static/RAG không thấy) vẫn thành finding "UNMAPPED" để có thể được sửa.
+# Trả về (confirmed, candidates).
 def fuse_findings(
     unit_results: list[dict[str, Any]],
     static_result: dict[str, Any] | list[dict[str, Any]],
@@ -312,6 +328,8 @@ def fuse_findings(
     return confirmed, candidates
 
 
+# Tạo finding "UNMAPPED:<unit>" cho các unit detector gắn nhãn Vulnerable mà static/RAG không có finding nào.
+# Mục đích: detector là phân loại nhị phân (không biết SWC) nhưng tín hiệu của nó vẫn không bị bỏ qua.
 def detector_findings(
     detector: dict[str, Any],
     local_findings: list[dict[str, Any]],
@@ -356,6 +374,13 @@ def detector_findings(
     return findings
 
 
+# [KẾT LUẬN CẤP CONTRACT - dùng cho báo cáo]
+# Điểm = tổng có trọng số của 3 kênh (detector 0.65, static 0.20, RAG 0.15), trọng số tự cân lại khi detector
+# offline (0/0.5/0.5) hoặc dưới ngưỡng mà static/RAG có phát hiện (0.2/0.4/0.4).
+# Sau đó áp "sàn bằng chứng" (decision_rules): static+RAG cùng xác nhận >= 0.72, lỗi High/Critical mạnh >= 0.65,
+# detector vượt ngưỡng >= 0.58 (có thêm finding local >= 0.62)...
+# Verdict: điểm >= 0.50 và có bằng chứng -> Vulnerable; mọi kênh bắt buộc chạy đủ -> Safe; còn lại -> Inconclusive.
+# Gọi bởi: orchestrator (lượt 1 = tạm thời không detector; lượt 2 = có detector) và final_verification.
 def fuse_detection(
     static_result: dict[str, Any],
     rag_result: dict[str, Any],

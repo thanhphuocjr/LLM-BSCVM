@@ -17,6 +17,8 @@ from E2E.config import KNOWLEDGE_BASE_DIR
 DEFAULT_SWC_REGISTRY = str(KNOWLEDGE_BASE_DIR / "swc_registry.json")
 
 
+# Cấu hình của MỘT SWC agent (37 agent, SWC-100 -> SWC-136): mã SWC, tiêu đề, mô tả, cách sửa,
+# mức nghiêm trọng, ngưỡng, số tín hiệu tối thiểu, danh sách regex tín hiệu.
 @dataclass(frozen=True)
 class AgentConfig:
     swc_id: str
@@ -29,10 +31,12 @@ class AgentConfig:
     min_signal_hits: int
     signal_patterns: Sequence[str]
 
+    # Tên kỹ thuật của agent, vd "swc_107".
     @property
     def name(self) -> str:
         return self.swc_id.lower().replace("-", "_")
 
+    # Tên hiển thị, vd "SWC-107 Agent - Reentrancy".
     @property
     def display_name(self) -> str:
         return f"{self.swc_id} Agent - {self.title}"
@@ -167,11 +171,13 @@ SIGNAL_PATTERNS_BY_SWC: Dict[str, Sequence[str]] = {
 }
 
 
+# Chuẩn hoá chuỗi bất kỳ về dạng "SWC-xxx" (vd "swc-107: Reentrancy" -> "SWC-107").
 def normalize_swc_id(value: object) -> str:
     match = re.search(r"SWC-\d{3}", str(value or "").upper())
     return match.group(0) if match else str(value or "").strip().upper()
 
 
+# Đọc swc_registry.json (37 mục SWC đã được làm giàu bằng dữ liệu) và lọc mục hợp lệ.
 def load_swc_registry(path: str = DEFAULT_SWC_REGISTRY) -> List[Dict]:
     registry_path = Path(path)
     with registry_path.open("r", encoding="utf-8") as f:
@@ -181,6 +187,7 @@ def load_swc_registry(path: str = DEFAULT_SWC_REGISTRY) -> List[Dict]:
     return [item for item in data if isinstance(item, dict) and normalize_swc_id(item.get("id"))]
 
 
+# Tạo câu truy vấn mô tả SWC (tên + mô tả + cách sửa) cho agent.
 def build_agent_query(swc_id: str, title: str, description: str, remediation: str) -> str:
     return (
         f"Audit this Solidity code for {swc_id} - {title}. "
@@ -190,6 +197,8 @@ def build_agent_query(swc_id: str, title: str, description: str, remediation: st
     )
 
 
+# Nhiệm vụ: dựng danh sách 37 AgentConfig từ registry + bảng SIGNAL_PATTERNS_BY_SWC / SEVERITY_BY_SWC /
+# MIN_SIGNAL_HITS_BY_SWC. Mục đích: LocalRAGRetriever dùng các agent này để "gác cổng" từng SWC.
 def build_agents_from_registry(path: str = DEFAULT_SWC_REGISTRY) -> List[AgentConfig]:
     agents = []
     for item in load_swc_registry(path):
@@ -214,6 +223,7 @@ def build_agents_from_registry(path: str = DEFAULT_SWC_REGISTRY) -> List[AgentCo
     return agents
 
 
+# Lọc lấy phần thực sự là mã Solidity (khối ```code``` và các dòng có từ khoá Solidity) trước khi dò tín hiệu.
 def extract_signal_code(code: str) -> str:
     fenced_blocks = re.findall(r"```(?:\w+)?\s*(.*?)```", code, re.IGNORECASE | re.DOTALL)
     code_lines = []
@@ -257,6 +267,7 @@ def extract_signal_code(code: str) -> str:
     return "\n".join([*fenced_blocks, *code_lines]).strip() or code
 
 
+# Lấy phiên bản (major, minor, patch) từ dòng pragma solidity.
 def pragma_version(code: str) -> tuple[int, int, int] | None:
     match = re.search(r"pragma\s+solidity\s+([^;]+);", code, re.IGNORECASE)
     if not match:
@@ -271,11 +282,13 @@ def pragma_version(code: str) -> tuple[int, int, int] | None:
     )
 
 
+# Pragma có cũ hơn phiên bản cho trước không (vd < 0.8.0 -> chưa có kiểm tra tràn số tự động).
 def pragma_before(code: str, major: int, minor: int, patch: int = 0) -> bool:
     version = pragma_version(code)
     return bool(version and version < (major, minor, patch))
 
 
+# Mã có phép toán số học (++, --, +=, a + b, add/sub/mul) không.
 def has_arithmetic_operation(code: str) -> bool:
     return bool(
         re.search(
@@ -286,6 +299,7 @@ def has_arithmetic_operation(code: str) -> bool:
     )
 
 
+# Liệt kê các câu lệnh có lời gọi cấp thấp .call/.delegatecall/.staticcall/.send.
 def low_level_call_statements(code: str) -> List[str]:
     return [
         statement.strip()
@@ -294,6 +308,7 @@ def low_level_call_statements(code: str) -> List[str]:
     ]
 
 
+# Lấy tên biến bool nhận kết quả của lời gọi cấp thấp (vd "(bool ok, ) = x.call(...)" -> ["ok"]).
 def statement_result_names(statement: str) -> List[str]:
     names = re.findall(r"\(\s*bool\s+(\w+)\s*,?", statement, re.IGNORECASE)
     names.extend(
@@ -306,6 +321,7 @@ def statement_result_names(statement: str) -> List[str]:
     return names
 
 
+# Kết quả lời gọi cấp thấp có được kiểm tra không (require(...)/assert/if(!ok)).
 def is_result_checked(full_code: str, statement: str) -> bool:
     if re.search(r"\b(?:require|assert)\s*\([^;]*\.(?:send|call|delegatecall|staticcall)\s*[\(\{]", statement, re.IGNORECASE | re.DOTALL):
         return True
@@ -319,6 +335,8 @@ def is_result_checked(full_code: str, statement: str) -> bool:
     return False
 
 
+# Có cập nhật state SAU lời gọi chuyển ETH (.call{value:}/.send) không -> dấu hiệu reentrancy (SWC-107).
+# Có nonReentrant/ReentrancyGuard thì trả False.
 def has_state_update_after_external_value_call(code: str) -> bool:
     if re.search(r"\bnonReentrant\b|ReentrancyGuard", code, re.IGNORECASE):
         return False
@@ -335,10 +353,12 @@ def has_state_update_after_external_value_call(code: str) -> bool:
     )
 
 
+# Lấy phần thân các vòng lặp for/while.
 def loop_bodies(code: str) -> List[str]:
     return re.findall(r"\b(?:for|while)\s*\([^)]*\)\s*\{(.*?)\}", code, re.IGNORECASE | re.DOTALL)
 
 
+# Lấy biểu thức điều kiện bên trong if(...) hoặc require(...) (đếm ngoặc lồng nhau).
 def condition_blocks(keyword: str, code: str) -> List[str]:
     blocks = []
     pattern = re.compile(rf"\b{keyword}\s*\(", re.IGNORECASE)
@@ -357,6 +377,7 @@ def condition_blocks(keyword: str, code: str) -> List[str]:
     return blocks
 
 
+# Có phép gán "=" (không phải "==") trong điều kiện if/require không -> SWC-129.
 def find_assignment_in_condition(code: str) -> bool:
     for condition in [*condition_blocks("if", code), *condition_blocks("require", code)]:
         compact = re.sub(r"\s+", "", condition)
@@ -367,6 +388,11 @@ def find_assignment_in_condition(code: str) -> bool:
     return False
 
 
+# Nhiệm vụ: kiểm tra tín hiệu "có ngữ cảnh" cho các SWC dễ báo nhầm (100, 101, 102, 103, 104, 105, 106, 107,
+# 112, 113, 118, 123, 129, 136). Vd SWC-104 chỉ báo khi kết quả .call KHÔNG được kiểm tra; SWC-105/106/112 bỏ qua
+# nếu có guard phân quyền; SWC-101 chỉ báo khi solc < 0.8 và không dùng SafeMath.
+# Trả None nếu SWC không có luật riêng (khi đó dùng regex chung).
+# Mục đích: dùng chung cho RAG (retriever) và static (static_runner gác cổng finding).
 def find_custom_signal_hits(swc_id: str, code: str) -> List[str] | None:
     if swc_id == "SWC-100":
         if pragma_before(code, 0, 5) and re.search(
@@ -450,6 +476,8 @@ def find_custom_signal_hits(swc_id: str, code: str) -> List[str] | None:
     return None
 
 
+# Trả về danh sách tín hiệu của một SWC trong đoạn mã: ưu tiên luật riêng (find_custom_signal_hits),
+# không có thì dò các regex chung của agent.
 def find_signal_hits(code: str, patterns: Sequence[str], swc_id: str | None = None) -> List[str]:
     signal_code = extract_signal_code(code)
     custom_hits = find_custom_signal_hits(swc_id, signal_code) if swc_id else None
@@ -462,6 +490,7 @@ def find_signal_hits(code: str, patterns: Sequence[str], swc_id: str | None = No
     ]
 
 
+# Mã có cơ chế phân quyền không (onlyOwner, onlyRole, Ownable, require(msg.sender == ...)).
 def has_access_control_guard(code: str) -> bool:
     return bool(
         re.search(

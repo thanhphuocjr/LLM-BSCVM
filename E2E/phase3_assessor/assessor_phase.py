@@ -114,6 +114,7 @@ SWC_CVSS_MAP: dict[str, dict[str, Any]] = {
 }
 
 
+# Từ vector CVSS mặc định, tính lại điểm bằng công thức (không tin con số viết tay trong bảng) và mức rủi ro tương ứng.
 def _with_computed_score(meta: dict[str, Any]) -> dict[str, Any]:
     """Derive the CVSS v3.1 base score and its qualitative rating from the vector itself."""
     metrics = dict(part.split(":", 1) for part in meta["cvss_vector"].split("/")[1:])
@@ -121,10 +122,13 @@ def _with_computed_score(meta: dict[str, Any]) -> dict[str, Any]:
     return {**meta, "cvss_score": score, "cvss_vector": vector, "severity": cvss_to_level(score)}
 
 
+# CVSS mặc định cho một SWC (bảng SWC_CVSS_MAP, hoặc mẫu theo mức độ) với điểm đã tính lại bằng công thức.
 def get_cvss_defaults(swc: str, severity: str = "Medium") -> dict[str, Any]:
     return _with_computed_score(_cvss_template(swc, severity))
 
 
+# Chọn mẫu CVSS: theo SWC nếu có trong SWC_CVSS_MAP (107, 105, 115, 104, 101, 114, 116, 120, 102),
+# không thì theo mức độ Critical/High/Medium/Low.
 def _cvss_template(swc: str, severity: str = "Medium") -> dict[str, Any]:
     if swc in SWC_CVSS_MAP:
         return SWC_CVSS_MAP[swc]
@@ -174,6 +178,11 @@ def _cvss_template(swc: str, severity: str = "Medium") -> dict[str, Any]:
     }
 
 
+# [HÀM CHÍNH PHASE 3] Đánh giá rủi ro mọi finding:
+#   1) gọi LLM song song (4 luồng) cho tối đa MAX_LLM_ASSESSOR_CALLS (5) finding đầu, có kèm root cause/impact từ Advisor;
+#   2) finding còn lại hoặc LLM lỗi -> dùng CVSS mặc định theo SWC (get_cvss_defaults);
+#   3) sắp xếp theo repair_priority rồi đánh số lại 1, 2, 3... (1 = sửa trước).
+# Gọi bởi: gpu_pipeline.run_server_gpu_pipeline (bỏ qua ở chế độ single_pass).
 def _generate_assessor_section(
     findings: list[dict[str, Any]],
     code: str = "",
@@ -197,6 +206,7 @@ def _generate_assessor_section(
     llm_assessor_results = {}
     if agent is not None and findings:
         findings_to_query = findings[:MAX_LLM_ASSESSOR_CALLS]
+        # Gọi assess_one cho một finding (đã bổ sung root_cause/impact từ suggestion của Advisor).
         def _call_assessor(finding_dict):
             f_key = finding_key(finding_dict)
             f_enr = dict(finding_dict)

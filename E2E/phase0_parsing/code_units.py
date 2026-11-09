@@ -25,6 +25,11 @@ DECLARATION_RE = re.compile(
 CONTRACT_RE = re.compile(r"\b(?:abstract\s+)?(contract|library|interface)\s+([A-Za-z_$][\w$]*)")
 
 
+# [Phase 0] Cấu trúc dữ liệu cho MỘT đơn vị mã (hàm / constructor / fallback / receive).
+# Lưu id dạng "Contract.func" (trùng tên thì thêm "#2"), loại, vị trí (offset + dòng), mã nguồn,
+# có thân hay không, có phải view/pure, visibility.
+# Mục đích: mọi phase sau làm việc theo unit (detector chấm từng unit, Fixer vá từng unit,
+# Phase 5 kiểm tra lại từng unit đã vá).
 @dataclass(frozen=True)
 class CodeUnit:
     unit_id: str
@@ -40,14 +45,18 @@ class CodeUnit:
     is_view_or_pure: bool = False
     visibility: str = "public"
 
+    # Chuyển unit thành dict để ghi JSON (phase0_input.json, request.json).
     def to_dict(self) -> dict:
         return asdict(self)
 
 
+# Đổi vị trí ký tự (offset) thành số dòng (bắt đầu từ 1).
 def _line_number(code: str, offset: int) -> int:
     return code.count("\n", 0, max(0, offset)) + 1
 
 
+# Nếu tại vị trí index là comment (//, /* */) hoặc chuỗi ('...', "..."), trả về vị trí ngay sau nó;
+# ngược lại trả None. Mục đích: khi đếm ngoặc { } thì bỏ qua comment/chuỗi.
 def _skip_comment_or_string(code: str, index: int) -> int | None:
     if code.startswith("//", index):
         newline = code.find("\n", index + 2)
@@ -69,6 +78,9 @@ def _skip_comment_or_string(code: str, index: int) -> int | None:
     return None
 
 
+# Thay mọi ký tự trong comment/chuỗi bằng dấu cách (giữ nguyên xuống dòng và độ dài).
+# Mục đích: regex tìm "function"/"contract" không bắt nhầm chữ nằm trong comment hay string,
+# mà offset vẫn khớp với mã gốc.
 def _mask_noncode(code: str) -> str:
     masked = list(code)
     cursor = 0
@@ -84,6 +96,8 @@ def _mask_noncode(code: str) -> str:
     return "".join(masked)
 
 
+# Từ chỗ bắt đầu khai báo hàm, tìm vị trí kết thúc: gặp ";" trước -> hàm không thân (interface/abstract);
+# gặp "{" -> đếm ngoặc đến "}" khớp. Trả về (end_offset, has_body).
 def _declaration_end(code: str, declaration_start: int, search_start: int) -> tuple[int, bool]:
     """
     Tìm vị trí kết thúc của khai báo hàm và xác định hàm có thân (has_body) hay không.
@@ -116,6 +130,8 @@ def _declaration_end(code: str, declaration_start: int, search_start: int) -> tu
     return len(code), False
 
 
+# Tìm contract/library/interface gần nhất phía trước offset -> (tên, loại).
+# Mục đích: gán unit vào đúng contract để tạo unit_id "Contract.func".
 def _contract_at(code: str, offset: int) -> tuple[str, str]:
     """Trả về (contract_name, contract_kind) tại vị trí offset."""
     matches = list(CONTRACT_RE.finditer(_mask_noncode(code), 0, offset))
@@ -124,6 +140,11 @@ def _contract_at(code: str, offset: int) -> tuple[str, str]:
     return "UnknownContract", "contract"
 
 
+# [HÀM CHÍNH PHASE 0] Tách mã nguồn Solidity thành danh sách CodeUnit.
+# Cách làm: che comment/chuỗi -> regex tìm "function X(", "function(" (fallback cũ), constructor/receive/fallback
+# -> tìm điểm kết thúc -> xác định contract chứa nó, visibility, view/pure. Nếu không có hàm nào thì
+# trả về 1 unit "source" chứa toàn bộ file.
+# Gọi bởi: orchestrator.run_pipeline, batch_audit, các bước kiểm chứng Phase 5.
 def parse_code_units(code: str) -> list[CodeUnit]:
     units: list[CodeUnit] = []
     names: dict[str, int] = {}
@@ -188,6 +209,8 @@ def parse_code_units(code: str) -> list[CodeUnit]:
     ]
 
 
+# Dựng lại CodeUnit từ dict (request.json lưu unit ở dạng dict). Nếu đã là CodeUnit thì trả nguyên.
+# Mục đích: GPU pipeline / Fixer nhận unit từ JSON nhưng cần đối tượng CodeUnit.
 def as_code_unit(unit: CodeUnit | dict[str, Any]) -> CodeUnit:
     """Rebuild a CodeUnit from its JSON form (request.json stores units as dicts)."""
     if isinstance(unit, CodeUnit):

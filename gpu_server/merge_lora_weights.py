@@ -36,6 +36,7 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "models" / "qwen25-v13-14b-merged"
 DEFAULT_BASE_MODEL = "Qwen/Qwen2.5-Coder-14B-Instruct"
 
 
+# Tham số: thư mục adapter, base model, thư mục đầu ra, thiết bị, kiểu dữ liệu...
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Ghép trọng số LoRA adapter vào mô hình nền LLM (v13)."
@@ -74,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Chọn thiết bị (cuda/mps/cpu) theo tham số và phần cứng sẵn có.
 def resolve_device(device_arg: str) -> str:
     if device_arg != "auto":
         return device_arg
@@ -86,6 +88,7 @@ def resolve_device(device_arg: str) -> str:
     return "cpu"
 
 
+# Chọn kiểu dữ liệu (bfloat16/float16/float32) cho việc merge.
 def resolve_dtype(dtype_name: str, torch_module):
     if dtype_name == "bfloat16":
         return torch_module.bfloat16
@@ -94,6 +97,8 @@ def resolve_dtype(dtype_name: str, torch_module):
     return torch_module.float32
 
 
+# Nạp base model + LoRA adapter v13, merge_and_unload() để gộp trọng số LoRA vào base, lưu checkpoint độc lập
+# (model + tokenizer). Mục đích (tuỳ chọn): chạy inference không cần PEFT (vLLM, GGUF...). Pipeline chính KHÔNG cần bước này.
 def merge_lora_into_base(
     adapter_dir: Path,
     output_dir: Path,
@@ -189,6 +194,7 @@ def merge_lora_into_base(
     logger.info("════════════════════════════════════════════════════════════════════")
 
 
+# Điểm vào của script merge.
 def main() -> None:
     args = parse_args()
     merge_lora_into_base(

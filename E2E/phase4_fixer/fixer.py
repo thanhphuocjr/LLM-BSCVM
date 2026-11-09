@@ -22,6 +22,9 @@ from E2E.phase4_fixer.behavior_guard import validate_observable_behavior
 from E2E.phase4_fixer.patching import apply_unit_patches, extract_declaration_body, lenient_json_string_field
 
 
+# Nhiệm vụ: chọn tối đa 3 ca tương tự từ ngữ cảnh RAG (retrieved_context) - ưu tiên ca cùng SWC với lỗi đang sửa,
+# bỏ ca similarity < 0.08 - và viết thành đoạn prompt: SWC, root cause, cách sửa, cặp mã lỗi/mã sửa ngắn (<= 350 ký tự).
+# Mục đích: cho Fixer "xem ví dụ" sửa lỗi thực tế từ KB 11,869 ca.
 def _build_rag_knowledge_section(
     rag_context: list[dict[str, Any]],
     target_swc: str | None = None,
@@ -73,6 +76,8 @@ def _build_rag_knowledge_section(
     )
 
 
+# Tìm lại một unit trong mã đã parse lại (sau khi các hàm khác đã được vá, offset thay đổi): theo unit_id,
+# không có thì theo tên hàm duy nhất trong cùng contract.
 def _find_unit(units: list[CodeUnit], target: CodeUnit) -> CodeUnit | None:
     """Locate `target` in a re-parsed source: by unit_id, else by a unique name match."""
     by_id = next((unit for unit in units if unit.unit_id == target.unit_id), None)
@@ -85,6 +90,8 @@ def _find_unit(units: list[CodeUnit], target: CodeUnit) -> CodeUnit | None:
     return same_name[0] if len(same_name) == 1 else None
 
 
+# Ghép bản thay thế của MỘT hàm vào mã hiện tại (parse lại -> tìm unit -> apply_unit_patches).
+# Không ghép được thì raise ValueError. Dùng bởi patch_unit và gpu_pipeline (dựng lại mã từ các bản vá đã đạt).
 def _splice_unit(code: str, target: CodeUnit, replacement: str, summary: str) -> str:
     current = _find_unit(parse_code_units(code), target)
     if current is None:
@@ -100,6 +107,7 @@ def _splice_unit(code: str, target: CodeUnit, replacement: str, summary: str) ->
     return updated
 
 
+# Đổi repair_feedback (lỗi compile + các kênh kiểm chứng không đạt) truyền từ ngoài vào thành đoạn văn bản cho prompt.
 def _feedback_from_request(repair_feedback: dict[str, Any] | None) -> str:
     """Turn an externally supplied repair_feedback object into prompt text."""
     if not repair_feedback:
@@ -123,6 +131,7 @@ def _feedback_from_request(repair_feedback: dict[str, Any] | None) -> str:
     return "\n".join(parts)
 
 
+# Phiên bản solc thấp nhất mà pragma cho phép (bản vá phải compile được với bản này).
 def _min_pragma_version(source_code: str) -> tuple[int, int, int] | None:
     """Lowest compiler version allowed by the pragma (the patch must compile with it)."""
     match = re.search(r"pragma\s+solidity\s+([^;]+);", source_code)
@@ -135,6 +144,9 @@ def _min_pragma_version(source_code: str) -> tuple[int, int, int] | None:
     return min(versions) if versions else None
 
 
+# Sinh luật cú pháp theo phiên bản Solidity cũ (< 0.6) để chèn vào prompt: vd < 0.4.22 không có require(msg),
+# không có constructor/abi.encode; < 0.4.21 không có emit; < 0.5 không có address payable/calldata.
+# Mục đích: model hay viết cú pháp 0.8 cho contract 0.4 -> compile lỗi; luật này giảm lỗi đó.
 def _version_rules(source_code: str) -> str:
     version = _min_pragma_version(source_code)
     if version is None or version >= (0, 6, 0):
@@ -158,6 +170,9 @@ def _version_rules(source_code: str) -> str:
     return "\n".join(rules) + "\n"
 
 
+# Dựng prompt Fixer cho MỘT hàm: tên hàm, danh sách lỗi + fix_strategy của Advisor (chỉ lấy suggestion đã được
+# Advisor xác nhận là true positive), mã gốc, ngữ cảnh contract + bất biến, tri thức RAG, feedback lần trước,
+# luật phiên bản, yêu cầu "MINIMAL DIFF", giữ mọi lệnh ghi state/event, trả JSON {replacement, changed_lines, why}.
 def _build_fixer_prompt(
     unit: CodeUnit,
     unit_findings: list[dict[str, Any]],
@@ -200,6 +215,13 @@ def _build_fixer_prompt(
     )
 
 
+# [HÀM CHÍNH PHASE 4] Vá MỘT hàm:
+#   prepare (dựng prompt) -> generate (gọi LLM, temperature 0) -> extract (lấy hàm thay thế từ JSON/code fence)
+#   -> guard (validate_observable_behavior: không được mất chuyển ETH/ghi state/event/return) -> apply (_splice_unit).
+# LLM thất bại -> thử fixed_code của Advisor (cũng phải qua guard). Không được -> outcome "rejected" kèm stage lỗi.
+# single_pass (batch vòng 1): kết quả model là kết quả cuối; guard chỉ ghi cảnh báo (guard_warning), không fallback,
+# trả về y nguyên -> "unchanged".
+# Trả về (mã mới, outcome {status applied/rejected/unchanged, engine, stage, rationale...}).
 def patch_unit(
     code: str,
     unit: CodeUnit,

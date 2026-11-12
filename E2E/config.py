@@ -15,17 +15,11 @@ KNOWLEDGE_SOURCE_DIR = DATA_DIR / "knowledge_base" / "source"
 VULNERABILITY_KNOWLEDGE_PATH = KNOWLEDGE_SOURCE_DIR / "final-vulnerability-knowledge.json"
 BASELINE_TAXONOMY_PATH = KNOWLEDGE_SOURCE_DIR / "baseline_taxonomy.json"
 KNOWLEDGE_BASE_DIR = DATA_DIR / "knowledge_base" / "built"      # read by Phase 1B (RAG) and Phase 2 (Advisor)
-# Train/val/test split of the v13 detector (copied to the GPU server by `scripts/gpu_server.sh deploy`).
-DETECTOR_DATASET_PATH = DATA_DIR / "detector_dataset" / "final-dataset-v12-train.json"
-SMARTBUGS_WILD_DIR = DATA_DIR / "smartbugs_wild"                # input corpus of the round-1 batch
-SOLODIT_EVAL_DIR = DATA_DIR / "solodit_eval"                    # evaluation set of the 9-tool benchmark
+SMARTBUGS_WILD_DIR = DATA_DIR / "smartbugs_wild"                # 3 reference contracts of tests/test_benchmark_regression.py
 
 # ── Results ──────────────────────────────────────────────────────────────────
 RESULTS_DIR = DATA_DIR / "results"
 RUNS_DIR = RESULTS_DIR / "audit_runs"                           # one folder per audit (web app / CLI)
-BATCH_RUNS_DIR = RESULTS_DIR                                    # batches: round1, round2, round2_regress
-ROUND1_JUDGE_DIR = RESULTS_DIR / "round1_judge"                 # judge scores of round 1 = input of round 2
-SOLODIT_BENCHMARK_RESULTS_DIR = RESULTS_DIR / "solodit_9tools"
 
 # ── Models and demo inputs ───────────────────────────────────────────────────
 MODEL_DIR = PROJECT_ROOT / "models"
@@ -44,6 +38,11 @@ DEFAULT_COMPONENT_WEIGHTS = {
     "static": 0.20,
 }
 MAX_FIX_ATTEMPTS = 3   # Fixer -> Verifier repair loop
+
+# LLM calls per contract: the Advisor triages at most this many findings (highest severity first),
+# the Assessor scores at most this many with the LLM; the rest use knowledge-base / SWC defaults.
+MAX_LLM_ADVISOR_CALLS = 40
+MAX_LLM_ASSESSOR_CALLS = 5
 
 RISK_ORDER = {
     "Critical": 4,

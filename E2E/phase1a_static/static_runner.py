@@ -1,5 +1,12 @@
+"""
+Phase 1A - static evidence: the rule engine (static_analyzer.py) on the whole contract and on
+every code unit, plus native Slither mapped to SWC ids. Error-prone rule types are confirmed only
+when the matching SWC agent of Phase 1B also sees its code signal (SIGNAL_GATED_TYPES).
+"""
+
+from __future__ import annotations
+
 import logging
-import shutil
 from typing import Any
 
 from E2E.config import RISK_ORDER
@@ -97,50 +104,32 @@ def _finding_rows(
 # (3) chạy Slither thật (nếu đã cài) và ánh xạ check -> SWC bằng SLITHER_CHECK_TO_SWC,
 # (4) khử trùng lặp theo (SWC, dòng) - ưu tiên Slither/finding có unit_id,
 # (5) chỉ giữ finding confirmed; finding chưa xác nhận để ở "candidates".
-# Trả về: score (= confidence cao nhất), verdict, risk_level, findings, unit_results (kết quả từng hàm).
+# Trả về: score (= confidence cao nhất), verdict, risk_level, findings (confirmed), candidates (chưa xác nhận).
 # Gọi bởi: orchestrator.run_pipeline (song song với run_rag), candidate_check/final_verification (chạy lại trên bản vá).
 def run_static(code: str, units: list[CodeUnit] | None = None) -> dict[str, Any]:
     parsed_units = units or parse_code_units(code)
     guard_modifiers = extract_guard_modifiers(code)
     contract_result = run_static_analysis(code, guard_modifiers=guard_modifiers)
-    unit_results = []
     all_rows = _finding_rows(contract_result, code)
-
     for unit in parsed_units:
         result = run_static_analysis(unit.code, guard_modifiers=guard_modifiers)
-        rows = _finding_rows(result, unit.code, unit)
-        all_rows.extend(rows)
-        unit_results.append(
-            {
-                "unit_id": unit.unit_id,
-                "start_line": unit.start_line,
-                "end_line": unit.end_line,
-                "score": round(float(result.get("static_score") or 0.0), 6),
-                "verdict": result.get("verdict", "Unknown"),
-                "risk_level": result.get("risk_level", "Unknown"),
-                "findings": rows,
-                "context_issues": result.get("context_issues", []),
-            }
-        )
+        all_rows.extend(_finding_rows(result, unit.code, unit))
 
-    engine_name = "Regex rules (34 rules)"
-    # Tích hợp Slither thật (Task C4)
+    engine_name = "Regex rules (27 rules + 25 semantic checks)"
+    # Slither thật (chỉ khi có solc phù hợp; chưa cài slither -> run_status "unavailable", chỉ dùng bộ luật)
     solc_path, selection_reason, _ = select_best_solc(code)
-    slither_ran_ok = False
-    if shutil.which("slither") and solc_path is not None:
+    if solc_path is not None:
         try:
             slither_res = _run_native_slither(code, "Contract.sol", None, solc_path, selection_reason)
             if slither_res.get("run_status") == "completed":
-                slither_ran_ok = True
                 engine_name = "Slither + Regex rules"
                 for item in slither_res.get("findings", []):
                     check = str(item.get("check") or "")
-                    sev = str(item.get("severity") or "")
                     lines = item.get("line") or []
                     first_line = lines[0] if lines else None
                     swc_info = SLITHER_CHECK_TO_SWC.get(check)
                     if swc_info:
-                        swc_id, title, mapped_sev = swc_info
+                        swc_id, title, severity = swc_info
                         matched_unit = None
                         if first_line:
                             matched_unit = next(
@@ -152,7 +141,7 @@ def run_static(code: str, units: list[CodeUnit] | None = None) -> dict[str, Any]
                                 "source": "slither",
                                 "swc": swc_id,
                                 "title": title,
-                                "severity": mapped_sev if mapped_sev != "AsIs" else sev,
+                                "severity": severity,
                                 "confidence": 0.95,
                                 "confirmed": True,
                                 "line": first_line,
@@ -197,11 +186,8 @@ def run_static(code: str, units: list[CodeUnit] | None = None) -> dict[str, Any]
         "status": "ok",
         "engine": engine_name,
         "score": round(score, 6),
-        "verdict": "Vulnerable" if findings or score > 0.25 else "Safe",
-        "risk_level": risk_level if findings else "None",
+        "verdict": "Vulnerable" if findings else "Safe",
+        "risk_level": risk_level,
         "findings": findings,
         "candidates": [item for item in candidates if not item["confirmed"]],
-        "context_issues": contract_result.get("context_issues", []),
-        "unit_results": unit_results,
-        "summary": contract_result.get("summary", ""),
     }

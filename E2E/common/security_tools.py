@@ -1,17 +1,14 @@
 """
-Run external security tools on one Solidity source and normalise their findings.
+Run Slither natively on one Solidity source and normalise its findings.
 
-* Slither, natively (`slither --solc <solc picked by pragma>`): used by Phase 1A
-  (static evidence) and by the Phase 5 tool matrix.
-* SmartBugs (Docker) for Mythril, SmartCheck and the other wrapped tools: used by the
-  Phase 5 tool matrix and by evaluation/benchmark_solodit_9tools.py.
-Findings are normalised to {tool, name, check, severity, line, message, category}.
+`slither <file> --solc <solc picked by pragma> --json` is used by Phase 1A (static
+evidence) and by the Phase 5 tool matrix. Findings are normalised to
+{tool, name, check, severity, line, message, category}.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 import tempfile
@@ -20,15 +17,9 @@ from pathlib import Path
 from typing import Any
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
-
-DEFAULT_SMARTBUGS_HOME = PROJECT_ROOT / ".tools" / "smartbugs"
-
-
 # Chạy một lệnh ngoài (subprocess) có timeout, trả dict status/return_code/stdout/stderr/thời gian.
 # Không bao giờ ném lỗi (timeout, thiếu lệnh -> status="error").
-def _run(command: list[str], timeout: int = 120, cwd: Path | None = None) -> dict[str, Any]:
+def _run(command: list[str], timeout: int = 120) -> dict[str, Any]:
     try:
         started = time.perf_counter()
         completed = subprocess.run(
@@ -37,7 +28,6 @@ def _run(command: list[str], timeout: int = 120, cwd: Path | None = None) -> dic
             capture_output=True,
             timeout=timeout,
             check=False,
-            cwd=str(cwd) if cwd else None,
         )
         return {
             "status": "passed" if completed.returncode == 0 else "failed",
@@ -81,7 +71,7 @@ def _slither_findings(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 # Chép mã nguồn (và các file .sol phụ thuộc trong source_root, nếu có) vào thư mục tạm.
-# Mục đích: Slither/SmartBugs cần file thật trên đĩa và cần thấy các file được import.
+# Mục đích: Slither cần file thật trên đĩa và cần thấy các file được import.
 def _copy_source_tree(
     temp_root: Path,
     code: str,
@@ -136,81 +126,6 @@ def _classify_category(*parts: Any) -> str:
         if any(needle in text for needle in needles):
             return category
     return "other"
-
-
-# Kiểm tra Docker daemon có chạy không (SmartBugs chạy Mythril/SmartCheck trong container Docker).
-def _is_docker_available() -> bool:
-    docker_bin = shutil.which("docker")
-    if not docker_bin:
-        return False
-    try:
-        completed = subprocess.run(
-            [docker_bin, "info"],
-            capture_output=True,
-            timeout=2,
-            check=False,
-        )
-        return completed.returncode == 0
-    except Exception:
-        return False
-
-
-# Tìm file chạy SmartBugs (tham số > SMARTBUGS_HOME > .tools/smartbugs > PATH); trả (path, lý do).
-# Không có Docker hoặc chưa cài virtualenv thì trả None kèm lý do.
-def _smartbugs_executable(smartbugs_home: str | Path | None = None) -> tuple[Path | None, str]:
-    if not _is_docker_available():
-        return None, "SmartBugs unavailable: Docker daemon is not running"
-    candidates: list[Path] = []
-    if smartbugs_home:
-        candidates.append(Path(smartbugs_home) / "smartbugs")
-    if os.environ.get("SMARTBUGS_HOME"):
-        candidates.append(Path(os.environ["SMARTBUGS_HOME"]) / "smartbugs")
-    candidates.append(DEFAULT_SMARTBUGS_HOME / "smartbugs")
-    discovered = shutil.which("smartbugs")
-    if discovered:
-        candidates.append(Path(discovered))
-    for candidate in candidates:
-        if candidate.exists() and os.access(candidate, os.X_OK):
-            venv_activate = candidate.parent / ".venv" / "bin" / "activate"
-            if candidate.parent == DEFAULT_SMARTBUGS_HOME and not venv_activate.exists():
-                return None, f"SmartBugs found at {candidate.parent}, but its virtualenv is not installed"
-            return candidate.resolve(), f"SmartBugs executable: {candidate.resolve()}"
-    return None, "SmartBugs executable not found"
-
-
-# Chuẩn hoá một finding của SmartBugs về dạng chung {tool, name, severity, line, message, category}.
-def _normalise_smartbugs_finding(tool: str, item: dict[str, Any]) -> dict[str, Any]:
-    name = item.get("name") or item.get("check") or item.get("title") or "unknown"
-    message = item.get("message") or item.get("description") or item.get("extra") or ""
-    severity = _normalise_severity(item.get("severity") or item.get("impact"))
-    return {
-        "tool": tool,
-        "name": str(name),
-        "severity": severity,
-        "line": item.get("line") or item.get("lines"),
-        "message": str(message),
-        "category": _classify_category(name, message),
-        "raw": item,
-    }
-
-
-# Đọc mọi result.json SmartBugs sinh ra -> (danh sách finding, lỗi, fail).
-def _read_smartbugs_results(tool: str, result_dir: Path) -> tuple[list[dict[str, Any]], list[str], list[str]]:
-    findings: list[dict[str, Any]] = []
-    errors: list[str] = []
-    fails: list[str] = []
-    for result_path in result_dir.rglob("result.json"):
-        try:
-            payload = json.loads(result_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            errors.append(f"{result_path}: {error}")
-            continue
-        for item in payload.get("findings", []) or []:
-            if isinstance(item, dict):
-                findings.append(_normalise_smartbugs_finding(tool, item))
-        errors.extend(str(item) for item in payload.get("errors", []) or [])
-        fails.extend(str(item) for item in payload.get("fails", []) or [])
-    return findings, errors, fails
 
 
 # Chuẩn hoá một finding Slither về dạng chung {tool, name, check, severity, line, message, category}.
@@ -285,68 +200,4 @@ def _run_native_slither(
             "compiler": str(solc),
             "selection_reason": selection_reason,
             "copied_solidity_dependencies": dependency_count,
-        }
-
-
-# Nhiệm vụ: chạy một tool qua SmartBugs (Docker): mythril, smartcheck, ... trên một file;
-# đọc result.json và chuẩn hoá finding.
-# Mục đích: ma trận tool Phase 5 (--full-matrix) và benchmark 9 tool.
-def _run_smartbugs_tool(
-    tool: str,
-    code: str,
-    file_name: str,
-    source_root: str | Path | None,
-    smartbugs_executable: Path,
-    results_root: Path,
-    label: str,
-    timeout: int,
-) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix=f"e2e-{tool}-{label}-") as temp_dir:
-        temp_root = Path(temp_dir)
-        source_path, dependency_count = _copy_source_tree(
-            temp_root,
-            code,
-            file_name,
-            source_root,
-        )
-        result_dir = results_root / label / tool
-        result_dir.mkdir(parents=True, exist_ok=True)
-        command = [
-            str(smartbugs_executable),
-            "-t",
-            tool,
-            "-f",
-            str(source_path),
-            "--processes",
-            "1",
-            "--timeout",
-            str(timeout),
-            "--mem-limit",
-            "4g",
-            "--json",
-            "--results",
-            str(result_dir),
-            "--overwrite",
-            "--quiet",
-        ]
-        run_result = _run(command, timeout=timeout + 120, cwd=smartbugs_executable.parent)
-        has_result = any(result_dir.rglob("result.json"))
-        findings, errors, fails = _read_smartbugs_results(tool, result_dir)
-        run_status = "completed" if has_result or run_result["status"] == "passed" else "error"
-        error = None
-        if errors or fails:
-            error = "; ".join([*errors, *fails])[:4000]
-        elif run_result["status"] == "error":
-            error = run_result.get("error") or run_result.get("stderr")
-        elif run_status == "error":
-            error = run_result.get("stderr") or "SmartBugs did not produce a parsed result"
-        return {
-            "run_status": run_status,
-            "findings": findings,
-            "error": error,
-            "elapsed_ms": run_result.get("elapsed_ms", 0.0),
-            "command": command,
-            "copied_solidity_dependencies": dependency_count,
-            "stdout": run_result.get("stdout", ""),
-            "stderr": run_result.get("stderr", ""),
         }

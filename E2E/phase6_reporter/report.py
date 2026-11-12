@@ -1,3 +1,8 @@
+"""
+Phase 6 - deterministic audit report: one report-data dict (build_report_data + the Phase 5
+verdict from apply_verification_to_report) rendered as Markdown, HTML and PDF (reportlab).
+"""
+
 from __future__ import annotations
 
 import html
@@ -10,16 +15,19 @@ from pathlib import Path
 from typing import Any
 
 from E2E.common.io_utils import write_text
+from E2E.config import RISK_ORDER
 from E2E.phase6_reporter.vulnerability_reference import VULNERABILITY_REFERENCE
 
 
 DEFAULT_RECOMMENDATIONS = [
     "Apply and manually review every accepted patch before deployment.",
     "Pin a supported Solidity compiler version and run compilation in CI.",
-    "Run the security tool matrix and project tests after every security-sensitive change.",
+    "Run Slither and the project tests after every security-sensitive change.",
     "Use checks-effects-interactions and established OpenZeppelin guards for external calls.",
     "Repeat the audit after dependency, privilege, or business-logic changes.",
 ]
+
+
 # Định dạng lại mã Solidity thành các dòng ổn định (mỗi câu lệnh một dòng, thụt lề theo { }, giữ nguyên chuỗi/comment)
 # để bảng so sánh "mã gốc | mã đã vá" dễ đọc, không bị lệch do khác định dạng.
 def format_solidity_for_comparison(code: str) -> list[str]:
@@ -264,50 +272,25 @@ def _match(items: list[dict[str, Any]], finding: dict[str, Any]) -> dict[str, An
     return {}
 
 
-# Chuẩn hoá danh sách khuyến nghị (chuỗi hoặc dict) thành list chuỗi; rỗng thì dùng DEFAULT_RECOMMENDATIONS.
-def normalize_recommendations(value: Any) -> list[str]:
-    if not isinstance(value, list):
-        return list(DEFAULT_RECOMMENDATIONS)
-    recommendations = []
-    for item in value:
-        if isinstance(item, str) and item.strip():
-            recommendations.append(item.strip())
-            continue
-        if not isinstance(item, dict):
-            continue
-        title = str(item.get("title") or "").strip()
-        description = str(
-            item.get("description")
-            or item.get("recommendation")
-            or item.get("summary")
-            or ""
-        ).strip()
-        if title and description:
-            recommendations.append(f"{title}: {description}")
-        elif title or description:
-            recommendations.append(title or description)
-    return recommendations or list(DEFAULT_RECOMMENDATIONS)
+CHANNEL_LABELS = {
+    "slither": "Slither",
+    "compile": "Compile",
+    "static": "Static Analysis",
+    "rag": "RAG",
+    "llm": "Neural Detector",
+}
 
 
-# Dựng các dòng bảng "Verification Results" (mục 5.5): mỗi kênh (slither, mythril, smartcheck, compile, static,
-# RAG, LLM) -> PASS/FAIL/ERROR/SKIPPED + chi tiết.
+# Dựng các dòng bảng "Verification Results" (mục 5.5): mỗi kênh (slither, compile, static, RAG, detector)
+# -> PASS/FAIL/ERROR/SKIPPED + chi tiết.
 def verification_channel_rows(data: dict[str, Any]) -> list[dict[str, str]]:
     rows = []
     channels = data.get("verification_channels", {})
-    legacy_keys = {"static", "rag", "llm"}
-    if channels and set(channels).issubset(legacy_keys):
-        items = (("static", "Static Analysis"), ("rag", "RAG"), ("llm", "LLM"))
-    else:
-        preferred_order = (
-            "slither",
-            "mythril",
-            "smartcheck",
-        )
-        ordered_keys = [key for key in preferred_order if key in channels]
-        ordered_keys.extend(key for key in channels if key not in ordered_keys)
-        items = tuple((key, key.replace("_", " ").title()) for key in ordered_keys)
-    for key, label in items:
-        component = channels.get(key, {})
+    ordered_keys = [key for key in CHANNEL_LABELS if key in channels]
+    ordered_keys.extend(key for key in channels if key not in ordered_keys)
+    for key in ordered_keys:
+        label = CHANNEL_LABELS.get(key, key.replace("_", " ").title())
+        component = channels[key]
         findings = component.get("findings", [])
         detail = str(component.get("reason") or component.get("error") or "").strip()
         if not detail and findings:
@@ -337,33 +320,80 @@ def verification_channel_rows(data: dict[str, Any]) -> list[dict[str, str]]:
     return rows
 
 
-# Đưa kết quả Phase 5 vào dữ liệu báo cáo: verdict bản vá, risk_delta, phiên bản solc, các kênh kiểm chứng.
-# Nếu bản vá bị từ chối/không kết luận được -> viết lại executive summary (KHÔNG được deploy bản vá, lỗi vẫn mở),
-# đánh dấu từng finding và thêm khuyến nghị "Do not deploy the generated patch" lên đầu.
-# Mục đích: báo cáo không bao giờ trình bày bản vá thất bại như đã sửa xong.
+# Khi bản vá được chấp nhận: cập nhật trạng thái từng finding theo kết luận cuối của Phase 5.
+#   - Hàm đã vá (tự kiểm PASS hoặc FLAGGED) -> "Fixed: patch accepted ...". Nếu detector vẫn báo (FLAGGED) thì
+#     ghi rõ xác suất so với ngưỡng và gọi đó là detector disagreement (detector hay báo nhầm hàm an toàn).
+#   - Hàm không vá -> giữ nguyên "Not patched" (lỗi vẫn mở).
+# Thêm một câu kết luận cuối vào executive summary để tóm tắt không mâu thuẫn với từng finding.
+def _apply_accepted_verdict(report_data: dict[str, Any], verification: dict[str, Any], verdict: str) -> None:
+    probabilities = {
+        item.get("unit_id"): item.get("vulnerability_probability")
+        for item in verification.get("fixed_unit_results", [])
+    }
+    threshold = (verification.get("fixed_detection") or {}).get("threshold")
+    disagreeing_units = []
+    for finding in report_data.get("findings", []):
+        self_check = finding.get("self_check_status")
+        if self_check not in {"PASS", "FLAGGED"}:
+            continue
+        finding["verification_status"] = f"Fixed: {verdict}"
+        finding["residual_risk"] = "None"
+        if self_check == "FLAGGED":
+            unit_id = finding.get("unit_id")
+            probability = probabilities.get(unit_id)
+            detail = (
+                f"p={float(probability):.4f} >= threshold {float(threshold):.2f}"
+                if probability is not None and threshold is not None
+                else "above threshold"
+            )
+            finding["verification_status"] += (
+                f"; the neural detector still flags the patched unit ({detail}) - detector disagreement"
+            )
+            finding["residual_risk"] = (
+                "Low: compiler, behavior checks and Slither passed, but the neural "
+                "detector disagrees; manual review is recommended"
+            )
+            if unit_id not in disagreeing_units:
+                disagreeing_units.append(unit_id)
+    summary = str(report_data.get("executive_summary") or "").rstrip()
+    final_sentence = f" Final verification: {verdict}."
+    if disagreeing_units:
+        final_sentence += (
+            " The neural detector still flags "
+            + ", ".join(str(unit) for unit in disagreeing_units)
+            + " after the patch (detector disagreement); the deterministic checks decide acceptance."
+        )
+    if final_sentence.strip() not in summary:
+        report_data["executive_summary"] = summary + final_sentence
+
+
+# Đưa kết quả Phase 5 vào dữ liệu báo cáo: verdict bản vá, các kênh kiểm chứng, số lần sửa, detector_disagreement.
+#   - Bản vá được chấp nhận -> _apply_accepted_verdict (trạng thái finding khớp kết luận cuối).
+#   - Bản vá bị từ chối/không kết luận được -> viết lại executive summary (KHÔNG được deploy bản vá, lỗi vẫn
+#     mở), đánh dấu từng finding và thêm khuyến nghị "Do not deploy the generated patch" lên đầu.
+# Mục đích: báo cáo không bao giờ trình bày bản vá thất bại như đã sửa xong, và không ghi một finding là
+# FLAGGED khi kết luận cuối là "accepted".
 def apply_verification_to_report(
     report_data: dict[str, Any],
     verification: dict[str, Any],
 ) -> None:
     verdict = str(verification.get("overall_verdict") or "Not complete")
     report_data["patch_verdict"] = verdict
-    report_data["verification_verdict"] = verdict
-    report_data["risk_delta"] = verification.get("risk_delta")
-    report_data["solc_version"] = (
-        verification.get("tool_verification", {}).get("compile", {}).get("compiler_version")
-        or verification.get("tool_verification", {}).get("solc_version")
-        or "solc-native"
-    )
+    report_data["detector_disagreement"] = bool(verification.get("detector_disagreement"))
     report_data["verification_channels"] = verification.get("verification_channels", {})
-    report_data["repair_attempts"] = verification.get("repair_attempts", [])
+    if verification.get("attempts_count") is not None:
+        report_data["attempts_count"] = verification.get("attempts_count")
+        report_data["max_attempts"] = verification.get("max_attempts")
     for row in report_data.get("phase_rows", []):
         if row.get("phase") == "5 Verifier":
             row["status"] = verification.get("status", "partial")
 
+    if verdict.startswith("Patch accepted"):
+        _apply_accepted_verdict(report_data, verification, verdict)
+        return
     if not verdict.startswith(("Patch rejected", "Patch inconclusive", "Inconclusive")):
         return
 
-    report_data["model_executive_summary"] = report_data.get("executive_summary", "")
     finding_count = len(report_data.get("findings", []))
     behavioral = verification.get("behavioral_verification", {})
     regression_count = len(behavioral.get("findings", []))
@@ -375,11 +405,14 @@ def apply_verification_to_report(
     outcome = "rejected" if verdict.startswith("Patch rejected") else "not accepted"
     no_patch = any(
         marker in verdict
-        for marker in ("no patch was generated", "patch execution incomplete")
+        for marker in (
+            "no patch was generated", "patch execution incomplete",
+            "no function-level repair target", "no effective patch",
+        )
     )
     if no_patch:
         report_data["executive_summary"] = (
-            f"The audit identified {finding_count} finding(s). Verification is inconclusive: "
+            f"The audit identified {finding_count} finding(s). No patch was verified: "
             f"{verdict}. The findings remain open and require manual review."
         )
     else:
@@ -387,15 +420,21 @@ def apply_verification_to_report(
             f"The audit identified {finding_count} finding(s). A patch was generated but {outcome} "
             f"by deterministic verification: {verdict}.{detail} The patch must not be deployed; "
             "the original finding remains open until a behavior-preserving patch passes compilation, "
-            "the security tool matrix, and project tests."
+            "Slither, and project tests."
         )
     for finding in report_data.get("findings", []):
+        # A finding that was never patched keeps its own status ("Not patched"):
+        # the rejected patch did not touch it.
+        if finding.get("self_check_status") == "NOT_PATCHED":
+            continue
         finding["verification_status"] = (
             "Rejected by deterministic verifier"
             if verdict.startswith("Patch rejected")
             else verdict
         )
         finding["residual_risk"] = verdict
+    if no_patch:
+        return
     rejection_recommendation = (
         "Do not deploy the generated patch; preserve the contract's intended transfers and behavior "
         "while addressing the root cause."
@@ -405,10 +444,67 @@ def apply_verification_to_report(
         report_data["recommendations"] = [rejection_recommendation, *recommendations]
 
 
+# Dòng CVSS của một finding (giống nhau ở MD/HTML/PDF): điểm, mức, nguồn điểm, mức lúc phát hiện (nếu khác),
+# thứ tự ưu tiên sửa. Rỗng nếu chưa có.
+def _cvss_text(finding: dict[str, Any]) -> str:
+    if finding.get("cvss_score") is None:
+        return ""
+    source = {"llm": "LLM-selected metrics", "swc_default": "SWC default vector"}.get(finding.get("cvss_source") or "")
+    details = [str(finding.get("severity") or "")]
+    if source:
+        details.append(source)
+    detected = finding.get("detected_severity")
+    if detected and detected != finding.get("severity"):
+        details.append(f"detected as {detected}")
+    text = f"{finding['cvss_score']} ({', '.join(item for item in details if item)})"
+    if finding.get("repair_priority"):
+        text += f"; repair priority #{finding['repair_priority']}"
+    return text
+
+
+# Dòng kết quả kiểm chứng của một finding (giống nhau ở MD/HTML/PDF): trạng thái + rủi ro còn lại.
+def _verification_text(finding: dict[str, Any]) -> str:
+    text = str(finding.get("verification_status") or "Not verified")
+    if finding.get("residual_risk"):
+        text += f"; residual risk: {finding['residual_risk']}"
+    return text
+
+
+# Tên hiển thị của finding: SWC-103 (pragma không cố định) luôn ghi "Floating Pragma".
+def _display_title(finding: dict[str, Any]) -> str:
+    return "Floating Pragma" if finding.get("swc") == "SWC-103" else str(finding.get("title") or "")
+
+
+# Trạng thái tự kiểm của vòng sửa phía GPU (gpu_pipeline) -> câu mô tả cho báo cáo.
+# Đây CHƯA phải kết luận cuối: apply_verification_to_report ghi đè theo kết luận Phase 5 (overall_verdict).
+SELF_CHECK_TEXT = {
+    "PASS": "Repair-loop self-check passed (compiler, neural detector, static/RAG re-run)",
+    "FLAGGED": "Repair-loop self-check: the neural detector still flags the patched unit",
+    "NOT_PATCHED": "Not patched",
+}
+
+
+# Chọn danh sách finding cho báo cáo, trả (findings, dismissed).
+#   - Có kết quả GPU (lượt 2): lấy phases.detector.confirmed_findings = finding còn lại SAU KHI Advisor loại
+#     báo nhầm.
+#     Finding Advisor loại (dismissed_findings) KHÔNG tính là lỗi, chỉ liệt kê ở mục riêng để minh bạch.
+#   - Chưa có kết quả GPU (lượt 1 / bản xem trước): dùng finding của fuse_detection (static + RAG).
+# Mục đích: số lỗi trong báo cáo, manifest và web app khớp với những gì Advisor xác nhận và Fixer xử lý.
+def select_report_findings(
+    fused: dict[str, Any],
+    remote: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    detector = _phase(remote or {}, "detector")
+    if "confirmed_findings" not in detector:
+        return list(fused.get("findings", [])), []
+    return list(detector.get("confirmed_findings", [])), list(detector.get("dismissed_findings", []))
+
+
 # [HÀM CHÍNH PHASE 6 - dữ liệu] Gom mọi thứ thành một dict báo cáo: thông tin contract, kết luận fusion,
-# từng finding ghép với gợi ý Advisor + CVSS Assessor + kết quả Verifier, finding ứng viên, phân bố mức độ,
-# bảng trạng thái các phase (phase_rows), mã gốc/mã vá, bảng tham chiếu lỗ hổng (VULNERABILITY_REFERENCE),
-# khuyến nghị, hạn chế, tuyên bố miễn trừ. Lượt 1 (remote=None) dùng để xuất bản xem trước.
+# từng finding (chọn bởi select_report_findings) ghép với gợi ý Advisor + CVSS Assessor + trạng thái tự kiểm
+# của vòng sửa, finding bị Advisor loại, finding ứng viên, phân bố mức độ, bảng trạng thái các phase
+# (phase_rows), mã gốc/mã vá, bảng tham chiếu lỗ hổng (VULNERABILITY_REFERENCE), khuyến nghị, hạn chế,
+# tuyên bố miễn trừ. Lượt 1 (remote=None) dùng để xuất bản xem trước.
 def build_report_data(
     request: dict[str, Any],
     fused: dict[str, Any],
@@ -416,86 +512,86 @@ def build_report_data(
     tool_verification: dict[str, Any],
 ) -> dict[str, Any]:
     remote = remote or {}
-    phases = remote.get("phases", {})
     advisor_items = _phase(remote, "advisor").get("suggestions", [])
     assessor_items = _phase(remote, "assessor").get("assessments", [])
     verifier_items = _phase(remote, "verifier").get("verifications", [])
     fixer = _phase(remote, "fixer")
-    reporter = _phase(remote, "reporter")
+    selected_findings, dismissed = select_report_findings(fused, remote)
     findings = []
 
-    for finding in fused.get("findings", []):
+    for finding in selected_findings:
         advice = _match(advisor_items, finding)
         assessment = _match(assessor_items, finding)
         verification = _match(verifier_items, finding)
+        self_check = verification.get("status") or ("NOT_PATCHED" if remote else "")
+        if self_check:
+            status_text = SELF_CHECK_TEXT.get(self_check, self_check)
+        else:
+            status_text = "Not verified (preview before the GPU phases)"
         findings.append(
             {
                 **finding,
+                # One severity per finding: the Phase 3 CVSS level when assessed, else the detection
+                # severity (preview before the GPU phases). The detection severity is kept alongside.
+                "severity": assessment.get("severity") or finding.get("severity", "Unknown"),
+                "detected_severity": finding.get("severity", "Unknown"),
                 "root_cause": advice.get("root_cause") or finding.get("description") or "",
-                "impact": assessment.get("impact") or advice.get("impact") or "",
+                # Impact: Advisor's attack scenario > knowledge-base impact of the finding > Assessor's CVSS rationale.
+                "impact": advice.get("impact") or finding.get("impact") or assessment.get("justification") or "",
                 "cvss_score": assessment.get("cvss_score"),
+                "cvss_source": assessment.get("cvss_source"),
                 "repair_priority": assessment.get("repair_priority"),
                 "repair_steps": advice.get("repair_steps")
                 or ([finding["remediation"]] if finding.get("remediation") else []),
-                "verification_status": verification.get("status") or "Not verified by generative model",
+                "self_check_status": self_check or None,
+                "verification_status": status_text,
                 "residual_risk": verification.get("residual_risk") or "",
             }
         )
+    dismissed_findings = [
+        {
+            "finding_id": item.get("finding_id"),
+            "swc": item.get("swc"),
+            "title": item.get("title"),
+            "unit_id": item.get("unit_id"),
+            "line": item.get("line"),
+            "severity": item.get("severity", "Unknown"),
+            "confidence": item.get("confidence"),
+            "sources": item.get("sources", []),
+            # The Advisor's own explanation (root cause it gave for the false-positive verdict).
+            "reason": item.get("dismissal_reason") or "Dismissed by the Advisor as a false positive.",
+        }
+        for item in dismissed
+    ]
 
     distribution = Counter(item.get("severity", "Unknown") for item in findings)
     original_code = request["source"]["code"]
     fixed_code = fixer.get("fixed_code") or original_code
     compile_status = tool_verification.get("compile", {}).get("status", "not run")
-    slither = tool_verification.get("slither", {})
-    if not slither and "tools" in tool_verification:
-        slither = tool_verification["tools"].get("slither", {})
-    slither_verdict = str(
-        slither.get("verdict")
-        or tool_verification.get("tools", {}).get("slither", {}).get("verdict")
-        or ""
-    ).upper()
-    if slither_verdict == "FAIL" and slither.get("status") in {"passed", "ok"}:
-        slither["status"] = "failed"
-    slither_count = len(slither.get("findings", []))
-    tool_summary = tool_verification.get("summary", {})
-    tool_matrix_status = (
-        f"security tool matrix pass/fail/warn/error: "
-        f"{tool_summary.get('pass', 0)}/{tool_summary.get('fail', 0)}/"
-        f"{tool_summary.get('warn', 0)}/{tool_summary.get('error', 0)}"
-        if tool_summary
-        else "security tool matrix not run"
-    )
+    slither_count = len(tool_verification.get("slither", {}).get("findings", []))
     function_names = ", ".join(unit["unit_id"] for unit in request.get("code_units", [])[:8])
     if len(request.get("code_units", [])) > 8:
         function_names += ", ..."
-    executive_summary = reporter.get("executive_summary")
-    if not executive_summary:
+    if remote:
+        applied_count = sum(1 for item in fixer.get("patch_outcomes", []) if item.get("status") == "applied")
+        executive_summary = (
+            f"Audit completed using the GPU server (Qwen2.5-Coder-14B v13) for run {request['run_id']}. "
+            f"{len(findings)} confirmed finding(s), {len(dismissed)} dismissed by the Advisor, "
+            f"{applied_count} patch(es) applied."
+        )
+    else:
         executive_summary = (
             f"The audit result is {fused.get('verdict', 'Inconclusive')} with a fused confidence "
             f"score of {float(fused.get('score') or 0.0):.3f}. The pipeline identified "
             f"{len(findings)} confirmed finding(s). Compilation status: {compile_status}; "
-            f"Slither reported {slither_count} detector finding(s); {tool_matrix_status}."
+            f"Slither reported {slither_count} detector finding(s) "
+            f"(verdict: {tool_verification.get('policy_verdict', 'not run')})."
         )
-    recommendations = normalize_recommendations(reporter.get("recommendations"))
-    backend_key = str(
-        remote.get("backend")
-        or request.get("execution", {}).get("backend")
-        or request.get("backend")
-        or ""
-    ).lower()
-
-    if "server_gpu" in backend_key or "rtx" in backend_key:
-        p1c_title = "1C Qwen2.5-Coder-14B detector (v13)"
-        detector_location = "GPU Server (RTX 4070 Ti SUPER)"
-        detector_engine = "Qwen2.5-Coder-14B-Instruct v13 Quality-First (LoRA r=64, alpha=128)"
-        agent_location = "GPU Server (RTX 4070 Ti SUPER)"
-        agent_engine = "Qwen2.5-Coder-14B-Instruct v13"
-    else:
-        p1c_title = "1C Neural detector"
-        detector_location = "GPU Server / Cloud"
-        detector_engine = remote.get("models", {}).get("detector", "Qwen2.5-Coder-14B v13")
-        agent_location = "GPU Server / Cloud"
-        agent_engine = "Qwen2.5-Coder-14B Instruct v13"
+    # The only backend: model calls go to the GPU server (detector = LoRA v13, agents = base instruct model).
+    p1c_title = "1C Qwen2.5-Coder-14B detector (v13)"
+    detector_location = agent_location = "GPU Server (RTX 4070 Ti SUPER)"
+    detector_engine = "Qwen2.5-Coder-14B-Instruct v13 Quality-First (LoRA r=64, alpha=128)"
+    agent_engine = "Qwen2.5-Coder-14B-Instruct v13"
 
     phase_rows = [
         {
@@ -538,34 +634,33 @@ def build_report_data(
             "phase": "5 Verifier",
             "location": "Local",
             "status": tool_verification.get("status", "pending"),
-            "engine": (
-                "solc compiler, AST behavioral invariants"
-                + (", Slither security matrix" if tool_verification.get("slither") else "")
-            ),
+            "engine": "solc compiler, Slither, AST behavioral invariants",
         },
         {
             "phase": "6 Reporter",
             "location": "Local",
-            "status": reporter.get("status", "ok"),
+            "status": "ok",
             "engine": "deterministic audit report renderer",
         },
     ]
-
-    for f in findings:
-        if f.get("swc") == "SWC-103":
-            f["title"] = "Floating Pragma"
 
     raw_candidates = (
         fused.get("candidate_findings", [])
         or _phase(remote, "detector").get("candidate_findings", [])
         or []
     )
-    candidate_findings = []
-    for cand in raw_candidates:
-        cand_dict = dict(cand)
-        if cand_dict.get("swc") == "SWC-103":
-            cand_dict["title"] = "Floating Pragma"
-        candidate_findings.append(cand_dict)
+    for f in findings:
+        f["title"] = _display_title(f)
+    candidate_findings = [{**cand, "title": _display_title(cand)} for cand in raw_candidates]
+
+    # Highest risk of the findings this report actually lists (not of the findings the Advisor dismissed).
+    if findings:
+        risk_level = max((f.get("severity", "Unknown") for f in findings), key=lambda sev: RISK_ORDER.get(sev, 0))
+    else:
+        risk_level = "Unknown" if fused.get("risk_level") == "Unknown" else "None"
+    contract_names = sorted({
+        unit.get("contract_name") for unit in request.get("code_units", []) if unit.get("contract_name")
+    })
 
     return {
         "title": "Smart Contract Audit Report",
@@ -574,18 +669,19 @@ def build_report_data(
         "file_name": request["source"]["file_name"],
         "source_sha256": request["source"]["sha256"],
         "analyzed_object": function_names or request["source"]["file_name"],
+        "contract_name": ", ".join(contract_names) or Path(request["source"]["file_name"]).stem,
         "detection_result": fused.get("verdict", "Inconclusive"),
         "analysis_status": fused.get("status", "inconclusive"),
         "score": float(fused.get("score") or 0.0),
-        "risk_level": fused.get("risk_level", "None"),
+        "risk_level": risk_level,
         "executive_summary": executive_summary,
         "findings": findings,
         "candidate_findings": candidate_findings,
+        "dismissed_findings": dismissed_findings,
         "distribution": distribution,
         "phase_rows": phase_rows,
         "original_code": original_code,
         "fixed_code": fixed_code,
-        "patch_outcomes": fixer.get("patch_outcomes", []),
         "patch_verdict": _phase(remote, "verifier").get("overall_verdict", "Not complete"),
         "reference_table": [
             {
@@ -607,8 +703,9 @@ def build_report_data(
         ],
         "tool_verification": tool_verification,
         "verification_channels": {},
-        "repair_attempts": remote.get("repair_attempts", []),
-        "recommendations": recommendations,
+        "attempts_count": _phase(remote, "verifier").get("attempts_count"),
+        "max_attempts": _phase(remote, "verifier").get("max_attempts"),
+        "recommendations": list(DEFAULT_RECOMMENDATIONS),
         "limitations": [
             "SWC Registry source material is no longer actively maintained and is not exhaustive.",
             "The fine-tuned classifier is a binary detector; SWC attribution comes from local static/RAG evidence.",
@@ -621,9 +718,24 @@ def build_report_data(
     }
 
 
+# Chuỗi "số lần sửa đã chạy / tối đa" cho mục 5.5 (ví dụ "3/3 attempt(s)").
+def _attempt_text(data: dict[str, Any]) -> str:
+    count = data.get("attempts_count")
+    maximum = data.get("max_attempts")
+    if not count:
+        return "not run"
+    return f"{count}/{maximum} attempt(s)" if maximum else f"{count} attempt(s)"
+
+
+# Cột của bảng phân bố mức độ (mục 4.2): Critical / High / Medium / Low, thêm các mức khác nếu có finding.
+def _severity_columns(distribution: Counter) -> list[str]:
+    standard = ["Critical", "High", "Medium", "Low"]
+    return standard + [level for level in distribution if level not in standard and distribution[level] > 0]
+
+
 # Xuất báo cáo Markdown theo cấu trúc: 1. Thông tin contract, 2. Tóm tắt, 3. Phương pháp (bảng phase),
-# 4. Findings (thống kê, phân bố, finding xác nhận, ứng viên), 5. Phân tích chi tiết (mã gốc, gợi ý sửa,
-# mã đã vá, kết quả kiểm chứng), 6. Kết luận & khuyến nghị, 7. Miễn trừ, 8. Phụ lục tham chiếu lỗ hổng.
+# 4. Findings (thống kê, phân bố, finding xác nhận, ứng viên, bị Advisor loại), 5. Phân tích chi tiết (mã gốc,
+# gợi ý sửa, mã đã vá, kết quả kiểm chứng), 6. Kết luận & khuyến nghị, 7. Miễn trừ, 8. Phụ lục tham chiếu lỗ hổng.
 def render_markdown(data: dict[str, Any]) -> str:
     findings = data["findings"]
     dist = data["distribution"]
@@ -662,9 +774,7 @@ def render_markdown(data: dict[str, Any]) -> str:
         f"| {row['phase']} | {row['location']} | {row['status']} | {row['engine']} |"
         for row in data["phase_rows"]
     )
-    std_sevs = ["Critical", "High", "Medium", "Low"]
-    extra_sevs = [s for s in dist.keys() if s not in std_sevs and dist[s] > 0]
-    sev_cols = std_sevs + extra_sevs
+    sev_cols = _severity_columns(dist)
 
     lines.extend(
         [
@@ -723,6 +833,28 @@ def render_markdown(data: dict[str, Any]) -> str:
     else:
         lines.append("_No unconfirmed candidate findings below threshold._")
 
+    lines.extend(["", "### 4.5 Findings Dismissed by the Advisor", ""])
+    dismissed_findings = data.get("dismissed_findings", [])
+    if dismissed_findings:
+        lines.extend(
+            [
+                "_Raised by a detection channel, then judged a false positive by the Advisor (Phase 2). "
+                "Not counted as vulnerabilities and not repaired._",
+                "",
+                "| ID | Vulnerability | Unit | Line | Severity | Confidence | Sources | Advisor reason |",
+                "| :-- | :------------ | :--- | :--: | :------- | :--------: | :------ | :------------- |",
+            ]
+        )
+        for item in dismissed_findings:
+            reason = str(item.get("reason") or "").replace("|", "&#124;").replace("\n", " ")
+            lines.append(
+                f"| {item.get('swc', '-')} | {item.get('title', '-')} | {item.get('unit_id') or 'contract'} | "
+                f"{item.get('line') or '-'} | {item.get('severity', 'Unknown')} | "
+                f"{float(item.get('confidence') or 0):.3f} | {', '.join(item.get('sources', []))} | {reason} |"
+            )
+    else:
+        lines.append("_No finding was dismissed by the Advisor._")
+
     lines.extend(
         [
             "",
@@ -730,7 +862,7 @@ def render_markdown(data: dict[str, Any]) -> str:
             "",
             "### 5.1 Contract Name",
             "",
-            data["analyzed_object"],
+            data["contract_name"],
             "",
             "### 5.2 Source Code",
             "",
@@ -754,15 +886,12 @@ def render_markdown(data: dict[str, Any]) -> str:
                 f"- **Impact:** {finding.get('impact') or 'Requires manual impact analysis'}",
             ]
         )
-        if finding.get("cvss_score") is not None:
-            lines.append(f"- **CVSS:** {finding['cvss_score']}")
+        if _cvss_text(finding):
+            lines.append(f"- **CVSS:** {_cvss_text(finding)}")
         lines.append("- **Repair steps:**")
         steps = finding.get("repair_steps") or ["Perform manual review and implement the cited remediation."]
         lines.extend(f"  {number}. {step}" for number, step in enumerate(steps, 1))
-        lines.append(
-            f"- **Patch verification:** {finding.get('verification_status')}"
-            + (f"; residual risk: {finding['residual_risk']}" if finding.get("residual_risk") else "")
-        )
+        lines.append(f"- **Patch verification:** {_verification_text(finding)}")
         lines.append("")
     lines.extend(
         [
@@ -774,7 +903,7 @@ def render_markdown(data: dict[str, Any]) -> str:
             "",
             "### 5.5 Verification Results",
             "",
-            "- **Fix attempt:** Single attempt",
+            f"- **Fix attempts:** {_attempt_text(data)}",
             "",
             "| Verification channel | Result | Verdict | Details |",
             "| :------------------- | :----: | :------ | :------ |",
@@ -785,8 +914,8 @@ def render_markdown(data: dict[str, Any]) -> str:
             ],
             "",
             f"- **Compilation:** {data['tool_verification'].get('compile', {}).get('status', 'not run')}",
-            f"- **Security tool matrix:** {data['tool_verification'].get('policy_verdict', 'not run')}",
-            f"- **Matrix reason:** {data['tool_verification'].get('policy_reason', 'not run')}",
+            f"- **Slither verdict:** {data['tool_verification'].get('policy_verdict', 'not run')}",
+            f"- **Slither verdict reason:** {data['tool_verification'].get('policy_reason', 'not run')}",
             f"- **Slither:** {data['tool_verification'].get('slither', {}).get('status', 'not run')}",
             f"- **Slither findings:** {len(data['tool_verification'].get('slither', {}).get('findings', []))}",
             f"- **Behavior preservation:** {data['tool_verification'].get('behavioral', {}).get('status', 'not run')}",
@@ -822,7 +951,7 @@ def render_markdown(data: dict[str, Any]) -> str:
 
 
 # Xuất báo cáo HTML (cùng nội dung với Markdown, có CSS, bảng so sánh mã tô màu dòng thay đổi).
-def render_html(data: dict[str, Any], markdown_text: str) -> str:
+def render_html(data: dict[str, Any]) -> str:
     code_comparison = build_code_comparison_rows(data["original_code"], data["fixed_code"])
     source_code_lines = _html_code_lines(code_comparison, "source")
     fixed_code_lines = _html_code_lines(code_comparison, "fixed", "fixed_changed")
@@ -865,10 +994,22 @@ def render_html(data: dict[str, Any], markdown_text: str) -> str:
         for item in data.get("candidate_findings", [])
     ) or "<tr><td colspan='7'>No unconfirmed candidate findings below threshold</td></tr>"
 
+    dismissed_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(str(item.get('swc', '-')))}</td>"
+        f"<td>{html.escape(str(item.get('title', '-')))}</td>"
+        f"<td>{html.escape(str(item.get('unit_id') or 'contract'))}</td>"
+        f"<td style='text-align:center;'>{html.escape(str(item.get('line') or '-'))}</td>"
+        f"<td>{html.escape(str(item.get('severity', 'Unknown')))}</td>"
+        f"<td>{float(item.get('confidence') or 0):.3f}</td>"
+        f"<td>{html.escape(', '.join(item.get('sources', [])))}</td>"
+        f"<td>{html.escape(str(item.get('reason') or ''))}</td>"
+        "</tr>"
+        for item in data.get("dismissed_findings", [])
+    ) or "<tr><td colspan='8'>No finding was dismissed by the Advisor</td></tr>"
+
     dist = data["distribution"]
-    std_sevs = ["Critical", "High", "Medium", "Low"]
-    extra_sevs = [s for s in dist.keys() if s not in std_sevs and dist[s] > 0]
-    sev_cols = std_sevs + extra_sevs
+    sev_cols = _severity_columns(dist)
     dist_th = "".join(f"<th>{s}</th>" for s in sev_cols)
     dist_td = "".join(f"<td>{dist.get(s, 0)}</td>" for s in sev_cols)
     distribution_html = f"<table><tr>{dist_th}</tr><tr>{dist_td}</tr></table>"
@@ -892,7 +1033,7 @@ def render_html(data: dict[str, Any], markdown_text: str) -> str:
     details = ""
     for index, item in enumerate(data["findings"], 1):
         steps = "".join(f"<li>{html.escape(str(step))}</li>" for step in item.get("repair_steps", []))
-        cvss_line = f"<p><b>CVSS:</b> {item['cvss_score']}</p>" if item.get("cvss_score") is not None else ""
+        cvss_line = f"<p><b>CVSS:</b> {html.escape(_cvss_text(item))}</p>" if _cvss_text(item) else ""
         details += (
             f"<section><h4>{index}. {html.escape(item['title'])} ({item['swc']})</h4>"
             f"<p><b>Severity:</b> {item['severity']} &nbsp; <b>Unit:</b> "
@@ -901,7 +1042,7 @@ def render_html(data: dict[str, Any], markdown_text: str) -> str:
             f"<p><b>Impact:</b> {html.escape(str(item.get('impact') or 'Requires manual analysis'))}</p>"
             f"{cvss_line}"
             f"<ol>{steps}</ol><p><b>Verification:</b> "
-            f"{html.escape(str(item.get('verification_status') or 'Not verified'))}</p></section>"
+            f"{html.escape(_verification_text(item))}</p></section>"
         )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>{data['title']}</title>
@@ -952,7 +1093,11 @@ generative repair agents, compilation, AST behavior-preservation checks, and det
 <h3>4.4 Candidate Findings</h3>
 <table><thead><tr><th>ID</th><th>Vulnerability</th><th>Unit</th><th>Line</th><th>Severity</th><th>Confidence</th><th>Sources</th></tr></thead>
 <tbody>{candidates_rows}</tbody></table>
-<h2>5. Detailed Analysis</h2><h3>5.1 Contract Name</h3><p>{html.escape(data['analyzed_object'])}</p>
+<h3>4.5 Findings Dismissed by the Advisor</h3>
+<p>Raised by a detection channel, then judged a false positive by the Advisor (Phase 2). Not counted as vulnerabilities and not repaired.</p>
+<table><thead><tr><th>ID</th><th>Vulnerability</th><th>Unit</th><th>Line</th><th>Severity</th><th>Confidence</th><th>Sources</th><th>Advisor reason</th></tr></thead>
+<tbody>{dismissed_rows}</tbody></table>
+<h2>5. Detailed Analysis</h2><h3>5.1 Contract Name</h3><p>{html.escape(data['contract_name'])}</p>
 <h3>5.2 Source Code</h3><pre>{html.escape(data['original_code'])}</pre>
 <h3>5.3 Repair Suggestion</h3>{details or '<p>No confirmed vulnerability was available for remediation.</p>'}
 <h3>5.4 Fixed Code</h3><p>Patch verification: <b>{html.escape(data['patch_verdict'])}</b></p>
@@ -960,15 +1105,15 @@ generative repair agents, compilation, AST behavior-preservation checks, and det
 <section class="code-panel"><h4>Source Code (Sample)</h4><pre>{source_code_lines}</pre></section>
 <section class="code-panel"><h4>Fixed Source Code</h4><pre>{fixed_code_lines}</pre></section>
 </div>
-	<h3>5.5 Verification Results</h3>
-	<p>Fix attempt: <b>Single attempt</b></p>
-	<table><thead><tr><th>Channel</th><th>Result</th><th>Verdict</th><th>Details</th></tr></thead>
-	<tbody>{verification_rows}</tbody></table>
-	<p>Compilation: <b>{data['tool_verification'].get('compile', {}).get('status', 'not run')}</b>;
-	Security tool matrix: <b>{data['tool_verification'].get('policy_verdict', 'not run')}</b>;
-	Slither: <b>{data['tool_verification'].get('slither', {}).get('status', 'not run')}</b>;
-	Behavior preservation: <b>{behavioral.get('status', 'not run')}</b>.</p>
-	{f'<ul>{behavioral_evidence}</ul>' if behavioral_evidence else ''}
+<h3>5.5 Verification Results</h3>
+<p>Fix attempts: <b>{html.escape(_attempt_text(data))}</b></p>
+<table><thead><tr><th>Channel</th><th>Result</th><th>Verdict</th><th>Details</th></tr></thead>
+<tbody>{verification_rows}</tbody></table>
+<p>Compilation: <b>{data['tool_verification'].get('compile', {}).get('status', 'not run')}</b>;
+Slither verdict: <b>{data['tool_verification'].get('policy_verdict', 'not run')}</b>;
+Slither: <b>{data['tool_verification'].get('slither', {}).get('status', 'not run')}</b>;
+Behavior preservation: <b>{behavioral.get('status', 'not run')}</b>.</p>
+{f'<ul>{behavioral_evidence}</ul>' if behavioral_evidence else ''}
 <h2>6. Summary and Recommendations</h2><ul>{''.join(f'<li>{html.escape(str(item))}</li>' for item in data['recommendations'])}</ul>
 <div class="notice"><b>Limitations</b><ul>{''.join(f'<li>{html.escape(str(item))}</li>' for item in data['limitations'])}</ul></div>
 <h2>7. Disclaimer</h2><p>{html.escape(data['disclaimer'])}</p>
@@ -1025,6 +1170,37 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
         )
     )
     story: list[Any] = [Paragraph(data["title"], styles["ReportTitle"]), Spacer(1, 6 * mm)]
+
+    # Kiểu bảng chung của PDF: dòng tiêu đề nền xanh chữ trắng, lưới xám, cỡ chữ font_size.
+    def header_table_style(font_size: float, *, valign_top: bool = True) -> list[tuple]:
+        style = [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#26394d")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+            ("FONTSIZE", (0, 0), (-1, -1), font_size),
+        ]
+        if valign_top:
+            style.append(("VALIGN", (0, 0), (-1, -1), "TOP"))
+        return style
+
+    # Bảng finding (mục 4.3 / 4.4 / 4.5): ID, tên lỗ hổng, unit, dòng, mức độ; rỗng thì một dòng empty_label.
+    def findings_table(items: list[dict[str, Any]], empty_label: str) -> Table:
+        rows = [["ID", "Vulnerability", "Unit", "Line", "Severity"]]
+        rows.extend(
+            [
+                str(item.get("swc") or "-"),
+                str(item.get("title") or "-"),
+                item.get("unit_id") or "contract",
+                str(item.get("line") or "-"),
+                str(item.get("severity") or "Unknown"),
+            ]
+            for item in items
+        )
+        if len(rows) == 1:
+            rows.append(["-", empty_label, "-", "-", "-"])
+        table = Table(rows, repeatRows=1, colWidths=[22 * mm, 60 * mm, 45 * mm, 18 * mm, 25 * mm])
+        table.setStyle(TableStyle(header_table_style(7.5)))
+        return table
 
     # Thêm tiêu đề mục vào PDF.
     def heading(text: str, level: int = 1) -> None:
@@ -1098,25 +1274,14 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
     )
     phase_table = [["Phase", "Location", "Status"], *[[r["phase"], r["location"], r["status"]] for r in data["phase_rows"]]]
     table = Table(phase_table, repeatRows=1, colWidths=[92 * mm, 35 * mm, 43 * mm])
-    table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#26394d")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
-                ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ]
-        )
-    )
+    table.setStyle(TableStyle(header_table_style(8, valign_top=False)))
     story.extend([table, Spacer(1, 4 * mm)])
     heading("4. Findings")
     heading("4.1 Vulnerability Statistics", 2)
     paragraph(f"{len(data['findings'])} confirmed finding(s); highest risk: {data['risk_level']}.")
     heading("4.2 Vulnerability Severity Distribution", 2)
     dist = data["distribution"]
-    std_sevs = ["Critical", "High", "Medium", "Low"]
-    extra_sevs = [s for s in dist.keys() if s not in std_sevs and dist[s] > 0]
-    sev_cols = std_sevs + extra_sevs
+    sev_cols = _severity_columns(dist)
     col_w = 170.0 / len(sev_cols) * mm
     severity_table = [
         sev_cols,
@@ -1127,57 +1292,20 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
     story.extend([table, Spacer(1, 4 * mm)])
 
     heading("4.3 Confirmed Findings Summary", 2)
-    rows = [["ID", "Vulnerability", "Unit", "Line", "Severity"]]
-    rows.extend(
-        [item["swc"], item["title"], item.get("unit_id") or "contract", str(item.get("line") or "-"), item["severity"]]
-        for item in data["findings"]
-    )
-    if len(rows) == 1:
-        rows.append(["-", "No confirmed findings", "-", "-", "-"])
-    table = Table(rows, repeatRows=1, colWidths=[22 * mm, 60 * mm, 45 * mm, 18 * mm, 25 * mm])
-    table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#26394d")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
-                ("FONTSIZE", (0, 0), (-1, -1), 7.5),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ]
-        )
-    )
-    story.extend([table, Spacer(1, 4 * mm)])
-
+    story.extend([findings_table(data["findings"], "No confirmed findings"), Spacer(1, 4 * mm)])
     heading("4.4 Candidate Findings", 2)
-    cand_rows = [["ID", "Vulnerability", "Unit", "Line", "Severity"]]
-    cand_rows.extend(
-        [
-            c.get("swc", "-"),
-            str(c.get("title", "-")),
-            c.get("unit_id") or "contract",
-            str(c.get("line") or "-"),
-            str(c.get("severity", "Unknown")),
-        ]
-        for c in data.get("candidate_findings", [])
-    )
-    if len(cand_rows) == 1:
-        cand_rows.append(["-", "No candidate findings below threshold", "-", "-", "-"])
-    table = Table(cand_rows, repeatRows=1, colWidths=[22 * mm, 60 * mm, 45 * mm, 18 * mm, 25 * mm])
-    table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#26394d")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
-                ("FONTSIZE", (0, 0), (-1, -1), 7.5),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ]
-        )
-    )
-    story.extend([table, PageBreak()])
+    story.extend([
+        findings_table(data.get("candidate_findings", []), "No candidate findings below threshold"),
+        Spacer(1, 4 * mm),
+    ])
+    heading("4.5 Findings Dismissed by the Advisor", 2)
+    story.extend([findings_table(data.get("dismissed_findings", []), "No finding was dismissed by the Advisor"), Spacer(1, 2 * mm)])
+    for item in data.get("dismissed_findings", []):
+        paragraph(f"{item.get('finding_id')}: {item.get('reason')}")
+    story.append(PageBreak())
     heading("5. Detailed Analysis")
     heading("5.1 Contract Name", 2)
-    paragraph(data["analyzed_object"])
+    paragraph(data["contract_name"])
     heading("5.2 Source Code", 2)
     wrapped_source = "\n".join(textwrap.fill(line, width=118, replace_whitespace=False) for line in data["original_code"].splitlines())
     story.extend([Preformatted(wrapped_source, styles["CodeSmall"]), Spacer(1, 3 * mm)])
@@ -1188,15 +1316,17 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
         heading(f"{index}. {item['title']} ({item['swc']}) - {item['severity']}", 3)
         paragraph(f"Root cause: {item.get('root_cause') or 'Not provided'}")
         paragraph(f"Impact: {item.get('impact') or 'Requires manual analysis'}")
+        if _cvss_text(item):
+            paragraph(f"CVSS: {_cvss_text(item)}")
         for step_index, step in enumerate(item.get("repair_steps", []), 1):
             paragraph(f"{step_index}. {step}")
-        paragraph(f"Patch verification: {item.get('verification_status') or 'Not verified'}")
+        paragraph(f"Patch verification: {_verification_text(item)}")
     heading("5.4 Fixed Code", 2)
     paragraph(f"Patch verification verdict: {data['patch_verdict']}")
     code_comparison = build_code_comparison_rows(data["original_code"], data["fixed_code"])
     story.extend([code_compare_table(code_comparison), Spacer(1, 3 * mm)])
     heading("5.5 Verification Results", 2)
-    paragraph("Fix attempt: Single attempt")
+    paragraph(f"Fix attempts: {_attempt_text(data)}")
     verification_table = [["Channel", "Result", "Verdict", "Details"]]
     verification_table.extend(
         [
@@ -1212,13 +1342,7 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
         repeatRows=1,
         colWidths=[35 * mm, 20 * mm, 30 * mm, 85 * mm],
     )
-    table_style = [
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#26394d")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
-        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-    ]
+    table_style = header_table_style(7.5)
     for row_index, row in enumerate(verification_channel_rows(data), 1):
         color = colors.HexColor("#28633b" if row["result"] == "PASS" else "#9e1d1d")
         table_style.append(("TEXTCOLOR", (1, row_index), (1, row_index), color))
@@ -1226,7 +1350,7 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
     story.extend([table, Spacer(1, 3 * mm)])
     paragraph(
         f"Compilation: {data['tool_verification'].get('compile', {}).get('status', 'not run')}; "
-        f"Security tool matrix: {data['tool_verification'].get('policy_verdict', 'not run')}; "
+        f"Slither verdict: {data['tool_verification'].get('policy_verdict', 'not run')}; "
         f"Slither: {data['tool_verification'].get('slither', {}).get('status', 'not run')}; "
         f"Behavior preservation: "
         f"{data['tool_verification'].get('behavioral', {}).get('status', 'not run')}."
@@ -1252,17 +1376,7 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
             row["impact"][:70] + "..." if len(row["impact"]) > 70 else row["impact"],
         ])
     table = Table(cat_rows, repeatRows=1, colWidths=[42 * mm, 20 * mm, 18 * mm, 90 * mm])
-    table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#26394d")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
-                ("FONTSIZE", (0, 0), (-1, -1), 7),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ]
-        )
-    )
+    table.setStyle(TableStyle(header_table_style(7)))
     story.extend([table, Spacer(1, 4 * mm)])
 
     # Vẽ chân trang mỗi trang PDF: run_id và số trang.
@@ -1292,7 +1406,7 @@ def write_reports(data: dict[str, Any], run_dir: str | Path) -> dict[str, Any]:
     output_dir = Path(run_dir)
     markdown_text = render_markdown(data)
     markdown_path = write_text(output_dir / "phase6_audit_report.md", markdown_text)
-    html_path = write_text(output_dir / "phase6_audit_report.html", render_html(data, markdown_text))
+    html_path = write_text(output_dir / "phase6_audit_report.html", render_html(data))
     pdf_path = output_dir / "phase6_audit_report.pdf"
     pdf_ok, pdf_error = render_pdf(data, pdf_path)
     return {

@@ -2,7 +2,7 @@
 E2E/common/solc.py
 ──────────────────────────────────────────────────────────────────────────────
 Trình quản lý và biên dịch Solidity Compiler (solc) chuẩn hóa cho pipeline LLM-BSCVM.
-Tuân thủ các yêu cầu trong kế hoạch thẩm định (B6, R-07):
+Quy tắc:
   - Phân tích ràng buộc pragma bằng semantic_version.
   - Chọn phiên bản THẤP NHẤT thỏa mãn trong số các bản đã cài đặt trong solc-select.
   - Compile kiểm tra cả contract gốc (baseline): nếu gốc lỗi thì đánh dấu baseline_failed.
@@ -24,6 +24,9 @@ import semantic_version
 
 
 SOLC_SELECT_ARTIFACTS = Path.home() / ".solc-select" / "artifacts"
+
+# Vị trí lỗi trong output của solc: `--> file.sol:12:5:` (>= 0.5) hoặc `file.sol:12:5:` (0.4).
+_ERROR_LOCATION_RE = re.compile(r"(-->\s*\S+:\d+:\d+:?|\S+\.sol:\d+:\d+:?)")
 
 
 # Liệt kê các bản solc đã cài qua solc-select (~/.solc-select/artifacts), sắp xếp tăng dần theo phiên bản.
@@ -152,8 +155,19 @@ def extract_solc_errors(stderr_or_output: str) -> str:
     if error_blocks:
         return "\n\n".join(error_blocks[:5])  # Giới hạn 5 lỗi chính
 
-    # Nếu không tìm thấy chữ Error cụ thể nhưng compiler fail, trả về 1000 ký tự đầu của stderr
+    # Nếu không tìm thấy chữ Error cụ thể nhưng compiler fail, trả về 1500 ký tự đầu của stderr
     return stderr_or_output.strip()[:1500]
+
+
+# Tập "chữ ký" lỗi compile: mỗi dòng có chữ "Error", đã bỏ phần vị trí file:dòng:cột.
+# Mục đích: so lỗi của bản vá với lỗi sẵn có của bản gốc (bản vá chỉ bị trách khi sinh lỗi MỚI) -
+# dùng chung cho vòng sửa (candidate_check) và kiểm chứng cuối (tool_matrix).
+def compiler_error_signatures(text: str) -> set[str]:
+    return {
+        _ERROR_LOCATION_RE.sub("", line).strip()
+        for line in (text or "").splitlines()
+        if "Error" in line
+    }
 
 
 # Nhiệm vụ: biên dịch một chuỗi mã Solidity bằng solc (tuỳ chọn xuất AST JSON).
@@ -179,7 +193,7 @@ def compile_solidity_code(
         }
 
     if solc_path is None:
-        solc_path, reason, _ = select_best_solc(code)
+        solc_path, _, _ = select_best_solc(code)
 
     if solc_path is None or not solc_path.exists():
         return {

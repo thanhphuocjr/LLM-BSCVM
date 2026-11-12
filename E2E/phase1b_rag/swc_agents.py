@@ -14,33 +14,20 @@ from typing import Dict, List, Sequence
 
 from E2E.config import KNOWLEDGE_BASE_DIR
 
-DEFAULT_SWC_REGISTRY = str(KNOWLEDGE_BASE_DIR / "swc_registry.json")
+DEFAULT_SWC_REGISTRY = KNOWLEDGE_BASE_DIR / "swc_registry.json"
 
 
 # Cấu hình của MỘT SWC agent (37 agent, SWC-100 -> SWC-136): mã SWC, tiêu đề, mô tả, cách sửa,
-# mức nghiêm trọng, ngưỡng, số tín hiệu tối thiểu, danh sách regex tín hiệu.
+# mức nghiêm trọng, số tín hiệu tối thiểu, danh sách regex tín hiệu.
 @dataclass(frozen=True)
 class AgentConfig:
     swc_id: str
     title: str
     description: str
     remediation: str
-    query: str
     severity: str
-    threshold: float
     min_signal_hits: int
     signal_patterns: Sequence[str]
-
-    # Tên kỹ thuật của agent, vd "swc_107".
-    @property
-    def name(self) -> str:
-        return self.swc_id.lower().replace("-", "_")
-
-    # Tên hiển thị, vd "SWC-107 Agent - Reentrancy".
-    @property
-    def display_name(self) -> str:
-        return f"{self.swc_id} Agent - {self.title}"
-
 
 
 SEVERITY_BY_SWC = {
@@ -178,7 +165,7 @@ def normalize_swc_id(value: object) -> str:
 
 
 # Đọc swc_registry.json (37 mục SWC đã được làm giàu bằng dữ liệu) và lọc mục hợp lệ.
-def load_swc_registry(path: str = DEFAULT_SWC_REGISTRY) -> List[Dict]:
+def load_swc_registry(path: str | Path = DEFAULT_SWC_REGISTRY) -> List[Dict]:
     registry_path = Path(path)
     with registry_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
@@ -187,21 +174,11 @@ def load_swc_registry(path: str = DEFAULT_SWC_REGISTRY) -> List[Dict]:
     return [item for item in data if isinstance(item, dict) and normalize_swc_id(item.get("id"))]
 
 
-# Tạo câu truy vấn mô tả SWC (tên + mô tả + cách sửa) cho agent.
-def build_agent_query(swc_id: str, title: str, description: str, remediation: str) -> str:
-    return (
-        f"Audit this Solidity code for {swc_id} - {title}. "
-        f"Weakness description: {description[:700]} "
-        f"Expected remediation or best practice: {remediation[:450]} "
-        "Focus on whether the target code actually contains this weakness."
-    )
-
-
-# Nhiệm vụ: dựng danh sách 37 AgentConfig từ registry + bảng SIGNAL_PATTERNS_BY_SWC / SEVERITY_BY_SWC /
-# MIN_SIGNAL_HITS_BY_SWC. Mục đích: LocalRAGRetriever dùng các agent này để "gác cổng" từng SWC.
-def build_agents_from_registry(path: str = DEFAULT_SWC_REGISTRY) -> List[AgentConfig]:
+# Nhiệm vụ: dựng danh sách 37 AgentConfig từ các mục registry (load_swc_registry) + bảng SIGNAL_PATTERNS_BY_SWC /
+# SEVERITY_BY_SWC / MIN_SIGNAL_HITS_BY_SWC. Mục đích: LocalRAGRetriever dùng các agent này để "gác cổng" từng SWC.
+def build_agents(registry: List[Dict]) -> List[AgentConfig]:
     agents = []
-    for item in load_swc_registry(path):
+    for item in registry:
         swc_id = normalize_swc_id(item.get("id"))
         title = str(item.get("title") or swc_id).strip()
         description = str(item.get("description") or "").strip()
@@ -213,9 +190,7 @@ def build_agents_from_registry(path: str = DEFAULT_SWC_REGISTRY) -> List[AgentCo
                 title=title,
                 description=description,
                 remediation=remediation,
-                query=build_agent_query(swc_id, title, description, remediation),
                 severity=SEVERITY_BY_SWC.get(swc_id, "Medium"),
-                threshold=0.58 if patterns else 0.72,
                 min_signal_hits=MIN_SIGNAL_HITS_BY_SWC.get(swc_id, 1 if len(patterns) <= 1 else 2),
                 signal_patterns=patterns,
             )
@@ -224,6 +199,7 @@ def build_agents_from_registry(path: str = DEFAULT_SWC_REGISTRY) -> List[AgentCo
 
 
 # Lọc lấy phần thực sự là mã Solidity (khối ```code``` và các dòng có từ khoá Solidity) trước khi dò tín hiệu.
+# Retriever gọi một lần cho mỗi unit rồi đưa kết quả cho find_signal_hits của cả 37 agent.
 def extract_signal_code(code: str) -> str:
     fenced_blocks = re.findall(r"```(?:\w+)?\s*(.*?)```", code, re.IGNORECASE | re.DOTALL)
     code_lines = []
@@ -389,7 +365,7 @@ def find_assignment_in_condition(code: str) -> bool:
 
 
 # Nhiệm vụ: kiểm tra tín hiệu "có ngữ cảnh" cho các SWC dễ báo nhầm (100, 101, 102, 103, 104, 105, 106, 107,
-# 112, 113, 118, 123, 129, 136). Vd SWC-104 chỉ báo khi kết quả .call KHÔNG được kiểm tra; SWC-105/106/112 bỏ qua
+# 112, 113, 118, 129, 136). Vd SWC-104 chỉ báo khi kết quả .call KHÔNG được kiểm tra; SWC-105/106/112 bỏ qua
 # nếu có guard phân quyền; SWC-101 chỉ báo khi solc < 0.8 và không dùng SafeMath.
 # Trả None nếu SWC không có luật riêng (khi đó dùng regex chung).
 # Mục đích: dùng chung cho RAG (retriever) và static (static_runner gác cổng finding).
@@ -462,9 +438,6 @@ def find_custom_signal_hits(swc_id: str, code: str) -> List[str] | None:
             return ["old-style constructor-like function on pre-0.4.22 Solidity"]
         return []
 
-    if swc_id == "SWC-123":
-        return []
-
     if swc_id == "SWC-129":
         return ["assignment used as condition"] if find_assignment_in_condition(code) else []
 
@@ -476,10 +449,9 @@ def find_custom_signal_hits(swc_id: str, code: str) -> List[str] | None:
     return None
 
 
-# Trả về danh sách tín hiệu của một SWC trong đoạn mã: ưu tiên luật riêng (find_custom_signal_hits),
-# không có thì dò các regex chung của agent.
-def find_signal_hits(code: str, patterns: Sequence[str], swc_id: str | None = None) -> List[str]:
-    signal_code = extract_signal_code(code)
+# Trả về danh sách tín hiệu của một SWC trong đoạn mã đã lọc bởi extract_signal_code: ưu tiên luật riêng
+# (find_custom_signal_hits), không có thì dò các regex chung của agent.
+def find_signal_hits(signal_code: str, patterns: Sequence[str], swc_id: str | None = None) -> List[str]:
     custom_hits = find_custom_signal_hits(swc_id, signal_code) if swc_id else None
     if custom_hits is not None:
         return custom_hits

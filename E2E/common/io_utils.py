@@ -41,7 +41,7 @@ def read_json(path: str | Path) -> Any:
 
 
 # Ghi JSON "nguyên tử": ghi vào file tạm cùng thư mục rồi os.replace sang tên thật.
-# Mục đích: nếu tiến trình bị dừng giữa chừng (batch chạy nhiều giờ) thì không để lại file JSON hỏng/nửa vời.
+# Mục đích: nếu tiến trình bị dừng giữa chừng (vd bấm Dừng trên web app) thì không để lại file JSON hỏng/nửa vời.
 def write_json(path: str | Path, value: Any) -> Path:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

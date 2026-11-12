@@ -2,14 +2,17 @@
 Phase 4 - behaviour guard: a patch must keep what the original function does.
 
 `validate_observable_behavior(original, replacement)` raises ValueError when the
-replacement drops an ETH transfer (or its safe equivalent), a state write or an event
-of the original. Used by the Fixer before a patch is applied, by the deterministic
-fallback, by Phase 5 and by the round-2 self-check.
+replacement drops an ETH transfer (or its safe equivalent), a return statement, a state
+write or an event of the original. Used by the Fixer before a patch is applied, and by
+Phase 5 (behavior_verifier) for patched units the AST comparison could not cover.
 """
 
 from __future__ import annotations
 
 import re
+
+from E2E.phase0_parsing.code_units import mask_noncode
+from E2E.phase0_parsing.contract_context import local_variable_names
 
 
 _VALUE_CALL = r"(?:\.call\s*\{\s*value\s*:|\.call\.value\s*\()"
@@ -29,35 +32,12 @@ _TRANSFER_EQUIVALENTS = {
 }
 
 
-_LOCAL_DECL_RE = re.compile(
-    r"\b(?:u?int\d*|address(?:\s+payable)?|bool|bytes\d*|string|var|[A-Z][\w$]*)"
-    r"(?:\s*\[[^\]]*\])*\s+(?:(memory|storage|calldata)\s+)?([A-Za-z_$][\w$]*)\s*(?=[=;,)])"
-)
-
-
 _STATE_WRITE_RE = re.compile(r"([A-Za-z_$][\w$]*)(?:\s*\[[^\]]+\])*\s*(\+=|-=|\*=|/=|%=|=)(?!=)")
 
 
-# Bỏ comment // và /* */ trước khi so sánh hành vi.
-def _strip_comments(code: str) -> str:
-    return re.sub(r"/\*.*?\*/", "", re.sub(r"//[^\n]*", "", code), flags=re.DOTALL)
-
-
-# Tên tham số và biến cục bộ (không phải storage): gán lại chúng KHÔNG phải là thay đổi state.
-def _local_names(code: str) -> set[str]:
-    """Parameters and non-storage local variables: rewriting them is not a state change."""
-    names = set()
-    for match in _LOCAL_DECL_RE.finditer(code):
-        if match.group(1) != "storage":
-            names.add(match.group(2))
-    for match in re.finditer(r"\(\s*bool\s+([A-Za-z_$][\w$]*)", code):
-        names.add(match.group(1))
-    return names
-
-
-# Tập tên biến state bị ghi trong hàm (=, +=, -=, ...), đã loại biến cục bộ.
+# Tập tên biến state bị ghi trong hàm (=, +=, -=, ...), đã loại tham số / biến cục bộ (local_variable_names).
 def _state_writes(code: str) -> set[str]:
-    local = _local_names(code)
+    local = local_variable_names(code)
     return {
         match.group(1)
         for match in _STATE_WRITE_RE.finditer(code)
@@ -93,7 +73,7 @@ def _emitted_events(code: str) -> set[str]:
 #   - chuyển ETH (call{value}/transfer/send - chấp nhận dạng an toàn tương đương như sendValue, safeTransfer),
 #   - lệnh return, event đã phát, hoặc lệnh ghi biến state.
 # Mục đích: chặn bản vá "sửa lỗi bằng cách xoá chức năng". Là kiểm tra cú pháp, không phải chứng minh tương đương.
-# Dùng ở: Fixer (trước khi ghép), vá heuristic, Phase 5 và self-check của vòng 2.
+# Dùng ở: Fixer (trước khi ghép bản vá) và Phase 5 (khi không so được bằng AST).
 def validate_observable_behavior(original: str, replacement: str) -> None:
     """
     Guard bảo toàn hành vi (Phase 4 / Phase 5) — kiểm tra cú pháp các tín hiệu observable:
@@ -104,8 +84,8 @@ def validate_observable_behavior(original: str, replacement: str) -> None:
       - Lệnh return
     Đây là kiểm tra cú pháp, không phải chứng minh tương đương ngữ nghĩa.
     """
-    original_code = _strip_comments(original)
-    replacement_code = _strip_comments(replacement)
+    original_code = mask_noncode(original, mask_strings=False)
+    replacement_code = mask_noncode(replacement, mask_strings=False)
 
     for label, (detect, preserved_by) in _TRANSFER_EQUIVALENTS.items():
         if re.search(detect, original_code) and not any(

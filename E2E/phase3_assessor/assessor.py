@@ -8,10 +8,8 @@ systematically evaluates its risk using:
     * the CVSS v3.1 scoring standard (base score + vector), and
     * a four-level risk system: Critical / High / Medium / Low.
 
-It then produces, exactly as in the paper (Fig. 7):
-    * a per-vulnerability risk level + CVSS assessment,
-    * a statistical risk distribution (count per level), and
-    * a repair-priority ordering to drive the subsequent Fixer agent.
+It produces a per-vulnerability risk level + CVSS assessment; assessor_phase.py turns the
+scores into the repair-priority order the Fixer (Phase 4) follows.
 
 Decompose -> one assessment per vulnerability
 Retrieve  -> reuses the root-cause / impact context already produced upstream
@@ -20,14 +18,15 @@ Generate  -> CVSS-grounded risk judgement via the generative LLM on the GPU serv
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from E2E.common.gpu_client import ServerGPUClient
+from E2E.phase2_advisor.advisor import RepairKnowledgeBase
 
-RISK_LEVELS = ("Critical", "High", "Medium", "Low")
 
-# Fallback mapping when the LLM returns a CVSS score but an off-vocabulary level.
+
 # Đổi điểm CVSS thành mức rủi ro: >= 9.0 Critical, >= 7.0 High, >= 4.0 Medium, còn lại Low (theo chuẩn CVSS v3.1).
 def cvss_to_level(score: float) -> str:
     if score >= 9.0:
@@ -39,14 +38,11 @@ def cvss_to_level(score: float) -> str:
     return "Low"
 
 
-# Chuẩn hoá mức rủi ro do LLM trả về; nếu không thuộc 4 mức chuẩn thì suy ra từ điểm CVSS (mặc định Medium).
-def normalize_level(level: object, cvss_score: float | None = None) -> str:
-    text = str(level or "").strip().title()
-    if text in RISK_LEVELS:
-        return text
-    if cvss_score is not None:
-        return cvss_to_level(cvss_score)
-    return "Medium"
+# Chuẩn hoá giá trị một metric CVSS về một chữ cái hợp lệ: "N"/"n"/"Network" -> "N", "High" -> "H"
+# (lấy chữ cái đầu); giá trị không hợp lệ -> giá trị mặc định. Nhờ vậy điểm và vector luôn khớp nhau.
+def _metric_letter(value: str, allowed: str, default: str) -> str:
+    letter = str(value or "").strip()[:1].upper()
+    return letter if letter and letter in allowed else default
 
 
 # Nhiệm vụ: tính điểm CVSS v3.1 base score bằng CÔNG THỨC chuẩn FIRST từ 8 metric
@@ -63,7 +59,14 @@ def compute_cvss_31_base_score(
     a: str = "H",
 ) -> tuple[float, str]:
     """Calculate CVSS v3.1 base score algorithmically from metrics according to FIRST spec."""
-    import math
+    av, ac, pr, ui = (
+        _metric_letter(av, "NALP", "N"),
+        _metric_letter(ac, "LH", "L"),
+        _metric_letter(pr, "NLH", "N"),
+        _metric_letter(ui, "NR", "N"),
+    )
+    s = _metric_letter(s, "UC", "U")
+    c, i, a = _metric_letter(c, "NLH", "N"), _metric_letter(i, "NLH", "H"), _metric_letter(a, "NLH", "H")
 
     av_weights = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.20}
     ac_weights = {"L": 0.77, "H": 0.44}
@@ -74,15 +77,15 @@ def compute_cvss_31_base_score(
     i_weights = {"N": 0.0, "L": 0.22, "H": 0.56}
     a_weights = {"N": 0.0, "L": 0.22, "H": 0.56}
 
-    av_val = av_weights.get(av.upper(), 0.85)
-    ac_val = ac_weights.get(ac.upper(), 0.77)
-    scope_changed = s.upper() == "C"
-    pr_val = (pr_weights_c if scope_changed else pr_weights_u).get(pr.upper(), 0.85)
-    ui_val = ui_weights.get(ui.upper(), 0.85)
+    av_val = av_weights[av]
+    ac_val = ac_weights[ac]
+    scope_changed = s == "C"
+    pr_val = (pr_weights_c if scope_changed else pr_weights_u)[pr]
+    ui_val = ui_weights[ui]
 
-    c_val = c_weights.get(c.upper(), 0.0)
-    i_val = i_weights.get(i.upper(), 0.56)
-    a_val = a_weights.get(a.upper(), 0.56)
+    c_val = c_weights[c]
+    i_val = i_weights[i]
+    a_val = a_weights[a]
 
     iss = 1.0 - ((1.0 - c_val) * (1.0 - i_val) * (1.0 - a_val))
     if not scope_changed:
@@ -101,7 +104,7 @@ def compute_cvss_31_base_score(
             raw_score = min(1.08 * (impact + exploitability), 10.0)
         base_score = math.ceil(raw_score * 10.0) / 10.0
 
-    vector = f"CVSS:3.1/AV:{av.upper()}/AC:{ac.upper()}/PR:{pr.upper()}/UI:{ui.upper()}/S:{'C' if scope_changed else 'U'}/C:{c.upper()}/I:{i.upper()}/A:{a.upper()}"
+    vector = f"CVSS:3.1/AV:{av}/AC:{ac}/PR:{pr}/UI:{ui}/S:{s}/C:{c}/I:{i}/A:{a}"
     return round(base_score, 1), vector
 
 
@@ -114,71 +117,26 @@ ASSESSOR_SYSTEM_INSTRUCTION = (
     "Return ONLY valid JSON matching the requested schema."
 )
 
-# Structured-output schema
-RISK_RESPONSE_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "attack_vector": {"type": "string", "enum": ["N", "A", "L", "P"]},
-        "attack_complexity": {"type": "string", "enum": ["L", "H"]},
-        "privileges_required": {"type": "string", "enum": ["N", "L", "H"]},
-        "user_interaction": {"type": "string", "enum": ["N", "R"]},
-        "scope": {"type": "string", "enum": ["U", "C"]},
-        "confidentiality": {"type": "string", "enum": ["N", "L", "H"]},
-        "integrity": {"type": "string", "enum": ["N", "L", "H"]},
-        "availability": {"type": "string", "enum": ["N", "L", "H"]},
-        "funds_at_risk": {"type": "boolean"},
-        "justification": {"type": "string"},
-    },
-    "required": [
-        "attack_vector",
-        "attack_complexity",
-        "privileges_required",
-        "user_interaction",
-        "scope",
-        "confidentiality",
-        "integrity",
-        "availability",
-        "funds_at_risk",
-        "justification",
-    ],
-}
-
-
-# Kết quả đánh giá rủi ro của MỘT lỗ hổng: mức rủi ro, điểm + vector CVSS, khả năng xảy ra (likelihood),
-# mức tác động, có nguy cơ mất tiền không (funds_at_risk), lý giải, thứ tự ưu tiên sửa.
+# Kết quả đánh giá rủi ro của MỘT lỗ hổng: mức rủi ro (từ điểm CVSS), điểm + vector CVSS, lý giải của model.
 @dataclass
 class RiskAssessment:
     swc: str
-    vulnerability_name: str
-    detector_severity: str
     risk_level: str
     cvss_score: float
     cvss_vector: str
-    likelihood: str
-    impact_rating: str
-    funds_at_risk: bool
     justification: str
-    repair_priority: int = 0
-    error: str | None = None
 
 
 # Agent Assessor (Phase 3): dùng LLM để chọn các metric CVSS v3.1 theo ngữ cảnh smart contract.
 class AssessorAgent:
-    # Gắn client LLM và (nếu có) RepairKnowledgeBase để lấy risk_guidance theo SWC.
+    # Gắn client LLM và RepairKnowledgeBase (dùng chung với Advisor nếu được truyền vào) để lấy risk_guidance theo SWC.
     def __init__(
         self,
         llm: ServerGPUClient | None = None,
-        knowledge_base: Any | None = None,
+        knowledge_base: RepairKnowledgeBase | None = None,
     ) -> None:
         self.llm = llm or ServerGPUClient()
-        if knowledge_base is not None:
-            self.knowledge_base = knowledge_base
-        else:
-            try:
-                from E2E.phase2_advisor.advisor import RepairKnowledgeBase
-                self.knowledge_base = RepairKnowledgeBase()
-            except Exception:
-                self.knowledge_base = None
+        self.knowledge_base = knowledge_base or RepairKnowledgeBase()
 
     # ── prompt ──────────────────────────────────────────────────────────────
     # Dựng prompt Assessor: thông tin lỗ hổng (SWC, tên, mức độ, root cause, impact từ Advisor),
@@ -261,56 +219,20 @@ class AssessorAgent:
         return "\n".join(sections)
 
     # ── single assessment ───────────────────────────────────────────────────
-    # [HÀM CHÍNH] Đánh giá MỘT lỗ hổng: false positive -> trả rủi ro Low, CVSS 0; ngược lại gọi LLM chọn metric
-    # -> compute_cvss_31_base_score -> mức rủi ro; suy ra likelihood (AC/PR) và impact_rating (I/A/funds_at_risk).
-    # LLM lỗi -> trả RiskAssessment có error (phase sẽ dùng CVSS mặc định theo SWC).
-    def assess_one(self, code: str, item: Dict[str, Any]) -> RiskAssessment:
+    # [HÀM CHÍNH] Đánh giá MỘT lỗ hổng: gọi LLM chọn 8 metric CVSS -> compute_cvss_31_base_score -> mức rủi ro.
+    # LLM lỗi -> trả None (assessor_phase dùng CVSS mặc định theo SWC).
+    # (Prompt còn hỏi funds_at_risk để model cân nhắc tác động lên tài sản; giá trị này không được lưu.)
+    def assess_one(self, code: str, item: Dict[str, Any]) -> RiskAssessment | None:
         swc = item.get("swc") or "Unknown"
-        name = item.get("vulnerability_name") or item.get("title") or "Unknown vulnerability"
-        detector_severity = item.get("severity") or "Unknown"
-
-        if item.get("is_true_positive") is False:
-            return RiskAssessment(
-                swc=swc,
-                vulnerability_name=name,
-                detector_severity="Low",
-                risk_level="Low",
-                cvss_score=0.0,
-                cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N",
-                likelihood="Low",
-                impact_rating="Low",
-                funds_at_risk=False,
-                justification="Advisor filtered this finding as a false positive.",
-            )
-
-        risk_guidance = item.get("risk_guidance")
-        if not risk_guidance and getattr(self, "knowledge_base", None):
-            try:
-                ret = self.knowledge_base.retrieve(swc)
-                risk_guidance = ret.get("risk_guidance")
-            except Exception:
-                pass
+        risk_guidance = self.knowledge_base.retrieve(swc).get("risk_guidance")
 
         try:
             data = self.llm.generate_json(
                 self._build_prompt(code, item, risk_guidance=risk_guidance),
                 ASSESSOR_SYSTEM_INSTRUCTION,
-                response_schema=RISK_RESPONSE_SCHEMA,
             )
-        except Exception as error:  # noqa: BLE001 - reported per finding
-            return RiskAssessment(
-                swc=swc,
-                vulnerability_name=name,
-                detector_severity=detector_severity,
-                risk_level=normalize_level(detector_severity),
-                cvss_score=0.0,
-                cvss_vector="",
-                likelihood="",
-                impact_rating="",
-                funds_at_risk=False,
-                justification="",
-                error=f"{type(error).__name__}: {error}",
-            )
+        except Exception:  # noqa: BLE001 - the phase falls back to the SWC default vector
+            return None
 
         cvss_score, cvss_vector = compute_cvss_31_base_score(
             av=str(data.get("attack_vector") or "N"),
@@ -322,27 +244,10 @@ class AssessorAgent:
             i=str(data.get("integrity") or "H"),
             a=str(data.get("availability") or "H"),
         )
-        risk_level = cvss_to_level(cvss_score)
-        funds_at_risk = bool(data.get("funds_at_risk"))
-        justification = str(data.get("justification") or "").strip()
-
-        ac = str(data.get("attack_complexity") or "L").upper()
-        pr = str(data.get("privileges_required") or "N").upper()
-        likelihood = "High" if (ac == "L" and pr == "N") else ("Low" if (ac == "H" or pr == "H") else "Medium")
-
-        i_metric = str(data.get("integrity") or "H").upper()
-        a_metric = str(data.get("availability") or "H").upper()
-        impact_rating = "High" if (i_metric == "H" or a_metric == "H" or funds_at_risk) else ("Low" if (i_metric == "N" and a_metric == "N") else "Medium")
-
         return RiskAssessment(
             swc=swc,
-            vulnerability_name=str(data.get("vulnerability_name") or name).strip(),
-            detector_severity=detector_severity,
-            risk_level=risk_level,
+            risk_level=cvss_to_level(cvss_score),
             cvss_score=cvss_score,
             cvss_vector=cvss_vector,
-            likelihood=likelihood,
-            impact_rating=impact_rating,
-            funds_at_risk=funds_at_risk,
-            justification=justification,
+            justification=str(data.get("justification") or "").strip(),
         )

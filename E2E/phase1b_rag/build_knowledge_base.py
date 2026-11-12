@@ -41,20 +41,6 @@ from E2E.phase1b_rag.swc_agents import (
 )
 
 
-HEADING_RE = re.compile(r"^##?\s+(.+?)\s*$", re.MULTILINE)
-
-
-# Lấy nội dung một mục "## <Tên>" trong file Markdown SWC (dùng khi xây từ thư mục SWC-*.md).
-def section(markdown: str, name: str) -> str:
-    matches = list(HEADING_RE.finditer(markdown))
-    for index, match in enumerate(matches):
-        if match.group(1).strip().lower() != name.lower():
-            continue
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(markdown)
-        return markdown[match.end() : end].strip()
-    return ""
-
-
 # Bỏ code block, link, ký hiệu Markdown -> văn bản thuần.
 def clean_markdown(value: str) -> str:
     value = re.sub(r"```[\s\S]*?```", " ", value)
@@ -82,29 +68,24 @@ def checklist(remediation: str) -> list[str]:
 # [BƯỚC OFFLINE] Dựng 2 dạng tri thức đồng bộ từ data/knowledge_base/source/:
 #   1) knowledge_items: mỗi hàm lỗi (is_vulnerable) là một "ca" có SWC, root cause, lập luận audit, cách sửa,
 #      mã lỗi, mã đã sửa và retrieval_text (văn bản để vector hoá TF-IDF);
-#   2) registry_records: 37 mục SWC-100..136, lấy mô tả từ baseline_taxonomy.json và làm giàu bằng dữ liệu
-#      (tiêu đề/root cause/cách sửa phổ biến nhất, tối đa 3 mẫu có bản vá). SWC không có dữ liệu cũng được
-#      thêm 1 item từ taxonomy để vẫn truy hồi được.
+#   2) registry_records: 37 mục SWC-100..136, làm giàu bằng dữ liệu (tiêu đề/root cause/cách sửa phổ biến nhất,
+#      tối đa 3 mẫu có bản vá); SWC không có dữ liệu lấy mô tả từ baseline_taxonomy.json và được thêm 1 item
+#      "nền" để vẫn truy hồi được.
 def build_knowledge_items(
-    knowledge_file: Path | None,
-    source_dir: Path | None = None,
-    baseline_taxonomy_file: Path | None = None,
+    knowledge_file: Path,
+    baseline_taxonomy_file: Path,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Builds two synchronized knowledge representations:
     1. knowledge_items: List of granular function-level vulnerability cases for TF-IDF RAG retrieval.
     2. registry_records: 37 SWC taxonomy entries enriched with dataset empirical evidence.
     """
     raw_data: list[dict[str, Any]] = []
-    if knowledge_file and knowledge_file.exists():
-        if knowledge_file.suffix == ".jsonl":
-            with knowledge_file.open("r", encoding="utf-8") as f:
-                raw_data = [json.loads(line) for line in f if line.strip()]
-        else:
-            with knowledge_file.open("r", encoding="utf-8") as f:
-                raw_data = json.load(f)
+    if knowledge_file.exists():
+        with knowledge_file.open("r", encoding="utf-8") as f:
+            raw_data = json.load(f)
 
     baseline_tax: dict[str, Any] = {}
-    if baseline_taxonomy_file and baseline_taxonomy_file.exists():
+    if baseline_taxonomy_file.exists():
         with baseline_taxonomy_file.open("r", encoding="utf-8") as f:
             baseline_tax = json.load(f)
 
@@ -166,34 +147,13 @@ def build_knowledge_items(
     for swc in all_swc_ids:
         patterns = list(SIGNAL_PATTERNS_BY_SWC.get(swc, ()))
 
-        # Try loading baseline if present
-        base_title = swc
-        base_desc = ""
-        base_remediation = ""
-        base_code_samples: list[str] = []
-        base_checklist_items: list[str] = []
-
-        if swc in baseline_tax:
-            info = baseline_tax[swc]
-            base_title = info.get("title") or swc
-            base_desc = info.get("description") or ""
-            base_remediation = info.get("remediation") or ""
-            base_checklist_items = info.get("checklist") or []
-            base_code_samples = [s["vulnerable"] for s in info.get("samples", []) if s.get("vulnerable")]
-        elif source_dir and (source_dir / f"{swc}.md").exists():
-            swc_md_path = source_dir / f"{swc}.md"
-            base_md = swc_md_path.read_text(encoding="utf-8")
-            base_title = clean_markdown(section(base_md, "Title")) or swc
-            base_desc = clean_markdown(section(base_md, "Description"))
-            base_remediation_raw = section(base_md, "Remediation")
-            base_remediation = clean_markdown(base_remediation_raw)
-            base_samples_raw = section(base_md, "Samples")
-            base_code_samples = (
-                re.findall(r"```(?:solidity)?\s*(.*?)```", base_samples_raw, re.DOTALL | re.IGNORECASE)
-                if base_samples_raw
-                else []
-            )
-            base_checklist_items = checklist(base_remediation_raw)
+        # SWC Registry baseline (title / description / remediation / samples), if the taxonomy has this SWC
+        info = baseline_tax.get(swc, {})
+        base_title = info.get("title") or swc
+        base_desc = info.get("description") or ""
+        base_remediation = info.get("remediation") or ""
+        base_checklist_items = info.get("checklist") or []
+        base_code_samples = [s["vulnerable"] for s in info.get("samples", []) if s.get("vulnerable")]
 
         if swc in by_swc:
             items = by_swc[swc]
@@ -310,16 +270,11 @@ def build_knowledge_items(
 # knowledge_items.json, swc_registry.json, knowledge_manifest.json.
 # Mục đích: tạo "bộ nhớ" mà Phase 1B (retriever) và Phase 2 (Advisor) đọc khi chạy. Kết quả tất định (byte-identical).
 def build_knowledge_base(
-    knowledge_file: Path | None,
-    source_dir: Path | None,
+    knowledge_file: Path,
     output_dir: Path,
     baseline_taxonomy_file: Path = BASELINE_TAXONOMY_PATH,
 ) -> dict[str, Any]:
-    knowledge_items, registry_records = build_knowledge_items(
-        knowledge_file,
-        source_dir=source_dir,
-        baseline_taxonomy_file=baseline_taxonomy_file,
-    )
+    knowledge_items, registry_records = build_knowledge_items(knowledge_file, baseline_taxonomy_file)
     if not knowledge_items:
         raise RuntimeError("No knowledge items could be constructed.")
 
@@ -345,7 +300,7 @@ def build_knowledge_base(
         "knowledge_items_count": len(knowledge_items),
         "registry_records_count": len(registry_records),
         "matrix_shape": list(matrix.shape),
-        "knowledge_source": str(knowledge_file) if knowledge_file and knowledge_file.exists() else "none",
+        "knowledge_source": str(knowledge_file) if knowledge_file.exists() else "none",
         "baseline_taxonomy_source": str(baseline_taxonomy_file) if baseline_taxonomy_file.exists() else "none",
         "artifacts": [
             "knowledge_items.json",
@@ -359,7 +314,7 @@ def build_knowledge_base(
     return manifest
 
 
-# Tham số CLI: --knowledge-file, --source-dir, --baseline-taxonomy, --output-dir.
+# Tham số CLI: --knowledge-file, --baseline-taxonomy, --output-dir.
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build the vulnerability knowledge store and TF-IDF artifacts.")
     parser.add_argument(
@@ -367,12 +322,6 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=VULNERABILITY_KNOWLEDGE_PATH,
         help="Path to final-vulnerability-knowledge.json",
-    )
-    parser.add_argument(
-        "--source-dir",
-        type=Path,
-        default=None,
-        help="Optional fallback directory containing SWC-*.md files.",
     )
     parser.add_argument("--baseline-taxonomy", type=Path, default=BASELINE_TAXONOMY_PATH)
     parser.add_argument("--output-dir", type=Path, default=KNOWLEDGE_BASE_DIR)
@@ -382,7 +331,7 @@ def parse_args() -> argparse.Namespace:
 # Điểm vào: `python -m E2E.phase1b_rag.build_knowledge_base` -> build và in manifest.
 def main() -> None:
     args = parse_args()
-    manifest = build_knowledge_base(args.knowledge_file, args.source_dir, args.output_dir, args.baseline_taxonomy)
+    manifest = build_knowledge_base(args.knowledge_file, args.output_dir, args.baseline_taxonomy)
     print(json.dumps(manifest, indent=2))
 
 

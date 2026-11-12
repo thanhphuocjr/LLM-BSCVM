@@ -10,15 +10,8 @@ Thư mục theo đúng thứ tự pipeline:
   phase1_fusion/     hợp nhất static + RAG + detector theo từng finding
   phase2_advisor/    Advisor: lọc false positive, nguyên nhân, hướng sửa
   phase3_assessor/   Assessor: CVSS v3.1, mức rủi ro, thứ tự ưu tiên
-  phase4_fixer/      Fixer: vá từng hàm, guard hành vi, vá dự phòng
+  phase4_fixer/      Fixer: vá từng hàm, guard hành vi (không có nguồn vá dự phòng)
   phase5_verifier/   kiểm chứng bản vá: compile, detector, static/RAG, Slither, AST
   phase6_reporter/   báo cáo Markdown / HTML / PDF
-  common/            dùng chung: client GPU server, solc, chạy Slither/SmartBugs, IO
-  experiments/       chạy thực nghiệm: vòng 1 (batch_audit) và vòng 2 (repair_round2)
-  evaluation/        đánh giá: benchmark hồi quy, static/RAG trên test split, 9 tool
-  data_tools/        công cụ dữ liệu: bỏ comment SmartBugs-Wild, manifest toàn vẹn
+  common/            dùng chung: client GPU server, solc, chạy Slither, IO
 """
-
-from .config import E2E_ROOT
-
-__all__ = ["E2E_ROOT"]

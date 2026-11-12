@@ -17,22 +17,17 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from E2E.config import DEFAULT_DETECTOR_THRESHOLD
+from E2E.config import DEFAULT_DETECTOR_THRESHOLD, PROJECT_ROOT
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SERVER_GPU_URL = "http://100.122.153.35:6868"
 DEFAULT_TEMPERATURE = 0.2
 
 
 # Nhiệm vụ: đọc file .env ở thư mục gốc và đưa biến vào os.environ (không cần thư viện python-dotenv).
-# override=False: biến có sẵn trong môi trường được ưu tiên; override=True: .env thắng.
-# Mục đích: lấy SERVER_GPU_URL / SERVER_GPU_API_KEY để biết GPU server ở đâu.
-def load_env_file(path: Path = PROJECT_ROOT / ".env", *, override: bool = False) -> None:
-    """Populate os.environ from .env (no python-dotenv dependency).
-
-    override=False: variables already set in the environment win (agents' LLM client).
-    override=True:  .env wins and is re-read on every call (server URL / API key lookups).
-    """
+# Giá trị trong .env THẮNG biến môi trường có sẵn và được đọc lại ở mỗi lần gọi.
+# Mục đích: detector và các agent luôn dùng cùng một SERVER_GPU_URL / SERVER_GPU_API_KEY / SERVER_GPU_TEMPERATURE.
+def load_env_file(path: Path = PROJECT_ROOT / ".env") -> None:
+    """Populate os.environ from .env (no python-dotenv dependency); .env wins and is re-read on every call."""
     if not path.exists():
         return
     for raw_line in path.read_text(encoding="utf-8").splitlines():
@@ -41,28 +36,27 @@ def load_env_file(path: Path = PROJECT_ROOT / ".env", *, override: bool = False)
             continue
         key, _, value = line.partition("=")
         key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and (override or key not in os.environ):
-            os.environ[key] = value
+        if key:
+            os.environ[key] = value.strip().strip('"').strip("'")
 
 
 # Trả về URL GPU server: tham số truyền vào > SERVER_GPU_URL trong .env > DEFAULT_SERVER_GPU_URL.
 def get_server_url(server_url: str | None = None) -> str:
     if server_url:
         return server_url.rstrip("/")
-    load_env_file(override=True)
+    load_env_file()
     return os.environ.get("SERVER_GPU_URL", DEFAULT_SERVER_GPU_URL).rstrip("/")
 
 
 # Tạo header X-API-Key nếu có SERVER_GPU_API_KEY (bí mật dùng chung giữa máy local và server).
 def _auth_headers() -> dict[str, str]:
     """Optional shared secret for the GPU server (set SERVER_GPU_API_KEY on both sides)."""
-    load_env_file(override=True)
+    load_env_file()
     api_key = os.environ.get("SERVER_GPU_API_KEY", "").strip()
     return {"X-API-Key": api_key} if api_key else {}
 
 
-# Gửi POST JSON tới một URL (kèm header xác thực) và parse JSON trả về. Hàm HTTP cấp thấp.
+# Gửi POST JSON tới một URL (kèm header xác thực) và parse JSON trả về. Hàm HTTP cấp thấp duy nhất cho POST.
 def _post_json(url: str, payload: dict[str, Any], timeout: int = 60) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -75,7 +69,7 @@ def _post_json(url: str, payload: dict[str, Any], timeout: int = 60) -> dict[str
 
 
 # Nhiệm vụ: gọi GET /api/v1/health của GPU server; lỗi kết nối thì trả {"status": "offline", ...}.
-# Mục đích: web app hiển thị trạng thái server; batch tự chờ server sống lại trước khi chạy tiếp.
+# Mục đích: web app hiển thị trạng thái server; gpu_pipeline kiểm tra server sẵn sàng trước khi chạy Phase 1C.
 def check_server_health(server_url: str | None = None, timeout: int = 3) -> dict[str, Any]:
     """Kiểm tra xem API server v13 trên GPU server có sẵn sàng hay không."""
     actual_url = get_server_url(server_url)
@@ -103,11 +97,12 @@ def detect_via_server(
     return _post_json(url, payload, timeout=timeout)
 
 
-# Gửi prompt tới /api/v1/generate (model instruct, tắt LoRA) và trả về chuỗi trả lời.
+# [Phase 2/3/4] Gửi prompt tới /api/v1/generate (model instruct, tắt LoRA) và trả về chuỗi trả lời.
+# Đường HTTP duy nhất để sinh văn bản: Fixer gọi trực tiếp (temperature 0), Advisor/Assessor gọi qua ServerGPUClient.
 def generate_via_server(
     prompt: str,
     system_prompt: str = "",
-    temperature: float = 0.2,
+    temperature: float = DEFAULT_TEMPERATURE,
     max_tokens: int = 1500,
     server_url: str | None = None,
     timeout: int = 120,
@@ -125,13 +120,23 @@ def generate_via_server(
     return str(res.get("response", "")).strip()
 
 
+# Các khoá mà agent thực sự đọc từ JSON của model (dùng khi phải "vớt" JSON hỏng bằng regex).
+#   Advisor (advisor.advise_one):  is_true_positive, root_cause, attack_scenario, impact, fix_strategy
+#   Assessor (assessor.assess_one): 8 metric CVSS + justification
+_SALVAGE_KEYS = (
+    "is_true_positive", "root_cause", "attack_scenario", "impact", "fix_strategy",
+    "attack_vector", "attack_complexity", "privileges_required", "user_interaction",
+    "scope", "confidentiality", "integrity", "availability", "justification",
+)
+
+
 # Nhiệm vụ: lấy JSON từ câu trả lời của LLM một cách "chịu lỗi": bỏ ```json fence -> parse thẳng ->
-# cắt từ { đầu tới } cuối -> thay xuống dòng thô bằng \n -> cuối cùng dùng regex vớt từng khoá quan trọng
-# (fixed_code, root_cause, cvss_vector...).
-# Mục đích: model 14B hay trả JSON sai cú pháp; hàm này giúp Advisor/Assessor/Fixer vẫn dùng được kết quả.
+# cắt từ { đầu tới } cuối -> thay xuống dòng thô bằng \n -> cuối cùng dùng regex vớt từng khoá mà
+# Advisor/Assessor cần (_SALVAGE_KEYS).
+# Mục đích: model 14B hay trả JSON sai cú pháp; hàm này giúp Advisor/Assessor vẫn dùng được kết quả.
 def extract_json(text: str) -> Any:
     """Robust, best-effort JSON extraction from an LLM response.
-    
+
     Handles markdown fences, unescaped control characters (newlines/tabs inside strings),
     and common JSON syntax slips from generative models.
     """
@@ -140,7 +145,7 @@ def extract_json(text: str) -> Any:
     fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
     if fenced:
         text = fenced.group(1).strip()
-    
+
     # 1. Direct parse with strict=False to allow control characters inside strings
     try:
         return json.loads(text, strict=False)
@@ -157,140 +162,65 @@ def extract_json(text: str) -> Any:
         except json.JSONDecodeError:
             pass
 
-        # 3. Clean common issues: unescaped raw newlines within JSON string values
+        # 3. Raw newlines inside string values -> \n
         try:
-            # Replace raw newlines in string properties with \n
-            sanitized = re.sub(
-                r'(?<!\\)\n',
-                r'\\n',
-                sliced
-            )
-            return json.loads(sanitized, strict=False)
+            return json.loads(re.sub(r"(?<!\\)\n", r"\\n", sliced), strict=False)
         except Exception:
             pass
 
-    # 4. Regex fallback dictionary for critical keys if full JSON parsing failed
-    fallback_dict: dict[str, Any] = {}
-    for key in (
-        "fixed_code", "vulnerability_name", "root_cause", "impact",
-        "risk_level", "cvss_score", "cvss_vector", "likelihood",
-        "impact_rating", "justification", "status", "confidence",
-        "bypass_scenario", "residual_risk", "analyzed_object",
-        "contract_function", "executive_summary"
-    ):
-        pattern = rf'"{key}"\s*:\s*"((?:\\.|[^"\\])*)"'
-        m = re.search(pattern, text)
-        if m:
-            val = m.group(1).replace(r'\"', '"').replace(r'\n', '\n')
-            fallback_dict[key] = val
-        else:
-            # Check for numeric or boolean
-            num_m = re.search(rf'"{key}"\s*:\s*([0-9\.]+|true|false)', text, re.IGNORECASE)
-            if num_m:
-                raw_v = num_m.group(1).lower()
-                if raw_v == "true":
-                    fallback_dict[key] = True
-                elif raw_v == "false":
-                    fallback_dict[key] = False
-                else:
-                    try:
-                        fallback_dict[key] = float(raw_v) if "." in raw_v else int(raw_v)
-                    except ValueError:
-                        pass
+    # 4. Regex salvage of the keys the agents read (string, number or boolean values)
+    salvaged: dict[str, Any] = {}
+    for key in _SALVAGE_KEYS:
+        string_match = re.search(rf'"{key}"\s*:\s*"((?:\\.|[^"\\])*)"', text)
+        if string_match:
+            salvaged[key] = string_match.group(1).replace(r'\"', '"').replace(r'\n', '\n')
+            continue
+        scalar_match = re.search(rf'"{key}"\s*:\s*([0-9.]+|true|false)', text, re.IGNORECASE)
+        if scalar_match:
+            raw_value = scalar_match.group(1).lower()
+            if raw_value in {"true", "false"}:
+                salvaged[key] = raw_value == "true"
+            else:
+                try:
+                    salvaged[key] = float(raw_value) if "." in raw_value else int(raw_value)
+                except ValueError:
+                    pass
 
-    # Regex for array fields (repair_steps, prevention, recommendations)
-    for arr_key in ("repair_steps", "prevention", "recommendations", "changes"):
-        arr_m = re.search(rf'"{arr_key}"\s*:\s*\[(.*?)\]', text, re.DOTALL)
-        if arr_m:
-            items = re.findall(r'"((?:\\.|[^"\\])*)"', arr_m.group(1))
-            fallback_dict[arr_key] = [it.replace(r'\"', '"').replace(r'\n', '\n') for it in items]
-
-    if fallback_dict:
-        return fallback_dict
+    if salvaged:
+        return salvaged
 
     raise json.JSONDecodeError("Failed to extract valid JSON from LLM response", text, 0)
 
 
-# Client LLM dùng chung cho các agent (Advisor, Assessor, Fixer): bọc endpoint /api/v1/generate.
-# Mục đích: các agent chỉ cần gọi .generate()/.generate_json(), không cần biết chi tiết HTTP.
+# Client LLM dùng chung cho Advisor và Assessor: bọc generate_via_server + extract_json.
+# Mục đích: các agent chỉ cần gọi .generate_json(), không cần biết chi tiết HTTP.
 class ServerGPUClient:
     """Generative client backed by the dedicated GPU Server running v13 FastAPI."""
 
-    # Đọc cấu hình: base_url (SERVER_GPU_URL), tên model, temperature (SERVER_GPU_TEMPERATURE, mặc định 0.2), timeout.
-    def __init__(
-        self,
-        base_url: str | None = None,
-        model_name: str | None = "qwen25-v13-14b",
-        temperature: float | None = None,
-        timeout: int = 120,
-    ) -> None:
-        load_env_file()
-        self._urllib = urllib.request
-        self.base_url = (base_url or os.environ.get("SERVER_GPU_URL", DEFAULT_SERVER_GPU_URL)).rstrip("/")
-        self.model_name = model_name or "qwen25-v13-14b"
+    # Đọc cấu hình: base_url (SERVER_GPU_URL), temperature (SERVER_GPU_TEMPERATURE, mặc định 0.2), timeout.
+    def __init__(self, timeout: int = 120) -> None:
+        self.base_url = get_server_url()  # also loads .env
         env_temp = os.environ.get("SERVER_GPU_TEMPERATURE")
-        self.temperature = (
-            temperature
-            if temperature is not None
-            else (float(env_temp) if env_temp else DEFAULT_TEMPERATURE)
-        )
+        self.temperature = float(env_temp) if env_temp else DEFAULT_TEMPERATURE
         self.timeout = timeout
 
-    # Header Content-Type JSON + X-API-Key (nếu có).
-    def _headers(self) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
-        api_key = os.environ.get("SERVER_GPU_API_KEY", "").strip()
-        if api_key:
-            headers["X-API-Key"] = api_key
-        return headers
-
     # Gửi prompt + system prompt tới GPU server, trả về văn bản. Lỗi mạng -> ConnectionError có thông báo rõ.
-    def generate(
-        self,
-        prompt: str,
-        system_instruction: str | None = None,
-        *,
-        as_json: bool = False,
-        temperature: float | None = None,
-        response_schema: Any | None = None,
-    ) -> str:
-        payload = {
-            "prompt": prompt,
-            "system_prompt": system_instruction or "",
-            "temperature": self.temperature if temperature is None else temperature,
-            "max_tokens": 2048,
-        }
-        url = f"{self.base_url}/api/v1/generate"
-        data = json.dumps(payload).encode("utf-8")
-        req = self._urllib.Request(
-            url,
-            data=data,
-            headers=self._headers(),
-        )
+    def generate(self, prompt: str, system_instruction: str | None = None) -> str:
         try:
-            with self._urllib.urlopen(req, timeout=self.timeout) as resp:
-                res = json.loads(resp.read().decode("utf-8"))
-                return str(res.get("response", "")).strip()
+            return generate_via_server(
+                prompt,
+                system_instruction or "",
+                temperature=self.temperature,
+                max_tokens=2048,
+                server_url=self.base_url,
+                timeout=self.timeout,
+            )
         except Exception as exc:
             raise ConnectionError(
-                f"Không thể kết nối tới GPU Server tại {url} ({exc}). "
+                f"Không thể kết nối tới GPU Server tại {self.base_url}/api/v1/generate ({exc}). "
                 f"Vui lòng đảm bảo dịch vụ trên server đã được khởi chạy."
             ) from exc
 
     # Như generate nhưng parse câu trả lời thành JSON bằng extract_json (agent cần output có cấu trúc).
-    def generate_json(
-        self,
-        prompt: str,
-        system_instruction: str | None = None,
-        *,
-        temperature: float | None = None,
-        response_schema: Any | None = None,
-    ) -> Any:
-        raw = self.generate(
-            prompt,
-            system_instruction,
-            as_json=True,
-            temperature=temperature,
-            response_schema=response_schema,
-        )
-        return extract_json(raw)
+    def generate_json(self, prompt: str, system_instruction: str | None = None) -> Any:
+        return extract_json(self.generate(prompt, system_instruction))

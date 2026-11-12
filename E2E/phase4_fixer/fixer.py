@@ -6,8 +6,8 @@ Prompt = target function + findings and the Advisor's fix strategy + contract co
 the previous attempt. The reply must be JSON {"replacement", "changed_lines", "why"}.
 
 The replacement is extracted, checked by the behaviour guard and spliced into the
-contract by unit id. When the model fails, the Advisor's fixed code is tried instead
-(not in single-pass mode, where the model's reply is the result).
+contract by unit id. When any step fails the unit is reported as `rejected` (with the
+failing stage); there is no fallback patch source.
 """
 
 from __future__ import annotations
@@ -107,30 +107,6 @@ def _splice_unit(code: str, target: CodeUnit, replacement: str, summary: str) ->
     return updated
 
 
-# Đổi repair_feedback (lỗi compile + các kênh kiểm chứng không đạt) truyền từ ngoài vào thành đoạn văn bản cho prompt.
-def _feedback_from_request(repair_feedback: dict[str, Any] | None) -> str:
-    """Turn an externally supplied repair_feedback object into prompt text."""
-    if not repair_feedback:
-        return ""
-    parts: list[str] = []
-    if repair_feedback.get("compiler_error"):
-        parts.append(f"Previous compilation error:\n{repair_feedback['compiler_error']}")
-    for channel_name, channel in (repair_feedback.get("components") or {}).items():
-        if channel.get("passed", True):
-            continue
-        channel_findings = channel.get("findings") or channel.get("residual_target_findings") or []
-        if channel_findings:
-            details = "; ".join(
-                str(item.get("message") or item.get("name") or item.get("title") or "")
-                for item in channel_findings
-                if item
-            )
-            parts.append(f"Verification channel [{channel_name}] flagged issues: {details}")
-        elif channel.get("reason") or channel.get("error"):
-            parts.append(f"Verification channel [{channel_name}] reported: {channel.get('reason') or channel.get('error')}")
-    return "\n".join(parts)
-
-
 # Phiên bản solc thấp nhất mà pragma cho phép (bản vá phải compile được với bản này).
 def _min_pragma_version(source_code: str) -> tuple[int, int, int] | None:
     """Lowest compiler version allowed by the pragma (the patch must compile with it)."""
@@ -172,7 +148,8 @@ def _version_rules(source_code: str) -> str:
 
 # Dựng prompt Fixer cho MỘT hàm: tên hàm, danh sách lỗi + fix_strategy của Advisor (chỉ lấy suggestion đã được
 # Advisor xác nhận là true positive), mã gốc, ngữ cảnh contract + bất biến, tri thức RAG, feedback lần trước,
-# luật phiên bản, yêu cầu "MINIMAL DIFF", giữ mọi lệnh ghi state/event, trả JSON {replacement, changed_lines, why}.
+# luật phiên bản, yêu cầu "MINIMAL DIFF", giữ mọi lệnh ghi state/event, chỉ dùng modifier/hàm/biến đã có (bản vá
+# chỉ thay một hàm nên không thể khai báo modifier mới), trả JSON {replacement, changed_lines, why}.
 def _build_fixer_prompt(
     unit: CodeUnit,
     unit_findings: list[dict[str, Any]],
@@ -205,7 +182,10 @@ def _build_fixer_prompt(
         f"1. Generate a MINIMAL DIFF security repair for `{unit.name}`.\n"
         f"{_version_rules(source_code)}"
         "2. All state write statements and event emissions from the original function MUST be preserved.\n"
-        "3. Return ONLY a single valid JSON object with format:\n"
+        f"3. Only `{unit.name}` is replaced, so the patch must compile against the rest of the contract unchanged: "
+        "use only modifiers, functions and state variables that already exist (see Contract Context) and never "
+        "introduce a new modifier. To restrict access, add a `require(...)` check on `msg.sender` inside the function.\n"
+        "4. Return ONLY a single valid JSON object with format:\n"
         "{\n"
         f'  "replacement": "full replacement code beginning with function {unit.name} and ending at its closing brace",\n'
         '  "changed_lines": [1, 2],\n'
@@ -218,10 +198,8 @@ def _build_fixer_prompt(
 # [HÀM CHÍNH PHASE 4] Vá MỘT hàm:
 #   prepare (dựng prompt) -> generate (gọi LLM, temperature 0) -> extract (lấy hàm thay thế từ JSON/code fence)
 #   -> guard (validate_observable_behavior: không được mất chuyển ETH/ghi state/event/return) -> apply (_splice_unit).
-# LLM thất bại -> thử fixed_code của Advisor (cũng phải qua guard). Không được -> outcome "rejected" kèm stage lỗi.
-# single_pass (batch vòng 1): kết quả model là kết quả cuối; guard chỉ ghi cảnh báo (guard_warning), không fallback,
-# trả về y nguyên -> "unchanged".
-# Trả về (mã mới, outcome {status applied/rejected/unchanged, engine, stage, rationale...}).
+# Bước nào lỗi -> outcome "rejected" kèm stage lỗi (không có nguồn vá dự phòng).
+# Trả về (mã mới, outcome {status applied/rejected, engine, stage, rationale...}).
 def patch_unit(
     code: str,
     unit: CodeUnit,
@@ -233,17 +211,11 @@ def patch_unit(
     rag_section: str,
     attempt: int,
     server_url: str | None,
-    single_pass: bool = False,
 ) -> tuple[str, dict[str, Any]]:
-    """Patch one unit with the generative model, falling back to the Advisor's fixed code.
-
-    single_pass: the fixer's reply is the result. The behaviour guard only annotates it
-    (`guard_warning`), an unchanged reply is reported as `unchanged`, and no fallback runs.
-    """
+    """Patch one unit with the generative model; any failure is reported as `rejected`."""
     label = f"attempt {attempt}"
     stage = "prepare"
     llm_error = ""
-    guard_warning = ""
     rationale = ""
     try:
         prompt = _build_fixer_prompt(unit, unit_findings, unit_suggestions, source_code, feedback_note, rag_section)
@@ -259,25 +231,8 @@ def patch_unit(
         candidate = extract_declaration_body(reply, target_name=unit.name)
         if not candidate or unit.name not in candidate:
             raise ValueError(f"Extracted patch does not define expected function {unit.name}")
-        if single_pass and re.sub(r"\s+", "", candidate) == re.sub(r"\s+", "", unit.code):
-            return code, {
-                "finding_id": f"LLM:Qwen14B:{unit.unit_id}",
-                "unit_id": unit.unit_id,
-                "status": "unchanged",
-                "stage": "unchanged",
-                "engine": "llm_fixer",
-                "fixed_code": candidate,
-                "attempt": attempt,
-                "rationale": rationale,
-                "reason": "The fixer returned the function unchanged.",
-            }
         stage = "guard"
-        try:
-            validate_observable_behavior(unit.code, candidate)
-        except ValueError as error:
-            if not single_pass:
-                raise
-            guard_warning = str(error)
+        validate_observable_behavior(unit.code, candidate)
         stage = "apply"
         updated = _splice_unit(code, unit, candidate, f"Qwen-14B patch for {unit.unit_id} ({label})")
         return updated, {
@@ -286,47 +241,14 @@ def patch_unit(
             "status": "applied",
             "stage": "applied",
             "engine": "llm_fixer",
-            "fixed_code": candidate,
             "patched_code": candidate,
             "attempt": attempt,
-            "guard_warning": guard_warning,
             "rationale": rationale,
             "reason": f"Applied neural unit patch for {unit.unit_id} ({label}).",
         }
     except Exception as error:
         llm_error = f"{type(error).__name__}: {error}"
 
-    advisor_error = ""
-    for suggestion in ([] if single_pass else unit_suggestions):
-        suggested = str(suggestion.get("fixed_code") or "").strip()
-        if not suggested:
-            continue
-        candidate = extract_declaration_body(suggested, target_name=unit.name)
-        if not candidate or unit.name not in candidate:
-            continue
-        if re.sub(r"\s+", "", candidate) == re.sub(r"\s+", "", unit.code):
-            continue
-        try:
-            validate_observable_behavior(unit.code, candidate)
-            updated = _splice_unit(code, unit, candidate, f"Advisor patch for {unit.unit_id}")
-        except Exception as error:
-            advisor_error = f"{type(error).__name__}: {error}"
-            continue
-        return updated, {
-            "finding_id": suggestion.get("finding_id") or f"Advisor:{unit.unit_id}",
-            "unit_id": unit.unit_id,
-            "status": "applied",
-            "stage": "applied",
-            "engine": "advisor_fallback",
-            "fixed_code": candidate,
-            "patched_code": candidate,
-            "attempt": attempt,
-            "reason": f"LLM fixer failed at stage '{stage}'; applied the Advisor's patch for {unit.unit_id}.",
-        }
-
-    reason = f"Patch rejected at stage '{stage}': {llm_error}"
-    if advisor_error:
-        reason += f"; advisor fallback rejected: {advisor_error}"
     return code, {
         "finding_id": f"LLM:Qwen14B:{unit.unit_id}",
         "unit_id": unit.unit_id,
@@ -335,5 +257,5 @@ def patch_unit(
         "attempt": attempt,
         "error": llm_error,
         "rationale": rationale,
-        "reason": reason,
+        "reason": f"Patch rejected at stage '{stage}': {llm_error}",
     }

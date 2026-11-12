@@ -19,7 +19,7 @@ Following the paper (Fig. 6), each suggestion covers five aspects:
     4. Repair steps + fixed code example
     5. Preventive measures
 
-Returns structured data so the next agents (Assessor, Fixer, Reporter) can
+Returns structured data so the next phases (Assessor, Fixer, report) can
 consume it directly.
 """
 
@@ -27,36 +27,15 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List
 
 from E2E.common.gpu_client import ServerGPUClient
 from E2E.config import KNOWLEDGE_BASE_DIR
 from E2E.phase0_parsing.contract_context import build_contract_context
-
-DEFAULT_KNOWLEDGE_DIR = KNOWLEDGE_BASE_DIR
-
-# Structured-output schema (OpenAPI subset)
-REPAIR_RESPONSE_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "is_true_positive": {"type": "boolean"},
-        "evidence_lines": {"type": "array", "items": {"type": "integer"}},
-        "root_cause": {"type": "string"},
-        "attack_scenario": {"type": "string"},
-        "preconditions": {"type": "array", "items": {"type": "string"}},
-        "fix_strategy": {"type": "string"},
-    },
-    "required": [
-        "is_true_positive",
-        "evidence_lines",
-        "root_cause",
-        "attack_scenario",
-        "preconditions",
-        "fix_strategy",
-    ],
-}
+from E2E.phase1b_rag.swc_agents import normalize_swc_id
 
 ADVISOR_SYSTEM_INSTRUCTION = (
     "You are a senior smart-contract security auditor specialising in Solidity. "
@@ -70,36 +49,26 @@ ADVISOR_SYSTEM_INSTRUCTION = (
 # ──────────────────────────────────────────────────────────────────────────────
 # Data model
 # ──────────────────────────────────────────────────────────────────────────────
-# Kết quả Advisor cho MỘT finding: đúng/sai (is_true_positive), dòng bằng chứng, nguyên nhân gốc,
-# kịch bản tấn công, điều kiện khai thác, chiến lược sửa (fix_strategy) cho Fixer, nguồn tri thức đã dùng.
+# Kết quả Advisor cho MỘT finding: đúng/sai (is_true_positive), nguyên nhân gốc, tác động (= kịch bản tấn công),
+# chiến lược sửa (fix_strategy) cho Fixer; error khi gọi LLM thất bại.
 @dataclass
 class RepairSuggestion:
-    swc: str
-    vulnerability_name: str
-    severity: str
-    root_cause: str
-    impact: str
-    repair_steps: List[str]
-    fixed_code: str
-    prevention: List[str]
-    knowledge_sources: List[str] = field(default_factory=list)
-    error: str | None = None
     is_true_positive: bool = True
-    evidence_lines: List[int] = field(default_factory=list)
+    root_cause: str = ""
+    impact: str = ""
     fix_strategy: str = ""
-    attack_scenario: str = ""
-    preconditions: List[str] = field(default_factory=list)
+    error: str | None = None
+
+
+# Mã mà Advisor xét cho một finding: mã của chính hàm (unit_code); finding cấp contract (không có hàm, vd
+# pragma) xét chính contract đang audit - KHÔNG dùng `vulnerable_code` vì đó là ca mẫu của contract khác trong KB.
+def _target_code(vulnerability: Dict[str, Any], code: str) -> str:
+    return str(vulnerability.get("unit_code") or "") or code
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Repair knowledge base (RAG retrieval by SWC id — offline, deterministic)
 # ──────────────────────────────────────────────────────────────────────────────
-# Chuẩn hoá chuỗi về dạng "SWC-xxx" (bản sao cục bộ của hàm cùng tên trong swc_agents).
-def normalize_swc_id(value: object) -> str:
-    match = re.search(r"SWC-\d{3}", str(value or "").upper())
-    return match.group(0) if match else str(value or "").strip().upper()
-
-
 # "Bước RAG của Advisor": tra tri thức sửa lỗi THEO MÃ SWC (không chạy lại TF-IDF/embedding) từ
 # swc_registry.json (37 SWC) + knowledge_items.json (11,869 ca). Dùng ở Phase 1F (enrich) và Phase 2.
 class RepairKnowledgeBase:
@@ -111,15 +80,11 @@ class RepairKnowledgeBase:
     """
 
     # Nạp registry và các ca lỗi, lập chỉ mục theo SWC (thiếu file thì bỏ qua, không lỗi).
-    def __init__(self, knowledge_dir: str | Path = DEFAULT_KNOWLEDGE_DIR) -> None:
+    def __init__(self, knowledge_dir: str | Path = KNOWLEDGE_BASE_DIR) -> None:
         k_dir = Path(knowledge_dir)
-        # Fall back to data/knowledge_base/built if the given directory does not exist
-        if not k_dir.exists():
-            k_dir = KNOWLEDGE_BASE_DIR
-
         self._registry_by_swc: Dict[str, Dict[str, Any]] = {}
         self._items_by_swc: Dict[str, List[Dict[str, Any]]] = {}
-        self._legacy_by_swc: Dict[str, List[Dict[str, Any]]] = {}
+        self._retrieved: Dict[tuple, Dict[str, Any]] = {}
 
         registry_path = k_dir / "swc_registry.json"
         if registry_path.exists():
@@ -143,23 +108,21 @@ class RepairKnowledgeBase:
             except Exception:
                 pass
 
-        metadata_path = k_dir / "sample_metadata.json"
-        if metadata_path.exists():
-            try:
-                with metadata_path.open("r", encoding="utf-8") as f:
-                    for record in json.load(f):
-                        swc = normalize_swc_id(record.get("Swc") or record.get("swc"))
-                        if swc:
-                            self._legacy_by_swc.setdefault(swc, []).append(record)
-            except Exception:
-                pass
-
     # Nhiệm vụ: gom tri thức cho một SWC: mô tả, cách sửa, checklist, ví dụ mã đã sửa từ registry;
     # cộng thêm các ca thực tế cùng SWC, xếp theo độ giống với mã đang xét (trùng hẳn = 10, chứa nhau = 5+,
     # còn lại SequenceMatcher). Trả best_pair (cặp mã lỗi/mã sửa gần nhất) và risk_guidance (cho Assessor).
+    # Dùng bởi: enrich_finding (Phase 1F), AdvisorAgent / advisor_phase (Phase 2), Assessor (risk_guidance).
+    # Kết quả được nhớ theo (SWC, limit, code): Phase 1F và Phase 2 tra cùng một finding với cùng tham số, và
+    # việc xếp hạng bằng SequenceMatcher trên ~2,000 ca mất khoảng 1 giây. Người gọi chỉ đọc kết quả.
     def retrieve(self, swc: str, limit: int = 3, code: str | None = None) -> Dict[str, Any]:
         """Aggregate remediation knowledge for a given SWC id, prioritizing empirical cases closest to the input code."""
-        norm_swc = normalize_swc_id(swc)
+        key = (normalize_swc_id(swc), limit, code)
+        if key not in self._retrieved:
+            self._retrieved[key] = self._retrieve(*key)
+        return self._retrieved[key]
+
+    # Phần tính toán của retrieve (không nhớ kết quả).
+    def _retrieve(self, norm_swc: str, limit: int, code: str | None) -> Dict[str, Any]:
         remediations: List[str] = []
         checklist: List[str] = []
         code_examples: List[str] = []
@@ -191,7 +154,6 @@ class RepairKnowledgeBase:
         # 2. Granular empirical cases from knowledge_items.json (11,869 cases)
         items = list(self._items_by_swc.get(norm_swc, []))
         if code and items:
-            from difflib import SequenceMatcher
             query_code = code.strip()
 
             # Điểm giống nhau giữa mã đang xét và mã lỗi của một ca trong KB (dùng để sắp xếp).
@@ -208,7 +170,7 @@ class RepairKnowledgeBase:
             items.sort(key=match_score, reverse=True)
 
         empirical_fixes: List[str] = []
-        empirical_pairs: List[Dict[str, Any]] = []
+        best_pair: Dict[str, Any] = {}
         for item in items[:limit]:
             title = str(item.get("title") or "").strip()
             if title and title not in titles:
@@ -227,61 +189,31 @@ class RepairKnowledgeBase:
             v_code = str(item.get("vulnerable_code") or "").strip()
             if fixed and fixed not in empirical_fixes:
                 empirical_fixes.append(fixed)
-            if fixed or v_code:
-                empirical_pairs.append({
-                    "id": item.get("id"),
-                    "title": title or norm_swc,
-                    "swc": norm_swc,
+            if (fixed or v_code) and not best_pair:
+                best_pair = {
                     "vulnerable_code": v_code,
                     "fixed_code": fixed,
                     "root_cause": str(item.get("root_cause") or "").strip(),
                     "remediation": remed,
-                    "checklist": item.get("checklist") or [],
                     "severity": str(item.get("severity") or (reg.get("severity") if reg else "Medium")),
                     "cwe_ids": item.get("cwe_ids") or [],
-                })
+                }
 
         # Place the closest empirical fix at the top of code_examples
         code_examples = empirical_fixes + [x for x in code_examples if x not in empirical_fixes]
 
-        # Fallback to registry samples if no empirical pairs were extracted
-        if not empirical_pairs and reg and reg.get("samples"):
-            for s in reg.get("samples", [])[:limit]:
-                if isinstance(s, dict):
-                    empirical_pairs.append({
-                        "id": f"{norm_swc}_sample",
-                        "title": titles[0] if titles else norm_swc,
-                        "swc": norm_swc,
-                        "vulnerable_code": str(s.get("vulnerable") or "").strip(),
-                        "fixed_code": str(s.get("fixed") or "").strip(),
-                        "root_cause": str(s.get("root_cause") or "").strip(),
-                        "remediation": str(reg.get("remediation") or "").strip(),
-                        "checklist": reg.get("checklist") or [],
-                        "severity": str(reg.get("severity") or "Medium"),
-                        "cwe_ids": [],
-                    })
-
-        best_pair = empirical_pairs[0] if empirical_pairs else {}
-
-        # 3. Legacy sample_metadata.json records if any
-        legacy_records = self._legacy_by_swc.get(norm_swc, [])
-        for record in legacy_records[:limit]:
-            for value, bucket in (
-                (record.get("Remediation") or record.get("remediation"), remediations),
-                (record.get("Description") or record.get("description"), descriptions),
-                (record.get("Title") or record.get("title"), titles),
-            ):
-                text = str(value or "").strip()
-                if text and text not in bucket:
-                    bucket.append(text)
-            for item in record.get("BestPracticeChecklist", []) or record.get("checklist", []) or []:
-                text = str(item or "").strip()
-                if text and text not in checklist:
-                    checklist.append(text)
-            for item in record.get("CodeExamples", []) or record.get("samples", []) or []:
-                text = str(item or "").strip()
-                if text and text not in code_examples:
-                    code_examples.append(text)
+        # Fallback to the first registry sample if no empirical pair was found
+        if not best_pair and reg:
+            sample = next((s for s in reg.get("samples", []) or [] if isinstance(s, dict)), None)
+            if sample:
+                best_pair = {
+                    "vulnerable_code": str(sample.get("vulnerable") or "").strip(),
+                    "fixed_code": str(sample.get("fixed") or "").strip(),
+                    "root_cause": str(sample.get("root_cause") or "").strip(),
+                    "remediation": str(reg.get("remediation") or "").strip(),
+                    "severity": str(reg.get("severity") or "Medium"),
+                    "cwe_ids": [],
+                }
 
         risk_guidance = {
             "swc": norm_swc,
@@ -293,21 +225,16 @@ class RepairKnowledgeBase:
             "checklist": checklist[:6],
         }
 
-        total_records = (1 if reg else 0) + len(items) + len(legacy_records)
         return {
-            "titles": titles,
             "descriptions": descriptions,
             "remediations": remediations,
             "checklist": checklist,
             "code_examples": code_examples[:limit],
-            "empirical_pairs": empirical_pairs,
             "best_pair": best_pair,
             "risk_guidance": risk_guidance,
-            "record_count": total_records,
         }
 
-    # Bổ sung cho một finding: mã lỗi/mã sửa mẫu, cách sửa, root cause, checklist, empirical_pairs, risk_guidance
-    # (chỉ điền khi finding chưa có).
+    # Bổ sung cho một finding: mã lỗi/mã sửa mẫu, cách sửa, root cause (chỉ điền khi finding chưa có), risk_guidance.
     def enrich_finding(self, finding: Dict[str, Any], code: str = "") -> Dict[str, Any]:
         """Enrich a finding with the most relevant empirical code, fix patterns, and evaluation knowledge."""
         norm_swc = normalize_swc_id(finding.get("swc"))
@@ -333,12 +260,9 @@ class RepairKnowledgeBase:
 
         if not enriched.get("remediation") and retrieved.get("remediations"):
             enriched["remediation"] = retrieved["remediations"][0]
-        if not enriched.get("checklist") and retrieved.get("checklist"):
-            enriched["checklist"] = retrieved["checklist"]
         if not enriched.get("root_cause") and retrieved.get("descriptions"):
             enriched["root_cause"] = retrieved["descriptions"][0]
 
-        enriched["empirical_pairs"] = retrieved.get("empirical_pairs", [])
         enriched["risk_guidance"] = retrieved.get("risk_guidance", {})
         return enriched
 
@@ -348,16 +272,10 @@ class RepairKnowledgeBase:
         self,
         findings: List[Dict[str, Any]],
         code: str = "",
-        code_units: List[Any] | None = None,
+        code_units: List[Dict[str, Any]] | None = None,
     ) -> List[Dict[str, Any]]:
         """Batch-enrich all findings with empirical vulnerability knowledge from 11,869 cases."""
-        unit_code_map = {}
-        if code_units:
-            for cu in code_units:
-                uid = cu.get("unit_id") if isinstance(cu, dict) else getattr(cu, "unit_id", None)
-                ucode = cu.get("code") if isinstance(cu, dict) else getattr(cu, "code", None)
-                if uid and ucode:
-                    unit_code_map[uid] = ucode
+        unit_code_map = {cu["unit_id"]: cu["code"] for cu in code_units or [] if cu.get("unit_id") and cu.get("code")}
 
         enriched_list = []
         for f in findings:
@@ -380,10 +298,9 @@ class AdvisorAgent:
         self,
         llm: ServerGPUClient | None = None,
         knowledge_base: RepairKnowledgeBase | None = None,
-        knowledge_dir: str | Path = DEFAULT_KNOWLEDGE_DIR,
     ) -> None:
         self.llm = llm or ServerGPUClient()
-        self.knowledge_base = knowledge_base or RepairKnowledgeBase(knowledge_dir)
+        self.knowledge_base = knowledge_base or RepairKnowledgeBase()
 
     # ── knowledge formatting ────────────────────────────────────────────────
     # Cắt danh sách văn bản theo số mục và số ký tự tối đa (giữ prompt ngắn).
@@ -394,11 +311,6 @@ class AdvisorAgent:
     # Dựng khối <RetrievedSecurityKnowledge> cho prompt: best practice, cách sửa, checklist, mẫu mã lỗi,
     # và cặp "mã lỗi -> mã đã sửa" gần nhất từ KB 11,869 ca.
     def _build_knowledge_block(self, vulnerability: Dict[str, Any], retrieved: Dict[str, Any]) -> str:
-        # Knowledge already carried from the detection phase ...
-        detection_practice = str(vulnerability.get("best_practice") or "").strip()
-        detection_checklist = vulnerability.get("best_practice_checklist") or []
-        detection_patterns = vulnerability.get("code_patterns_from_rag") or []
-
         # Empirical RAG case match from Phase 1B or knowledge retrieval
         best_pair = retrieved.get("best_pair", {})
         rag_fixed = str(vulnerability.get("fixed_code") or best_pair.get("fixed_code") or "").strip()
@@ -406,23 +318,17 @@ class AdvisorAgent:
 
         # ... merged with a fresh lookup from the vulnerability knowledge base.
         remediations = self._truncate(retrieved.get("remediations", []), 3, 800)
-        checklist = self._truncate(
-            [str(x) for x in (list(detection_checklist) + retrieved.get("checklist", []))], 8, 200
-        )
+        checklist = self._truncate([str(x) for x in retrieved.get("checklist", [])], 8, 200)
         code_examples = self._truncate(retrieved.get("code_examples", []), 3, 800)
         if rag_fixed and rag_fixed not in code_examples:
             code_examples.insert(0, rag_fixed[:800])
 
         lines = ["<RetrievedSecurityKnowledge>"]
-        if detection_practice:
-            lines.append(f"Best practice (from detection): {detection_practice[:800]}")
         for idx, item in enumerate(remediations, 1):
             lines.append(f"Remediation {idx}: {item}")
         if checklist:
             lines.append("Checklist:")
             lines.extend(f"  - {item}" for item in checklist)
-        if detection_patterns:
-            lines.append("Vulnerable code patterns: " + "; ".join(str(p) for p in detection_patterns[:6]))
         if rag_vuln and rag_fixed:
             lines.append(
                 "Most Relevant Empirical Code Repair Pair (from 11,869-case knowledge base):\n"
@@ -435,62 +341,37 @@ class AdvisorAgent:
         lines.append("</RetrievedSecurityKnowledge>")
         return "\n".join(lines)
 
-    # Dựng đoạn mô tả vị trí + mã hàm lỗi + ngữ cảnh liên quan (hiện không được _build_prompt dùng).
-    @staticmethod
-    def _related_code_block(vulnerability: Dict[str, Any]) -> str:
-        parts: List[str] = []
-        unit_id = vulnerability.get("unit_id")
-        start_line = vulnerability.get("start_line") or vulnerability.get("line")
-        end_line = vulnerability.get("end_line")
-        vuln_code = vulnerability.get("vulnerable_code")
-        matched_text = vulnerability.get("matched_text")
-
-        if unit_id:
-            parts.append(f"Target function unit: `{unit_id}`")
-        if start_line:
-            loc = f"Line {start_line}" + (f"-{end_line}" if end_line and end_line != start_line else "")
-            parts.append(f"Source location: {loc}")
-        if vuln_code:
-            parts.append(f"Vulnerable function code:\n```solidity\n{vuln_code.strip()}\n```")
-        elif matched_text:
-            parts.append(f"Matched vulnerable snippet:\n```solidity\n{matched_text.strip()}\n```")
-
-        for related in vulnerability.get("related_code", []) or []:
-            window = (related.get("window") or {}).get("code")
-            if window and window.strip() not in "".join(parts):
-                parts.append(f"Related code context:\n```solidity\n{window.strip()}\n```")
-
-        return "\n\n".join(parts).strip()
-
     # Dựng prompt Advisor: thông tin finding (SWC, mức độ), phiên bản Solidity, schema JSON yêu cầu
     # (is_true_positive, evidence_lines, root_cause, attack_scenario, preconditions, fix_strategy),
-    # luật triage (có onlyOwner/kiểm tra msg.sender thì lỗi access control là FALSE POSITIVE),
+    # luật triage (có onlyOwner/kiểm tra msg.sender thì lỗi access control là FALSE POSITIVE; kiểm tra tx.origin
+    # KHÔNG phải guard - với SWC-115 nó chính là lỗ hổng),
     # <TargetFunction>, <Context> (build_contract_context) và <Knowledge>.
     def _build_prompt(self, code: str, vulnerability: Dict[str, Any], knowledge_block: str) -> str:
         swc = vulnerability.get("swc") or "Unknown"
         title = vulnerability.get("title") or "Unknown vulnerability"
         severity = vulnerability.get("severity") or "Unknown"
 
-        target_code = (
-            vulnerability.get("unit_code")
-            or vulnerability.get("vulnerable_code")
-            or vulnerability.get("matched_text")
-            or ""
-        )
-        start_line = vulnerability.get("start_line") or vulnerability.get("line") or 1
-        end_line = vulnerability.get("end_line") or (start_line + target_code.count("\n"))
+        unit_code = str(vulnerability.get("unit_code") or "")
+        if unit_code:
+            target_code = unit_code
+            start_line = vulnerability.get("start_line") or vulnerability.get("line") or 1
+            end_line = vulnerability.get("end_line") or (start_line + target_code.count("\n"))
+        else:
+            # Contract-level finding: the contract itself is the target (first 2,000 characters).
+            target_code = code[:2000]
+            start_line, end_line = 1, 1 + target_code.count("\n")
 
         sol_match = re.search(r"pragma\s+solidity\s+([^;]+);", code)
         compiler_note = sol_match.group(1).strip() if sol_match else "0.4.x"
 
-        context_str = ""
+        # unit_id = "<Contract>.<function>[#n]": the context comes from the enclosing contract. A contract-level
+        # finding (no unit) matches no contract name, so build_contract_context falls back to the whole source.
+        unit_id = str(vulnerability.get("unit_id") or "")
+        contract_name = unit_id.split(".", 1)[0] if "." in unit_id else "Contract"
         try:
-            unit_info = {
-                "name": vulnerability.get("name") or vulnerability.get("unit_id") or "target",
-                "contract_name": vulnerability.get("contract_name") or "Contract",
-                "code": target_code,
-            }
-            context_str = build_contract_context(unit_info, code, budget_tokens=1500)
+            context_str = build_contract_context(
+                {"contract_name": contract_name, "code": target_code}, code, budget_tokens=1500
+            )
         except Exception:
             context_str = ""
 
@@ -515,11 +396,11 @@ class AdvisorAgent:
             "",
             "Rules:",
             "1. Cite only lines that exist in <TargetFunction>.",
-            "2. If the function is protected by an authorization modifier (e.g. onlyOwner, oO) or by `if (msg.sender != ...) revert/throw`, an access-control finding is a FALSE POSITIVE (`is_true_positive: false`).",
+            "2. If the function is protected by an authorization modifier (e.g. onlyOwner, oO) or by `if (msg.sender != ...) revert/throw`, an access-control finding is a FALSE POSITIVE (`is_true_positive: false`). A check on `tx.origin` is NOT a valid guard: for SWC-115 (tx.origin authentication) that check is the vulnerability itself.",
             "3. If this candidate is a false positive, set `is_true_positive: false` and describe the protective guard in `root_cause`.",
             "",
             f'<TargetFunction lines="{start_line}-{end_line}">',
-            target_code if target_code else code[:2000],
+            target_code,
             "</TargetFunction>",
             "",
             "<Context>",
@@ -534,87 +415,22 @@ class AdvisorAgent:
 
     # ── per-vulnerability advice ────────────────────────────────────────────
     # [HÀM CHÍNH] Xử lý MỘT finding: tra tri thức -> dựng prompt -> gọi LLM (generate_json) -> parse thành RepairSuggestion.
-    # Lọc evidence_lines chỉ giữ dòng nằm trong hàm. LLM lỗi -> trả RepairSuggestion có error (không làm hỏng cả batch).
+    # LLM lỗi -> trả RepairSuggestion có error (không làm hỏng cả batch).
     def advise_one(self, code: str, vulnerability: Dict[str, Any]) -> RepairSuggestion:
-        swc = vulnerability.get("swc") or "Unknown"
-        title = vulnerability.get("title") or "Unknown vulnerability"
-        severity = vulnerability.get("severity") or "Unknown"
-
-        target_code = (
-            vulnerability.get("unit_code")
-            or vulnerability.get("vulnerable_code")
-            or vulnerability.get("matched_text")
-            or code
+        retrieved = self.knowledge_base.retrieve(
+            vulnerability.get("swc") or "Unknown", code=_target_code(vulnerability, code)
         )
-        retrieved = self.knowledge_base.retrieve(swc, code=target_code)
         knowledge_block = self._build_knowledge_block(vulnerability, retrieved)
         prompt = self._build_prompt(code, vulnerability, knowledge_block)
 
-        sources = list(dict.fromkeys(retrieved.get("titles", [])))[:3]
-
         try:
-            data = self.llm.generate_json(
-                prompt,
-                ADVISOR_SYSTEM_INSTRUCTION,
-                response_schema=REPAIR_RESPONSE_SCHEMA,
-            )
+            data = self.llm.generate_json(prompt, ADVISOR_SYSTEM_INSTRUCTION)
         except Exception as error:  # noqa: BLE001 - reported per finding, never aborts the batch
-            return RepairSuggestion(
-                swc=swc,
-                vulnerability_name=title,
-                severity=severity,
-                root_cause="",
-                impact="",
-                repair_steps=[],
-                fixed_code="",
-                prevention=[],
-                knowledge_sources=sources,
-                error=f"{type(error).__name__}: {error}",
-                is_true_positive=True,
-                evidence_lines=[],
-                fix_strategy="",
-            )
-
-        # Ép giá trị (chuỗi/list) về list chuỗi không rỗng.
-        def as_list(value: Any) -> List[str]:
-            if isinstance(value, list):
-                return [str(item).strip() for item in value if str(item).strip()]
-            text = str(value or "").strip()
-            return [text] if text else []
-
-        is_true_positive = bool(data.get("is_true_positive", True))
-        raw_lines = data.get("evidence_lines", [])
-        evidence_lines = []
-        if isinstance(raw_lines, list):
-            for x in raw_lines:
-                try:
-                    evidence_lines.append(int(x))
-                except (ValueError, TypeError):
-                    pass
-
-        st_line = vulnerability.get("start_line")
-        end_line = vulnerability.get("end_line")
-        if st_line is not None and end_line is not None and evidence_lines:
-            evidence_lines = [ln for ln in evidence_lines if st_line <= ln <= end_line]
-
-        root_cause = str(data.get("root_cause") or "").strip()
-        fix_strategy = str(data.get("fix_strategy") or "").strip()
-        attack_scenario = str(data.get("attack_scenario") or "").strip()
-        preconditions = as_list(data.get("preconditions"))
+            return RepairSuggestion(error=f"{type(error).__name__}: {error}")
 
         return RepairSuggestion(
-            swc=swc,
-            vulnerability_name=str(data.get("vulnerability_name") or title).strip(),
-            severity=severity,
-            root_cause=root_cause,
-            impact=attack_scenario or str(data.get("impact") or "").strip(),
-            repair_steps=[fix_strategy] if fix_strategy else [],
-            fixed_code="",
-            prevention=preconditions,
-            knowledge_sources=sources,
-            is_true_positive=is_true_positive,
-            evidence_lines=evidence_lines,
-            fix_strategy=fix_strategy,
-            attack_scenario=attack_scenario,
-            preconditions=preconditions,
+            is_true_positive=bool(data.get("is_true_positive", True)),
+            root_cause=str(data.get("root_cause") or "").strip(),
+            impact=str(data.get("attack_scenario") or "").strip() or str(data.get("impact") or "").strip(),
+            fix_strategy=str(data.get("fix_strategy") or "").strip(),
         )

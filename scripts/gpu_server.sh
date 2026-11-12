@@ -34,7 +34,7 @@ deploy() {
   # Code and the dataset only; checkpoints and weights stay on the server.
   rsync -avz --progress -e "ssh -p $SERVER_PORT" \
     --exclude "__pycache__" --exclude "*.pyc" --exclude "*.log" --exclude "*.pid" \
-    --exclude "codellama-*" --exclude "checkpoint-*" --exclude "*.safetensors" --exclude "*.bin" \
+    --exclude "checkpoint-*" --exclude "*.safetensors" --exclude "*.bin" \
     gpu_server/ "$TARGET:$REMOTE_DIR/"
   [[ -f "$DATASET" ]] && rsync -avz --progress -e "ssh -p $SERVER_PORT" "$DATASET" "$TARGET:$REMOTE_DIR/"
   local cfg="models/$MODEL_NAME/threshold_config.json"

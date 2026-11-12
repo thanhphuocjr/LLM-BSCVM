@@ -24,7 +24,7 @@ if [ -f "$PID_FILE" ]; then
 fi
 
 if [ "$RUNNING" -eq 0 ]; then
-    # Kiểm tra xem có tiến trình nào đang listen port 8000
+    # Kiểm tra xem có tiến trình nào đang listen port $PORT
     PORT_PID=$(lsof -ti :$PORT 2>/dev/null || true)
     if [ -n "$PORT_PID" ]; then
         echo "🟡 Cổng $PORT đang mở (PID: $PORT_PID), nhưng PID file không khớp."

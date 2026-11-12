@@ -55,86 +55,67 @@ def _line_number(code: str, offset: int) -> int:
     return code.count("\n", 0, max(0, offset)) + 1
 
 
-# Nếu tại vị trí index là comment (//, /* */) hoặc chuỗi ('...', "..."), trả về vị trí ngay sau nó;
-# ngược lại trả None. Mục đích: khi đếm ngoặc { } thì bỏ qua comment/chuỗi.
-def _skip_comment_or_string(code: str, index: int) -> int | None:
-    if code.startswith("//", index):
-        newline = code.find("\n", index + 2)
-        return len(code) if newline < 0 else newline + 1
-    if code.startswith("/*", index):
-        end = code.find("*/", index + 2)
-        return len(code) if end < 0 else end + 2
-    if code[index] in {'"', "'"}:
-        quote = code[index]
-        cursor = index + 1
-        while cursor < len(code):
-            if code[cursor] == "\\":
-                cursor += 2
-                continue
-            if code[cursor] == quote:
-                return cursor + 1
-            cursor += 1
-        return len(code)
-    return None
+# Comment hoặc chuỗi, theo đúng thứ tự xuất hiện. Regex luôn khớp token SỚM NHẤT trước nên `//` nằm trong
+# "http://..." thuộc về chuỗi, còn dấu ' trong `// don't` thuộc về comment. Comment / chuỗi chưa đóng kéo tới
+# hết mã.
+_NONCODE_RE = re.compile(
+    r"//[^\n]*"                               # comment một dòng
+    r"|/\*[\s\S]*?(?:\*/|\Z)"                 # comment khối
+    r"|\"(?:\\[\s\S]?|[^\"\\])*(?:\"|\Z)"     # "chuỗi" (có ký tự thoát)
+    r"|'(?:\\[\s\S]?|[^'\\])*(?:'|\Z)"        # 'chuỗi'
+)
+_NOT_NEWLINE_RE = re.compile(r"[^\n]")
 
 
-# Thay mọi ký tự trong comment/chuỗi bằng dấu cách (giữ nguyên xuống dòng và độ dài).
-# Mục đích: regex tìm "function"/"contract" không bắt nhầm chữ nằm trong comment hay string,
-# mà offset vẫn khớp với mã gốc.
-def _mask_noncode(code: str) -> str:
-    masked = list(code)
-    cursor = 0
-    while cursor < len(code):
-        end = _skip_comment_or_string(code, cursor)
-        if end is None:
-            cursor += 1
-            continue
-        for index in range(cursor, end):
-            if masked[index] != "\n":
-                masked[index] = " "
-        cursor = end
-    return "".join(masked)
+# [NƠI DUY NHẤT BỎ COMMENT CỦA CẢ PIPELINE] Thay mọi ký tự trong comment (và chuỗi, nếu mask_strings=True)
+# bằng dấu cách, giữ nguyên xuống dòng và độ dài -> offset / số dòng vẫn khớp với mã gốc.
+#   mask_strings=True : che cả comment lẫn chuỗi (Phase 0 tìm hàm, Phase 1A chạy luật, tìm bất biến của hàm).
+#   mask_strings=False: chỉ che comment, giữ chuỗi (chữ hiển thị trong prompt, behaviour guard của Fixer).
+# Dùng bởi: code_units (Phase 0), contract_context, static_analyzer._clean_code (Phase 1A), behavior_guard (Phase 4).
+def mask_noncode(code: str, *, mask_strings: bool = True) -> str:
+    # Thay một comment/chuỗi bằng dấu cách (giữ "\n"); chuỗi được giữ nguyên khi mask_strings=False.
+    def blank(match: re.Match[str]) -> str:
+        text = match.group()
+        if not mask_strings and text[0] in "\"'":
+            return text
+        return _NOT_NEWLINE_RE.sub(" ", text)
+
+    return _NONCODE_RE.sub(blank, code)
 
 
-# Từ chỗ bắt đầu khai báo hàm, tìm vị trí kết thúc: gặp ";" trước -> hàm không thân (interface/abstract);
-# gặp "{" -> đếm ngoặc đến "}" khớp. Trả về (end_offset, has_body).
-def _declaration_end(code: str, declaration_start: int, search_start: int) -> tuple[int, bool]:
+# Từ chỗ bắt đầu khai báo hàm, tìm vị trí kết thúc trên mã ĐÃ CHE comment/chuỗi (mask_noncode giữ nguyên độ dài,
+# nên offset khớp với mã gốc): gặp ";" trước -> hàm không thân (interface/abstract); gặp "{" -> đếm ngoặc tới "}" khớp.
+# Trả về (end_offset, has_body).
+def _declaration_end(masked_code: str, search_start: int) -> tuple[int, bool]:
     """
     Tìm vị trí kết thúc của khai báo hàm và xác định hàm có thân (has_body) hay không.
     Trả về: (end_offset, has_body)
     """
     cursor = search_start
-    while cursor < len(code):
-        skipped = _skip_comment_or_string(code, cursor)
-        if skipped is not None:
-            cursor = skipped
-            continue
-        if code[cursor] == ";":
+    while cursor < len(masked_code):
+        char = masked_code[cursor]
+        if char == ";":
             # Hàm interface / abstract không có body
             return cursor + 1, False
-        if code[cursor] == "{":
-            depth = 1
-            cursor += 1
-            while cursor < len(code) and depth:
-                skipped = _skip_comment_or_string(code, cursor)
-                if skipped is not None:
-                    cursor = skipped
-                    continue
-                if code[cursor] == "{":
+        if char == "{":
+            depth = 0
+            for position in range(cursor, len(masked_code)):
+                if masked_code[position] == "{":
                     depth += 1
-                elif code[cursor] == "}":
+                elif masked_code[position] == "}":
                     depth -= 1
-                cursor += 1
-            return cursor, True
+                    if depth == 0:
+                        return position + 1, True
+            return len(masked_code), True
         cursor += 1
-    return len(code), False
+    return len(masked_code), False
 
 
-# Tìm contract/library/interface gần nhất phía trước offset -> (tên, loại).
+# Tìm contract/library/interface gần nhất phía trước offset (trên mã đã che comment/chuỗi) -> (tên, loại).
 # Mục đích: gán unit vào đúng contract để tạo unit_id "Contract.func".
-def _contract_at(code: str, offset: int) -> tuple[str, str]:
+def _contract_at(masked_code: str, offset: int) -> tuple[str, str]:
     """Trả về (contract_name, contract_kind) tại vị trí offset."""
-    matches = list(CONTRACT_RE.finditer(_mask_noncode(code), 0, offset))
+    matches = list(CONTRACT_RE.finditer(masked_code, 0, offset))
     if matches:
         return matches[-1].group(2), matches[-1].group(1)
     return "UnknownContract", "contract"
@@ -144,11 +125,11 @@ def _contract_at(code: str, offset: int) -> tuple[str, str]:
 # Cách làm: che comment/chuỗi -> regex tìm "function X(", "function(" (fallback cũ), constructor/receive/fallback
 # -> tìm điểm kết thúc -> xác định contract chứa nó, visibility, view/pure. Nếu không có hàm nào thì
 # trả về 1 unit "source" chứa toàn bộ file.
-# Gọi bởi: orchestrator.run_pipeline, batch_audit, các bước kiểm chứng Phase 5.
+# Gọi bởi: orchestrator.run_pipeline, các bước kiểm chứng Phase 5.
 def parse_code_units(code: str) -> list[CodeUnit]:
     units: list[CodeUnit] = []
     names: dict[str, int] = {}
-    masked_code = _mask_noncode(code)
+    masked_code = mask_noncode(code)
     for match in DECLARATION_RE.finditer(masked_code):
         if match.group("unnamed_fallback"):
             name = "fallback"
@@ -156,8 +137,8 @@ def parse_code_units(code: str) -> list[CodeUnit]:
         else:
             name = match.group("function") or match.group("special") or "unknown"
             kind = "function" if match.group("function") else name
-        end, has_body = _declaration_end(code, match.start(), match.end())
-        contract_name, contract_kind = _contract_at(code, match.start())
+        end, has_body = _declaration_end(masked_code, match.end())
+        contract_name, contract_kind = _contract_at(masked_code, match.start())
         if contract_kind == "interface":
             has_body = False
 
@@ -196,7 +177,7 @@ def parse_code_units(code: str) -> list[CodeUnit]:
             unit_id="source",
             kind="source",
             name="source",
-            contract_name=_contract_at(code, len(code))[0],
+            contract_name=_contract_at(masked_code, len(code))[0],
             start_offset=code.find(stripped) if stripped else 0,
             end_offset=len(code),
             start_line=1,

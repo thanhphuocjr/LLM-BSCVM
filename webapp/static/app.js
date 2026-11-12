@@ -473,7 +473,7 @@
     }
   }
 
-  // Nút "Chạy": gửi POST /api/audit/submit với mã + tên file (tool Phase 5 = slither) rồi track(run_id).
+  // Nút "Chạy": gửi POST /api/audit/submit với mã + tên file rồi track(run_id).
   async function startRun() {
     const code = el.code.value;
     if (!code.trim()) {
@@ -491,7 +491,6 @@
         body: JSON.stringify({
           code,
           file_name: el.fileName.value.trim() || 'Contract.sol',
-          tools: 'slither',
         }),
       });
       track(body.run_id, Date.now());
@@ -584,26 +583,31 @@
     }
   }
 
-  // Đổi overall_verdict của Phase 5 thành nhãn bản vá: "Đã vá" / "Chưa vá" (kèm lý do: không biên dịch, sai hành vi,
-  // vẫn còn lỗ hổng...) / "Không cần" / "Cần xem lại"...
+  // Đổi overall_verdict của Phase 5 (final_verification.decide_overall_verdict) thành nhãn bản vá:
+  // "Đã vá" / "Chưa vá" (kèm lý do) / "Không cần" / "Chưa rõ" (kèm lý do).
   function patchStatus(data) {
     const raw = String(data.manifest?.verification?.overall_verdict || data.verification_verdict || '');
     const v = raw.toLowerCase();
     if (!v || v === 'pending') return { label: '—', rejected: false };
     if (v.includes('no patch required')) return { label: 'Không cần', rejected: false };
-    if (v.includes('accepted') || v === 'pass' || v === 'verified') return { label: 'Đã vá', rejected: false };
+    if (v.includes('accepted')) return { label: 'Đã vá', rejected: false };
     if (v.includes('rejected')) {
       let sub = '';
       if (v.includes('compile')) sub = 'Không biên dịch được';
       else if (v.includes('behavioral')) sub = 'Sai hành vi';
-      else if (v.includes('residual') || v.includes('introduced')) sub = 'Vẫn còn lỗ hổng';
+      else if (v.includes('residual') || v.includes('introduced') || v.includes('still detect')) sub = 'Vẫn còn lỗ hổng';
       else if (v.includes('no effective')) sub = 'Chưa tạo được bản vá';
       return { label: 'Chưa vá', sub, rejected: true };
     }
-    if (v === 'warn') return { label: 'Cần xem lại', rejected: false };
-    if (v.includes('pending') || v.includes('awaiting')) return { label: 'Đang chờ', rejected: false };
-    if (v.includes('skipped')) return { label: 'Bỏ qua', rejected: false };
-    if (v.includes('generated')) return { label: 'Có bản vá', sub: 'Chưa kiểm chứng', rejected: false };
+    if (v.startsWith('inconclusive')) {
+      let sub = '';
+      if (v.includes('no patch was generated')) sub = 'Chưa tạo được bản vá';
+      else if (v.includes('repair target')) sub = 'Không có hàm để vá';
+      else if (v.includes('incomplete')) sub = 'Chưa chạy xong';
+      else if (v.includes('in isolation')) sub = 'Không biên dịch độc lập được';
+      else if (v.includes('slither')) sub = 'Slither chưa kết luận';
+      return { label: 'Chưa rõ', sub, rejected: false };
+    }
     return { label: raw, rejected: false };
   }
 
@@ -636,8 +640,8 @@
           confidence !== null && `Tin cậy ${confidence.toFixed(2)}`,
           cvss !== null && `CVSS ${cvss.toFixed(1)}`,
         ].filter(Boolean);
-        const description = f.description || f.rationale || assessment.impact || '';
-        const remediation = f.remediation || f.recommendation || '';
+        const description = f.description || f.root_cause || '';
+        const remediation = f.remediation || '';
         return `
           <div class="finding">
             <button class="finding-row" data-act="toggle">
@@ -790,7 +794,7 @@
   async function loadHistory() {
     if (!el.runList.innerHTML) el.runList.innerHTML = '<div class="empty">Đang tải…</div>';
     try {
-      // Folders without any run artifacts (batch containers) are not audits.
+      // Folders without any run artifacts are not audits.
       state.runs = (await getJson('/api/runs'))
         .filter((r) => r.status === 'running' || r.created_at || r.verdict !== 'Unknown')
         .sort((a, b) =>

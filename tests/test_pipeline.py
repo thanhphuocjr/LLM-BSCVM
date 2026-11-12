@@ -14,11 +14,12 @@ from E2E.phase1a_static.static_runner import run_static
 from E2E.phase1b_rag.rag_runner import run_rag
 from E2E.phase4_fixer.patching import apply_unit_patches
 from E2E.phase5_verifier.behavior_verifier import verify_patch_behavior
-from E2E.phase5_verifier.final_verification import build_repair_feedback
+from E2E.phase5_verifier.final_verification import build_verification_channels
 from E2E.phase6_reporter.report import (
+    DEFAULT_RECOMMENDATIONS,
     apply_verification_to_report,
     build_code_comparison_rows,
-    normalize_recommendations,
+    build_report_data,
     render_html,
     render_markdown,
 )
@@ -213,8 +214,8 @@ class DetectorTests(unittest.TestCase):
 
 # Kiểm tra tích hợp Phase 5 + Phase 6: feedback, hồi quy hành vi, báo cáo, ma trận tool.
 class IntegrationTests(unittest.TestCase):
-    # build_repair_feedback ghi rõ lý do thất bại của từng kênh static / RAG / LLM.
-    def test_repair_feedback_contains_failed_static_rag_and_llm_reasons(self) -> None:
+    # build_verification_channels ghi rõ lý do thất bại của từng kênh static / RAG / detector trên bản vá.
+    def test_verification_channels_contain_failed_static_rag_and_llm_reasons(self) -> None:
         static_result = {
             "status": "ok",
             "verdict": "Vulnerable",
@@ -241,20 +242,19 @@ class IntegrationTests(unittest.TestCase):
         detector = {
             "status": "ok",
             "verdict": "Vulnerable",
-            "vulnerability_reason": "The external call still occurs before the balance update.",
-            "unit_results": [{"unit_id": "C.withdraw", "label": "Vulnerable"}],
+            "unit_results": [{"unit_id": "C.withdraw", "label": "Vulnerable", "vulnerability_probability": 0.91}],
         }
-        feedback = build_repair_feedback(
-            static_result,
-            rag_result,
-            detector,
-            {},
-            attempt=1,
+        channels = build_verification_channels(
+            {"compile": {"status": "passed"}},
+            static_result=static_result,
+            rag_result=rag_result,
+            detector_fixed=detector,
         )
-        self.assertFalse(feedback["passed"])
-        self.assertEqual(feedback["components"]["static"]["findings"][0]["swc"], "SWC-107")
-        self.assertIn("checks-effects-interactions", feedback["components"]["rag"]["findings"][0]["remediation"])
-        self.assertIn("external call", feedback["components"]["llm"]["reason"])
+        self.assertFalse(any(channels[name]["passed"] for name in ("static", "rag", "llm")))
+        self.assertTrue(channels["compile"]["passed"])
+        self.assertEqual(channels["static"]["findings"][0]["swc"], "SWC-107")
+        self.assertIn("checks-effects-interactions", channels["rag"]["findings"][0]["remediation"])
+        self.assertEqual(channels["llm"]["reason"], "The neural detector still flags: C.withdraw (0.910).")
 
     # Bản vá làm mất hành vi -> verify_patch_behavior failed và báo cáo ghi "must not be deployed" dù model nói đã sửa.
     def test_behavioral_regression_overrides_model_narrative(self) -> None:
@@ -319,12 +319,46 @@ class IntegrationTests(unittest.TestCase):
         )
         self.assertEqual(report_data["phase_rows"][0]["status"], "complete")
 
-    # normalize_recommendations đổi khuyến nghị dạng dict thành chuỗi "title: description".
-    def test_report_normalizes_object_recommendations(self) -> None:
-        result = normalize_recommendations(
-            [{"title": "Run tests", "description": "Execute the full project suite."}]
+    # Bản vá bị reject: chỉ finding đã vá bị ghi "Rejected"; finding chưa vá giữ nguyên trạng thái.
+    def test_rejected_patch_keeps_status_of_unpatched_findings(self) -> None:
+        report_data = {
+            "executive_summary": "",
+            "findings": [
+                {"self_check_status": "PASS", "verification_status": "self-check passed"},
+                {"self_check_status": "NOT_PATCHED", "verification_status": "Not patched"},
+            ],
+            "phase_rows": [],
+            "recommendations": [],
+        }
+        apply_verification_to_report(
+            report_data,
+            {"status": "complete", "overall_verdict": "Patch rejected: fixed code does not compile"},
         )
-        self.assertEqual(result, ["Run tests: Execute the full project suite."])
+        statuses = [item["verification_status"] for item in report_data["findings"]]
+        self.assertEqual(statuses[0], "Rejected by deterministic verifier")
+        self.assertEqual(statuses[1], "Not patched")
+
+    # Phase 6 tự dựng tóm tắt (số finding, số bị Advisor loại, số bản vá) và dùng bộ khuyến nghị mặc định.
+    def test_report_summary_and_recommendations_come_from_phase_6(self) -> None:
+        request = {
+            "run_id": "test-summary",
+            "source": {"file_name": "Bank.sol", "sha256": "0" * 64, "code": "contract Bank {}"},
+            "code_units": [],
+            "local_phase1": {"static": {"findings": []}, "rag": {"findings": []}},
+        }
+        finding = {"finding_id": "SWC-107:Bank.withdraw", "swc": "SWC-107", "unit_id": "Bank.withdraw",
+                   "title": "Reentrancy", "severity": "Critical"}
+        remote = {"phases": {
+            "detector": {"confirmed_findings": [finding], "dismissed_findings": [dict(finding, swc="SWC-102")]},
+            "fixer": {"patch_outcomes": [{"unit_id": "Bank.withdraw", "status": "applied"}]},
+        }}
+        data = build_report_data(request, {"verdict": "Vulnerable", "score": 0.9}, remote, {})
+        self.assertEqual(
+            data["executive_summary"],
+            "Audit completed using the GPU server (Qwen2.5-Coder-14B v13) for run test-summary. "
+            "1 confirmed finding(s), 1 dismissed by the Advisor, 1 patch(es) applied.",
+        )
+        self.assertEqual(data["recommendations"], DEFAULT_RECOMMENDATIONS)
 
     # Báo cáo có bảng so sánh mã gốc / mã vá và đánh dấu dòng thay đổi.
     def test_fixed_code_report_renders_side_by_side_diff(self) -> None:
@@ -337,6 +371,7 @@ class IntegrationTests(unittest.TestCase):
             "title": "Smart Contract Audit Report",
             "run_id": "diff-test",
             "analyzed_object": "C",
+            "contract_name": "C",
             "file_name": "C.sol",
             "source_sha256": "abc",
             "detection_result": "Vulnerable",
@@ -357,7 +392,7 @@ class IntegrationTests(unittest.TestCase):
             "disclaimer": "Disclaimer.",
         }
         markdown = render_markdown(report_data)
-        html_report = render_html(report_data, markdown)
+        html_report = render_html(report_data)
         self.assertIn("Source Code (Sample)", markdown)
         self.assertIn("Fixed Source Code", markdown)
         self.assertIn("<mark>    uint256 x;</mark>", markdown)
@@ -481,19 +516,13 @@ class IntegrationTests(unittest.TestCase):
                         }
                     ],
                 },
-                "reporter": {
-                    "status": "ok",
-                    "executive_summary": "One critical reentrancy issue was identified and patched.",
-                    "recommendations": ["Run the complete project test suite."],
-                },
             },
         }
         tool_result = {
             "component": "tool_verification",
             "status": "ok",
             "policy_verdict": "passed",
-            "policy_reason": "9/9 tools completed without residual target findings.",
-            "summary": {"pass": 9, "fail": 0, "warn": 0, "error": 0},
+            "policy_reason": "1/1 tools completed without residual target findings.",
             "compile": {"status": "passed"},
             "slither": {"status": "passed", "findings": []},
             "tools": {
@@ -544,7 +573,7 @@ class IntegrationTests(unittest.TestCase):
             )
             self.assertEqual(
                 disagreement["verification"]["overall_verdict"],
-                "Patch accepted by security tool matrix",
+                "Patch accepted by Slither",
             )
             disagreement_report = json.loads(
                 (Path(temp_dir) / disagreement_run_id / "phase6_report_data.json").read_text(
@@ -565,7 +594,6 @@ class IntegrationTests(unittest.TestCase):
         remote["phases"]["fixer"] = {
             "status": "error",
             "fixed_code": code,
-            "patches": [],
             "patch_outcomes": [],
         }
         remote["phases"]["verifier"] = {
@@ -573,12 +601,6 @@ class IntegrationTests(unittest.TestCase):
             "overall_verdict": "Fixed",
             "verifications": [],
         }
-        remote["phases"]["reporter"]["recommendations"] = [
-            {
-                "title": "Run tests",
-                "description": "Execute the complete project test suite.",
-            }
-        ]
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch("E2E.phase5_verifier.final_verification.verify_security_tool_matrix", return_value=tool_result):
                 rejected = run_pipeline(
@@ -601,39 +623,32 @@ class IntegrationTests(unittest.TestCase):
                 report_data["patch_verdict"],
                 "Patch rejected: no effective patch was applied",
             )
-            self.assertIn(
-                "Run tests: Execute the complete project test suite.",
-                report_data["recommendations"],
-            )
+            # No patch exists, so the summary says so and no "do not deploy the patch" warning is added.
+            self.assertIn("No patch was verified: Patch rejected: no effective patch was applied",
+                          report_data["executive_summary"])
+            self.assertEqual(report_data["recommendations"], DEFAULT_RECOMMENDATIONS)
 
-    # Kiểm tra Docker không làm lỗi; tool SKIPPED đúng và _policy_verdict ra passed khi phù hợp.
-    def test_docker_availability_and_tool_policy(self) -> None:
-        from E2E.common.security_tools import _is_docker_available
+    # Slither không chạy được -> SKIPPED và kết luận inconclusive; chạy sạch -> passed.
+    def test_tool_policy_for_skipped_and_clean_slither(self) -> None:
         from E2E.phase5_verifier.tool_matrix import _evaluate_tool_result, _policy_verdict
 
-        self.assertIsInstance(_is_docker_available(), bool)
-
         skipped_eval = _evaluate_tool_result(
-            "osiris",
+            "slither",
             "unavailable",
             [],
             [],
             {"reentrancy"},
-            error="Docker daemon is not running",
+            error="slither not installed",
         )
         self.assertEqual(skipped_eval["verdict"], "SKIPPED")
+        self.assertEqual(_policy_verdict({"slither": skipped_eval})["verdict"], "inconclusive")
 
-        policy = _policy_verdict({
-            "slither": {"run_status": "completed", "verdict": "PASS"},
-            "osiris": {"run_status": "unavailable", "verdict": "SKIPPED"},
-        })
+        policy = _policy_verdict({"slither": {"run_status": "completed", "verdict": "PASS"}})
         self.assertEqual(policy["verdict"], "passed")
 
     # Slither FAIL thì báo cáo Markdown/HTML phải ghi "failed" (không bao giờ "passed").
     def test_slither_status_consistency_when_failed(self) -> None:
         from E2E.phase5_verifier.tool_matrix import _evaluate_tool_result
-        from E2E.phase6_reporter.report import build_report_data, render_html, render_markdown
-
         evaluated_slither = _evaluate_tool_result(
             "slither",
             "completed",
@@ -684,9 +699,94 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("- **Slither:** failed", md)
         self.assertNotIn("- **Slither:** passed", md)
 
-        html = render_html(report_data, md)
+        html = render_html(report_data)
         self.assertIn("Slither: <b>failed</b>", html)
         self.assertNotIn("Slither: <b>passed</b>", html)
+
+    # Một mức độ duy nhất: báo cáo dùng mức CVSS của Phase 3 (phân bố, highest risk, tiêu đề), giữ mức lúc phát hiện.
+    def test_report_severity_is_the_cvss_level(self) -> None:
+        finding = {
+            "finding_id": "SWC-107:Bank.withdraw", "swc": "SWC-107", "unit_id": "Bank.withdraw",
+            "title": "Reentrancy", "severity": "Critical", "confidence": 0.99, "sources": ["static"],
+        }
+        request = {
+            "run_id": "test-severity",
+            "source": {"file_name": "Bank.sol", "sha256": "0" * 64, "code": "contract Bank {}"},
+            "code_units": [],
+            "local_phase1": {"static": {"findings": []}, "rag": {"findings": []}},
+        }
+        remote = {
+            "phases": {
+                "detector": {"confirmed_findings": [finding], "dismissed_findings": []},
+                "assessor": {"assessments": [{
+                    "finding_id": "SWC-107:Bank.withdraw", "swc": "SWC-107", "unit_id": "Bank.withdraw",
+                    "severity": "High", "cvss_score": 8.2, "cvss_source": "llm", "repair_priority": 1,
+                }]},
+            }
+        }
+        data = build_report_data(request, {"verdict": "Vulnerable", "score": 0.9}, remote, {})
+        self.assertEqual(data["findings"][0]["severity"], "High")
+        self.assertEqual(data["findings"][0]["detected_severity"], "Critical")
+        self.assertEqual(data["risk_level"], "High")
+        self.assertEqual(dict(data["distribution"]), {"High": 1})
+        md = render_markdown(data)
+        self.assertIn("#### 1. Reentrancy (SWC-107) - High", md)
+        self.assertIn("8.2 (High, LLM-selected metrics, detected as Critical); repair priority #1", md)
+
+    # Lượt 2: báo cáo chỉ liệt kê finding Advisor xác nhận; finding bị loại nằm ở mục 4.5.
+    # Bản vá accepted nhưng detector vẫn báo (FLAGGED) -> "Fixed ... detector disagreement", không còn FLAGGED.
+    def test_report_uses_advisor_confirmed_findings_and_final_verdict(self) -> None:
+        reentrancy = {
+            "finding_id": "SWC-107:Bank.withdraw", "swc": "SWC-107", "unit_id": "Bank.withdraw",
+            "title": "Reentrancy", "severity": "Critical", "confidence": 0.99, "sources": ["static"],
+        }
+        pragma = {
+            "finding_id": "SWC-102:contract", "swc": "SWC-102", "unit_id": None,
+            "title": "Outdated Compiler Version", "severity": "Low", "confidence": 0.9, "sources": ["slither"],
+        }
+        request = {
+            "run_id": "test-report-findings",
+            "source": {"file_name": "Bank.sol", "sha256": "0" * 64, "code": "contract Bank {}"},
+            "code_units": [],
+            "local_phase1": {"static": {"findings": []}, "rag": {"findings": []}},
+        }
+        fused = {"verdict": "Vulnerable", "score": 0.97, "findings": [reentrancy, pragma]}
+        remote = {
+            "phases": {
+                "detector": {"confirmed_findings": [reentrancy], "dismissed_findings": [pragma]},
+                "advisor": {"suggestions": [], "false_positives": ["SWC-102:contract"]},
+                "verifier": {
+                    "attempts_count": 3,
+                    "max_attempts": 3,
+                    "verifications": [{"finding_id": "SWC-107:Bank.withdraw", "status": "FLAGGED"}],
+                },
+                "fixer": {"fixed_code": "contract Bank { }"},
+            }
+        }
+        report_data = build_report_data(request, fused, remote, {"behavioral": {"status": "passed"}})
+        self.assertEqual([f["swc"] for f in report_data["findings"]], ["SWC-107"])
+        self.assertEqual([f["swc"] for f in report_data["dismissed_findings"]], ["SWC-102"])
+
+        apply_verification_to_report(
+            report_data,
+            {
+                "status": "complete",
+                "overall_verdict": "Patch accepted by Slither",
+                "detector_disagreement": True,
+                "attempts_count": 3,
+                "max_attempts": 3,
+                "fixed_detection": {"threshold": 0.7},
+                "fixed_unit_results": [{"unit_id": "Bank.withdraw", "vulnerability_probability": 0.8962}],
+            },
+        )
+        status = report_data["findings"][0]["verification_status"]
+        self.assertTrue(status.startswith("Fixed: Patch accepted"))
+        self.assertIn("p=0.8962 >= threshold 0.70", status)
+        self.assertIn("Final verification: Patch accepted", report_data["executive_summary"])
+        md = render_markdown(report_data)
+        self.assertIn("- **Fix attempts:** 3/3 attempt(s)", md)
+        self.assertIn("### 4.5 Findings Dismissed by the Advisor", md)
+        self.assertNotIn("FLAGGED", md)
 
 
 # Kiểm tra cấu hình detector v13 có trên máy (cần thư mục models/).

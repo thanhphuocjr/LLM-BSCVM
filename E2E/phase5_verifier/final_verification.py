@@ -1,16 +1,16 @@
 """
 Phase 5 - final verification of the patched contract, run by the orchestrator.
 
-1. Security tool matrix on original vs patched source   (tool_matrix.py)
+1. Compile + Slither on original vs patched source      (tool_matrix.py)
 2. Behaviour check: compile both, compare the ASTs      (behavior_verifier.py)
 3. Static + RAG re-run on the patched source, scoped to the findings of the patched
    units (an unrelated pre-existing finding elsewhere does not reject the patch)
 4. `decide_overall_verdict`: one verdict for phase5_verification.json, checked in a
-   fixed order (behaviour regression > compile failure > no effective patch > tool
-   matrix failure > residual static/RAG finding > ...).
+   fixed order (behaviour regression > compile failure > no effective patch > Slither
+   failure > residual static/RAG finding > ...).
 
-`build_tool_repair_feedback` turns all channels into the per-channel summary shown in
-the report (and, for a repair loop, into feedback for the next Fixer attempt).
+`build_verification_channels` turns all channels into the per-channel table of the
+report (section 5.5 "Verification Results").
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any
 
 from E2E.common.safe_run import safe_run
-from E2E.config import MAX_FIX_ATTEMPTS
 from E2E.phase0_parsing.code_units import parse_code_units
 from E2E.phase1a_static.static_runner import run_static
 from E2E.phase1b_rag.rag_runner import run_rag
@@ -29,10 +28,7 @@ from E2E.phase5_verifier.tool_matrix import verify_security_tool_matrix
 
 # Một kênh (static/RAG/detector) được coi là "đạt" khi status=ok và verdict=Safe.
 def _verification_passed(result: dict[str, Any] | None) -> bool:
-    if not result or result.get("status") != "ok":
-        return False
-    verdict = result.get("verdict") or result.get("final_verdict")
-    return verdict == "Safe"
+    return bool(result) and result.get("status") == "ok" and result.get("verdict") == "Safe"
 
 
 # Rút gọn finding chỉ còn các trường cần thiết để đưa vào feedback/báo cáo.
@@ -59,92 +55,46 @@ def _compact_feedback_findings(findings: list[dict[str, Any]]) -> list[dict[str,
     ]
 
 
-# Tìm lý do vì sao detector vẫn coi bản vá là lỗi (lý do có sẵn, bằng chứng verifier, hoặc liệt kê hàm + xác suất).
-def _llm_vulnerability_reason(
-    detector: dict[str, Any] | None,
-    verifier: dict[str, Any] | None,
-) -> str:
+# Lý do detector vẫn coi bản vá là lỗi: liệt kê các hàm đã vá còn bị gắn Vulnerable kèm xác suất.
+def _detector_reason(detector: dict[str, Any] | None) -> str:
     detector = detector or {}
-    verifier = verifier or {}
-    for value in (
-        detector.get("vulnerability_reason"),
-        verifier.get("vulnerability_reason"),
-        verifier.get("reason"),
-    ):
-        if str(value or "").strip():
-            return str(value).strip()
-
-    evidence = [
-        str(item.get("evidence") or "").strip()
-        for item in verifier.get("verifications", [])
-        if str(item.get("status") or "").lower() not in {"fixed", "safe"}
-        and str(item.get("evidence") or "").strip()
-    ]
-    if evidence:
-        return " ".join(evidence)
-
     vulnerable_units = [
-        (
-            str(item.get("unit_id") or "fixed source"),
-            float(item.get("vulnerability_probability") or 0.0),
-        )
+        f"{item.get('unit_id') or 'fixed source'} ({float(item.get('vulnerability_probability') or 0.0):.3f})"
         for item in detector.get("unit_results", [])
         if item.get("label") == "Vulnerable"
     ]
     if vulnerable_units:
-        details = ", ".join(f"{unit_id} ({probability:.3f})" for unit_id, probability in vulnerable_units)
-        return f"The neural detector still flags: {details}."
+        return f"The neural detector still flags: {', '.join(vulnerable_units)}."
     return str(detector.get("error") or "The neural detector verification did not return a Safe verdict.")
 
 
-# Tổng hợp kết quả 3 kênh static / RAG / detector trên bản vá thành {passed, components{static, rag, llm}}.
-def build_repair_feedback(
+# Ba kênh static / RAG / detector trên bản vá -> {static, rag, llm}: passed, status, verdict, findings rút gọn, lý do.
+def _local_channel_components(
     fixed_static: dict[str, Any],
     fixed_rag: dict[str, Any],
     detector_fixed: dict[str, Any] | None,
-    verifier: dict[str, Any] | None,
-    *,
-    attempt: int,
-    max_attempts: int = MAX_FIX_ATTEMPTS,
 ) -> dict[str, Any]:
-    static_passed = _verification_passed(fixed_static)
-    rag_passed = _verification_passed(fixed_rag)
+    detector = detector_fixed or {}
     llm_passed = _verification_passed(detector_fixed)
-    return {
-        "attempt": attempt,
-        "max_attempts": min(max(1, max_attempts), MAX_FIX_ATTEMPTS),
-        "passed": static_passed and rag_passed and llm_passed,
-        "components": {
-            "static": {
-                "passed": static_passed,
-                "status": fixed_static.get("status", "unknown"),
-                "verdict": fixed_static.get("verdict", "Unknown"),
-                "findings": _compact_feedback_findings(fixed_static.get("findings", [])),
-                "error": fixed_static.get("error"),
-            },
-            "rag": {
-                "passed": rag_passed,
-                "status": fixed_rag.get("status", "unknown"),
-                "verdict": fixed_rag.get("verdict")
-                or fixed_rag.get("final_verdict")
-                or "Unknown",
-                "findings": _compact_feedback_findings(fixed_rag.get("findings", [])),
-                "error": fixed_rag.get("error"),
-            },
-            "llm": {
-                "passed": llm_passed,
-                "status": (detector_fixed or {}).get("status", "missing"),
-                "verdict": (detector_fixed or {}).get("verdict", "Unknown"),
-                "reason": (
-                    ""
-                    if llm_passed
-                    else _llm_vulnerability_reason(detector_fixed, verifier)
-                ),
-                "unit_results": (detector_fixed or {}).get("unit_results", []),
-                "error": (detector_fixed or {}).get("error"),
-            },
-        },
+    components = {
+        name: {
+            "passed": _verification_passed(result),
+            "status": result.get("status", "unknown"),
+            "verdict": result.get("verdict", "Unknown"),
+            "findings": _compact_feedback_findings(result.get("findings", [])),
+            "error": result.get("error"),
+        }
+        for name, result in (("static", fixed_static), ("rag", fixed_rag))
     }
+    components["llm"] = {
+        "passed": llm_passed,
+        "status": detector.get("status", "missing"),
+        "verdict": detector.get("verdict", "Unknown"),
+        "reason": "" if llm_passed else _detector_reason(detector_fixed),
+        "unit_results": detector.get("unit_results", []),
+        "error": detector.get("error"),
+    }
+    return components
 
 
 # Chạy lại static (Phase 1A) và RAG (Phase 1B) trên MÃ ĐÃ VÁ (không dùng lại kết quả Phase 1 của bản gốc).
@@ -181,7 +131,6 @@ def scope_to_targets(result: dict[str, Any], target_findings: list[dict[str, Any
         **result,
         "findings": residual,
         "verdict": "Vulnerable" if residual else "Safe",
-        "final_verdict": "Vulnerable" if residual else "Safe",
         "scope": "original target findings",
     }
 
@@ -204,18 +153,15 @@ def _compact_tool_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any
     ]
 
 
-# Nhiệm vụ: gộp mọi kênh kiểm chứng (từng tool của ma trận, compile, static, RAG, detector) thành tóm tắt theo kênh
-# (passed/verdict/findings/lý do) + danh sách tool FAIL/ERROR.
-# Mục đích: hiển thị "verification_channels" trong báo cáo Phase 6 (và có thể làm feedback cho lần sửa sau).
-def build_tool_repair_feedback(
+# Nhiệm vụ: gộp mọi kênh kiểm chứng (Slither, compile, static, RAG, detector) thành tóm tắt theo kênh
+# {tên kênh: {passed, verdict, findings, reason, ...}}.
+# Mục đích: bảng "Verification Results" (mục 5.5) của báo cáo Phase 6 (report_data["verification_channels"]).
+def build_verification_channels(
     tool_result: dict[str, Any],
     *,
-    attempt: int,
-    max_attempts: int = MAX_FIX_ATTEMPTS,
     static_result: dict[str, Any] | None = None,
     rag_result: dict[str, Any] | None = None,
     detector_fixed: dict[str, Any] | None = None,
-    verifier: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     components: dict[str, Any] = {}
     for tool_name, result in tool_result.get("tools", {}).items():
@@ -234,19 +180,8 @@ def build_tool_repair_feedback(
             "reason": result.get("detail"),
             "error": result.get("error"),
         }
-    channel_passed = True
-    if any([static_result, rag_result, detector_fixed, verifier]):
-        channel_feedback = build_repair_feedback(
-            static_result or {},
-            rag_result or {},
-            detector_fixed,
-            verifier,
-            attempt=attempt,
-            max_attempts=max_attempts,
-        )
-        for ch_name, ch_data in channel_feedback.get("components", {}).items():
-            components[ch_name] = ch_data
-        channel_passed = channel_feedback.get("passed", True)
+    if any([static_result, rag_result, detector_fixed]):
+        components.update(_local_channel_components(static_result or {}, rag_result or {}, detector_fixed))
 
     compile_info = tool_result.get("compile", {})
     compile_status = compile_info.get("status", "unknown")
@@ -268,36 +203,11 @@ def build_tool_repair_feedback(
         "reason": "Compilation succeeded" if compile_passed else "Compilation failed",
         "error": compile_error,
     }
-    failed_tools = [
-        name
-        for name, component in components.items()
-        if component.get("verdict") == "FAIL"
-    ]
-    errored_tools = [
-        name
-        for name, component in components.items()
-        if component.get("verdict") == "ERROR"
-    ]
-    return {
-        "attempt": attempt,
-        "max_attempts": min(max(1, max_attempts), MAX_FIX_ATTEMPTS),
-        "passed": tool_result.get("policy_verdict") == "passed" and compile_passed,
-        "channel_passed": channel_passed,
-        "policy_verdict": tool_result.get("policy_verdict", "inconclusive"),
-        "policy_reason": tool_result.get("policy_reason", ""),
-        "compile_passed": compile_passed,
-        "compile_status": compile_status,
-        "compiler_error": compile_error,
-        "compile": compile_info,
-        "failed_tools": failed_tools,
-        "errored_tools": errored_tools,
-        "summary": tool_result.get("summary", {}),
-        "components": components,
-    }
+    return components
 
 
 # [KIỂM CHỨNG CUỐI - orchestrator gọi ở lượt 2] Trên bản vá cuối cùng:
-#   1) ma trận tool (Slither, + Mythril/SmartCheck nếu bật) trên bản gốc và bản vá - verify_security_tool_matrix;
+#   1) compile + Slither trên bản gốc và bản vá - verify_security_tool_matrix;
 #   2) kiểm tra hành vi bằng so sánh AST - verify_patch_behavior;
 #   3) chạy lại static + RAG, chỉ xét các finding của hàm đã vá (scope_to_targets).
 # Mỗi bước bọc trong safe_run. Trả (tool_result, behavioral_result, fixed_static, fixed_rag).
@@ -309,9 +219,6 @@ def verify_final_patch(
     fused: dict[str, Any],
     file_name: str,
     source_root: str | Path | None,
-    results_dir: Path,
-    tools: list[str] | None,
-    use_smartbugs: bool,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Steps 1-3 on the final patch -> (tool_result, behavioral_result, fixed_static, fixed_rag)."""
     # Residual checks only concern the functions that were actually patched; unrelated
@@ -331,9 +238,6 @@ def verify_final_patch(
             file_name=file_name,
             source_root=source_root,
             target_findings=patch_targets,
-            results_dir=results_dir,
-            tools=tools,
-            use_smartbugs=use_smartbugs,
         ),
     )
     behavioral_result = safe_run(
@@ -360,9 +264,7 @@ def skipped_verification() -> tuple[dict[str, Any], dict[str, Any]]:
         "policy_verdict": "inconclusive",
         "policy_reason": "Patch execution incomplete or remote runner did not finish.",
         "compile": {"status": "skipped", "reason": "remote runner incomplete"},
-        "smartbugs": {"status": "skipped", "reason": "remote runner incomplete"},
         "tools": {},
-        "summary": {"pass": 0, "fail": 0, "warn": 0, "error": 0},
         "slither": {"status": "skipped", "findings": [], "verdict": "Not run"},
     }
     behavioral_result = {
@@ -374,10 +276,12 @@ def skipped_verification() -> tuple[dict[str, Any], dict[str, Any]]:
 
 
 # [KẾT LUẬN DUY NHẤT của phase5_verification.json] Xét các luật theo thứ tự, luật khớp đầu tiên thắng:
-# chưa có kết quả GPU -> Inconclusive; gốc Safe & không vá -> No patch required; hồi quy hành vi -> rejected;
-# không compile -> rejected; không có bản vá hiệu lực -> rejected; ma trận tool FAIL -> rejected;
+# chưa có kết quả GPU -> Inconclusive; gốc Safe & không vá -> No patch required;
+# Advisor loại hết finding -> No patch required; còn finding nhưng không có hàm nào để vá (chỉ finding cấp contract
+# hoặc hàm view/pure, vòng sửa 0 attempt) -> Inconclusive; hồi quy hành vi -> rejected;
+# không compile -> rejected; không có bản vá hiệu lực -> rejected; Slither FAIL -> rejected;
 # static/RAG vẫn thấy lỗi mục tiêu -> rejected; không compile riêng được -> Inconclusive;
-# ma trận tool passed -> "Patch accepted by security tool matrix"; còn lại -> Inconclusive.
+# Slither passed -> "Patch accepted by Slither"; còn lại -> Inconclusive.
 # (Detector vẫn báo lỗi KHÔNG chặn chấp nhận - chỉ ghi detector_disagreement, vì detector hay báo nhầm hàm an toàn.)
 def decide_overall_verdict(
     *,
@@ -393,33 +297,40 @@ def decide_overall_verdict(
 ) -> str:
     """Step 4: the single verdict of phase5_verification.json (first matching rule wins)."""
     compile_status = tool_result.get("compile", {}).get("status")
-    matrix_verdict = tool_result.get("policy_verdict", "inconclusive")
+    slither_verdict = tool_result.get("policy_verdict", "inconclusive")
     local_residual = [
         name
         for name, result in (("static", fixed_static), ("rag", fixed_rag))
         if result and result.get("status") == "ok" and result.get("findings")
     ]
 
-    if not remote or remote.get("status") in {"pending", "crashed"}:
+    if not remote:
         return "Inconclusive: patch execution incomplete"
     if fused.get("verdict") == "Safe" and not patch_applied and fixed_code == code:
         return "No patch required: original detection reported Safe"
     if fused.get("verdict") != "Vulnerable" and not patch_applied and fixed_code == code:
         return "Inconclusive: detection incomplete and no patch was generated"
+    if not patch_applied and fixed_code == code:
+        phases = remote.get("phases", {})
+        detector = phases.get("detector", {})
+        if not detector.get("confirmed_findings") and detector.get("dismissed_findings"):
+            return "No patch required: the Advisor dismissed every finding as a false positive"
+        if phases.get("verifier", {}).get("attempts_count") == 0:
+            return "Inconclusive: no function-level repair target for the confirmed findings"
     if behavioral_result.get("status") == "failed":
         return "Patch rejected: behavioral regression detected"
     if compile_status == "failed":
         return "Patch rejected: fixed code does not compile"
     if not patch_applied or fixed_code == code:
         return "Patch rejected: no effective patch was applied"
-    if matrix_verdict == "failed":
-        return "Patch rejected: security tool matrix found residual or introduced vulnerabilities"
+    if slither_verdict == "failed":
+        return "Patch rejected: Slither found residual or introduced vulnerabilities"
     if local_residual:
         return f"Patch rejected: {'/'.join(local_residual)} still detect the targeted vulnerability"
     if compile_status in {"unavailable", "baseline_failed"}:
         return "Inconclusive: fixed code could not be compiled in isolation"
-    if matrix_verdict == "passed":
+    if slither_verdict == "passed":
         # The binary detector is known to over-flag safe functions, so its disagreement does
         # not block acceptance; it is surfaced as `detector_disagreement` instead.
-        return "Patch accepted by security tool matrix"
-    return "Inconclusive: security tool matrix did not complete enough checks"
+        return "Patch accepted by Slither"
+    return "Inconclusive: Slither did not complete enough checks"

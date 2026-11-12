@@ -2,7 +2,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # run_api_server.sh
 # Khởi chạy Unified AI Inference Server (Version 13) trên GPU 0 Server
-# Host: 0.0.0.0 | Port: 8000
+# Host: 0.0.0.0 | Port: 6868 (PORT=... để đổi)
 # GPU: CHỈ DÙNG GPU 0 (NVIDIA RTX 4070 Ti SUPER 16GB)
 # ══════════════════════════════════════════════════════════════════════════════
 

@@ -6,10 +6,12 @@ Orchestrator - runs one contract through Phase 0 -> 6 and writes one artifact pe
   Phase 0   parse the source into code units             phase0_parsing/code_units.py
   Phase 1A  static analysis + Slither                    phase1a_static/static_runner.py
   Phase 1B  RAG over the vulnerability knowledge base    phase1b_rag/rag_runner.py
-            -> request.json (input of the GPU server phases)
-  Phase 1C-4 on the GPU server (detector, Advisor, Assessor, Fixer + repair loop)
-                                                          pipeline/gpu_pipeline.py
-  Phase 1F  fusion of static + RAG + detector           phase1_fusion/fusion.py
+            -> request.json (input of the GPU phases)
+  Phase 1C-5 GPU phases: detector, per-finding fusion, Advisor, Assessor, Fixer + repair loop
+            (self-check)                                  pipeline/gpu_pipeline.py
+            The loop itself runs on THIS machine, in the same process as main(); only the
+            model calls go to the GPU server over HTTP (/api/v1/detect, /api/v1/generate).
+  Phase 1F  contract-level fusion of static + RAG + detector  phase1_fusion/fusion.py
   Phase 5   final verification of the patch             phase5_verifier/final_verification.py
   Phase 6   audit report (Markdown / HTML / PDF)         phase6_reporter/report.py
 
@@ -44,7 +46,7 @@ from E2E.phase1_fusion.fusion import fuse_detection
 from E2E.phase1a_static.static_runner import run_static
 from E2E.phase1b_rag.rag_runner import run_rag
 from E2E.phase5_verifier.final_verification import (
-    build_tool_repair_feedback,
+    build_verification_channels,
     decide_overall_verdict,
     skipped_verification,
     verify_final_patch,
@@ -90,22 +92,12 @@ def validated_run_id(value: str) -> str:
     return value
 
 
-# Nhiệm vụ: lấy kết quả detector (Phase 1C) từ server_result cho bản "original" hoặc "fixed".
-# Hỗ trợ cả định dạng cũ (detector là dict phẳng = kết quả bản gốc); tự điền "status" nếu thiếu.
-# Mục đích: đưa điểm detector vào fuse_detection để ra kết luận cuối của contract.
+# Nhiệm vụ: lấy tóm tắt detector (Phase 1C) của bản "original" hoặc "fixed" từ server_result
+# (phases.detector.original / .fixed, do summarize_detector tạo); chưa có kết quả GPU -> None.
+# Mục đích: đưa điểm detector của bản gốc vào fuse_detection để ra kết luận cuối của contract.
 def _remote_detector(remote: dict[str, Any], target: str) -> dict[str, Any] | None:
-    detector = remote.get("phases", {}).get("detector", {})
-    if target in detector and isinstance(detector[target], dict):
-        res = dict(detector[target])
-        if "status" not in res:
-            res["status"] = detector.get("status", "ok")
-        return res
-    if target == "original" and detector and isinstance(detector, dict):
-        res = dict(detector)
-        if "status" not in res:
-            res["status"] = "ok"
-        return res
-    return None
+    summary = remote.get("phases", {}).get("detector", {}).get(target)
+    return dict(summary) if isinstance(summary, dict) else None
 
 
 # Nhiệm vụ: kiểm tra kết quả GPU trả về khớp với request: đúng schema_version, có "phases",
@@ -135,7 +127,7 @@ def validate_remote_result(request: dict[str, Any], remote: dict[str, Any]) -> N
 #   - Lượt 2 (có remote_result từ gpu_pipeline): kiểm tra kết quả GPU, fusion đầy đủ (static + RAG +
 #     detector), ghi phase2/3/4, chạy kiểm chứng cuối Phase 5 (verify_final_patch), quyết định
 #     overall_verdict, rồi xuất báo cáo Phase 6 (MD/HTML/PDF) và manifest.json.
-# Mục đích: là "xương sống" của hệ thống; CLI, web app và batch đều đi qua hàm này.
+# Mục đích: là "xương sống" của hệ thống; CLI và web app (gọi lại CLI) đều đi qua hàm này.
 def run_pipeline(
     code: str,
     *,
@@ -145,15 +137,13 @@ def run_pipeline(
     remote_result: dict[str, Any] | None = None,
     detector_threshold: float | None = None,
     source_root: str | Path | None = None,
-    tools: list[str] | None = None,
-    use_smartbugs: bool = True,
     max_fix_attempts: int = MAX_FIX_ATTEMPTS,
     local_phase1: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write every phase artifact of one contract to runs_dir/<run_id>/.
 
     Called twice per audit (see main): without `remote_result` it runs Phase 0, 1A, 1B and
-    writes request.json; with the GPU result it merges Phases 1C-4 and runs Phase 5 and 6.
+    writes request.json; with the GPU-phase result it merges Phases 1C-4 and runs Phase 5 and 6.
     """
     actual_run_id = validated_run_id(run_id or make_run_id(file_name, code))
     run_dir = Path(runs_dir) / actual_run_id
@@ -251,7 +241,7 @@ def run_pipeline(
     patch_applied = any(item.get("status") == "applied" for item in patch_outcomes)
 
     if remote and remote.get("status") in {"ok", "partial"} and fixed_code and fixed_code != code:
-        print(f"[{time.strftime('%H:%M:%S')}] [PHASE 5] Verifying patch integrity & compiler behavioral matrix...", flush=True)
+        print(f"[{time.strftime('%H:%M:%S')}] [PHASE 5] Verifying patch: compile + Slither, AST behavior check, static/RAG re-run...", flush=True)
         tool_result, behavioral_result, fixed_static, fixed_rag = verify_final_patch(
             code,
             fixed_code,
@@ -259,9 +249,6 @@ def run_pipeline(
             fused=fused,
             file_name=file_name,
             source_root=source_root,
-            results_dir=run_dir / "security_tool_matrix",
-            tools=tools,
-            use_smartbugs=use_smartbugs,
         )
         write_json(run_dir / "phase5_fixed_static.json", fixed_static)
         write_json(run_dir / "phase5_fixed_rag.json", fixed_rag)
@@ -270,8 +257,8 @@ def run_pipeline(
         tool_result, behavioral_result = skipped_verification()
 
     tool_result["behavioral"] = behavioral_result
-    matrix_verdict = tool_result.get("policy_verdict", "inconclusive")
-    remote_fixed = remote.get("phases", {}).get("detector", {}).get("fixed") if remote else None
+    slither_verdict = tool_result.get("policy_verdict", "inconclusive")
+    remote_fixed = _remote_detector(remote, "fixed")
     detector_still_flags = bool(remote_fixed) and remote_fixed.get("verdict") == "Vulnerable"
     overall_verdict = decide_overall_verdict(
         remote=remote,
@@ -285,67 +272,30 @@ def run_pipeline(
         fixed_rag=fixed_rag,
     )
 
-    # Fixed detection & risk delta: chỉ dùng điểm thật, không bịa điểm số (Task A1)
-    if remote_fixed and remote_fixed.get("score") is not None:
-        fixed_detection = remote_fixed
-        fixed_score = float(remote_fixed["score"])
-        risk_delta = round(float(fused.get("score") or 0.0) - fixed_score, 6)
-    elif matrix_verdict == "passed" and behavioral_result.get("status") == "passed":
-        fixed_detection = {
-            "component": "security_tool_matrix",
-            "status": "ok",
-            "verdict": "Safe",
-            "score": None,
-            "risk_level": "None",
-            "policy_reason": tool_result.get("policy_reason", ""),
-            "summary": tool_result.get("summary", {}),
-        }
-        risk_delta = None
-    else:
-        fixed_detection = {
-            "component": "verification",
-            "status": "inconclusive",
-            "verdict": overall_verdict,
-            "score": None,
-            "risk_level": "Unknown",
-            "policy_reason": "Verification inconclusive or incomplete.",
-            "summary": {},
-        }
-        risk_delta = None
-
     v_info = remote.get("phases", {}).get("verifier", {}) if remote else {}
-    final_feedback = build_tool_repair_feedback(
-        tool_result,
-        attempt=len(remote.get("repair_attempts", [])) if remote else 1,
-        max_attempts=MAX_FIX_ATTEMPTS,
-        static_result=fixed_static,
-        rag_result=fixed_rag,
-        detector_fixed=remote_fixed,
-        verifier=v_info,
-    )
     verification = {
         "status": (
             "complete"
-            if matrix_verdict in {"passed", "failed"} and tool_result.get("status") in {"ok", "partial"}
+            if slither_verdict in {"passed", "failed"} and tool_result.get("status") in {"ok", "partial"}
             else "inconclusive" if not remote or remote.get("status") != "ok" else "partial"
         ),
-        "verification_model": v_info.get("verification_model", "Multi-Tier AST & Security Tool Matrix"),
         "original_detection": fused,
-        "fixed_detection": fixed_detection,
+        # Detector re-score of the patched units (GPU repair loop); the report reads its threshold.
+        "fixed_detection": remote_fixed or {},
         "tool_verification": tool_result,
         "behavioral_verification": behavioral_result,
-        "verifications": v_info.get("verifications", []),
-        "verification_channels": final_feedback.get("components", {}),
-        "repair_attempts": remote.get("repair_attempts", []) or v_info.get("attempts", []),
-        "attempts_count": v_info.get("attempts_count", len(remote.get("repair_attempts", [])) or 1) if remote else 0,
-        "max_attempts": v_info.get("max_attempts", 3),
-        "attempts": v_info.get("attempts", []),
+        "verification_channels": build_verification_channels(
+            tool_result,
+            static_result=fixed_static,
+            rag_result=fixed_rag,
+            detector_fixed=remote_fixed,
+        ),
+        # Per-attempt details of the repair loop stay in server_result.json (phases.verifier.attempts).
+        "attempts_count": v_info.get("attempts_count", 1) if remote else 0,
+        "max_attempts": v_info.get("max_attempts", MAX_FIX_ATTEMPTS),
         "fixed_unit_results": v_info.get("fixed_unit_results", []),
-        "vulnerability_probability": v_info.get("vulnerability_probability"),
-        "risk_delta": risk_delta,
         "detector_disagreement": detector_still_flags and overall_verdict.startswith("Patch accepted"),
         "overall_verdict": overall_verdict,
-        "notes": f"Phase 5 verification finished with verdict: {overall_verdict}.",
     }
     write_json(run_dir / "phase5_verification.json", verification)
     if remote:
@@ -372,7 +322,7 @@ def run_pipeline(
             if (
                 remote.get("status") == "ok"
                 and fused["status"] == "complete"
-                and verification["status"] in {"complete", "ok"}
+                and verification["status"] == "complete"
             )
             else "pending_remote" if not remote else "partial"
         ),
@@ -382,17 +332,18 @@ def run_pipeline(
             "verdict": fused["verdict"],
             "status": fused["status"],
             "score": fused["score"],
-            "risk_level": fused["risk_level"],
-            "finding_count": len(fused["findings"]),
+            "risk_level": report_data["risk_level"],  # highest severity among the reported findings
+            # Same list as the report: after the GPU phases, findings the Advisor dismissed are excluded.
+            "finding_count": len(report_data["findings"]),
+            "dismissed_count": len(report_data.get("dismissed_findings", [])),
         },
         "verification": {
             "status": verification["status"],
             "overall_verdict": verification["overall_verdict"],
-            "risk_delta": verification["risk_delta"],
         },
         "reports": report_paths,
         "next_action": (
-            "Run pipeline/gpu_pipeline.py with request.json to complete Phase 1C-5."
+            "Waiting for the GPU phases (pipeline/gpu_pipeline.py, Phase 1C-5) on request.json."
             if not remote
             else "Review findings, generated patch, compiler output, and behavioral verification checks."
         ),
@@ -406,7 +357,7 @@ def run_pipeline(
 
 
 # Nhiệm vụ: khai báo tham số CLI cho `python -m E2E.run <file.sol>` (--run-id, --detector-threshold,
-# --max-fix-attempts, --tools, --full-matrix, --solidity-root).
+# --max-fix-attempts, --solidity-root).
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Audit one Solidity contract (Phase 0 -> 6) through the GPU server.")
     parser.add_argument("code_file", type=Path)
@@ -425,17 +376,6 @@ def parse_args() -> argparse.Namespace:
         help="Maximum repair attempts (1-3) of the Fixer -> Verifier loop.",
     )
     parser.add_argument(
-        "--tools",
-        nargs="*",
-        default=None,
-        help="Security tools of the Phase 5 matrix (e.g. slither mythril smartcheck). Default: native slither only.",
-    )
-    parser.add_argument(
-        "--full-matrix",
-        action="store_true",
-        help="Run all 3 verified security tools (slither, mythril, smartcheck) in Phase 5 verification.",
-    )
-    parser.add_argument(
         "--solidity-root",
         type=Path,
         help="Root containing imported .sol files; defaults to the input file directory.",
@@ -443,36 +383,28 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# Nhiệm vụ: điểm vào CLI. Đọc file .sol, chọn bộ tool Phase 5 (mặc định chỉ Slither), rồi:
+# Nhiệm vụ: điểm vào CLI. Đọc file .sol, rồi:
 #   1) run_pipeline lượt 1 (local: Phase 0, 1A, 1B) -> request.json
-#   2) run_server_gpu_pipeline(request) (GPU server: Phase 1C -> 5, vòng sửa <= 3 lần)
+#   2) run_server_gpu_pipeline(request): Phase 1C -> 5, vòng sửa <= 3 lần. Hàm này chạy NGAY TRÊN MÁY NÀY
+#      (cùng tiến trình); chỉ các lời gọi model đi qua HTTP tới GPU server (/api/v1/detect, /api/v1/generate).
 #   3) run_pipeline lượt 2 với kết quả GPU -> fusion, kiểm chứng cuối, báo cáo.
 # Mục đích: web app cũng gọi lại đúng lệnh CLI này trong một subprocess.
 def main() -> None:
     args = parse_args()
     code = args.code_file.read_text(encoding="utf-8")
 
-    selected_tools = args.tools
-    if selected_tools is None and not args.full_matrix:
-        selected_tools = ["slither"]
-    use_smartbugs = (
-        args.full_matrix
-        or selected_tools is None
-        or bool(args.tools and any(t != "slither" for t in args.tools))
-    )
     common = dict(
         file_name=args.code_file.name,
         runs_dir=args.runs_dir,
         detector_threshold=args.detector_threshold,
         source_root=args.solidity_root or args.code_file.parent,
-        tools=selected_tools,
-        use_smartbugs=use_smartbugs,
         max_fix_attempts=args.max_fix_attempts,
     )
     # Pass 1: Phase 0, 1A, 1B on this machine -> request.json.
     manifest = run_pipeline(code, run_id=args.run_id, **common)
 
-    # Phases 1C-5 on the GPU server. The GPU pipeline owns the single repair loop
+    # Phases 1C-5: runs in this process; only the model calls go to the GPU server over HTTP.
+    # The GPU pipeline owns the single repair loop
     # (compiler + detector + static/RAG feedback, at most MAX_FIX_ATTEMPTS attempts).
     from E2E.pipeline.gpu_pipeline import run_server_gpu_pipeline
 

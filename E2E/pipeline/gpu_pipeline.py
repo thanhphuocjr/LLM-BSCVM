@@ -1,19 +1,22 @@
 """
 Phases 1C -> 5 of one contract, driven through the GPU server (Qwen2.5-Coder-14B v13).
 
+Where it runs: this module runs on the LOCAL machine, in the same process as
+orchestrator.main(). Only the model calls are remote: gpu_client sends HTTP requests to
+the GPU server's /api/v1/detect (Phase 1C, detector re-scoring in Phase 5) and
+/api/v1/generate (Advisor, Assessor, Fixer). Compiler and static/RAG re-runs are local.
+
 Input: request.json written by the orchestrator (source, code units, Phase 1A/1B results).
 
   1C  detector scores every unit                      -> phase1c_detector/detector.py
   1F  per-finding fusion of static + RAG + detector   -> phase1_fusion/fusion.py
   2   Advisor: triage (drops false positives) + fix strategy -> phase2_advisor/
   3   Assessor: CVSS v3.1 + repair priority            -> phase3_assessor/
-  4   Fixer: patch each target unit                     -> phase4_fixer/fixer.py
+  4   Fixer: patch each target unit, in repair-priority order -> phase4_fixer/fixer.py
   5   check the candidate (compiler, detector, static/RAG); on failure feed the
-      problems back to the Fixer, at most MAX_VERIFICATION_ATTEMPTS attempts
+      problems back to the Fixer, at most MAX_FIX_ATTEMPTS (config.py) attempts
                                                         -> phase5_verifier/candidate_check.py
-
-single_pass (batch runs, execution.repair.single_pass): one Fixer call per target unit,
-no Phase 3 and no Phase 5; the model's patch is the result (scored by an external judge).
+The final verification (Slither, AST) and the report (Phase 6) run afterwards in the orchestrator.
 """
 
 from __future__ import annotations
@@ -23,19 +26,15 @@ from typing import Any
 
 from E2E.common.findings import finding_key
 from E2E.common.gpu_client import check_server_health, get_server_url
-from E2E.config import DEFAULT_DETECTOR_THRESHOLD
+from E2E.config import DEFAULT_DETECTOR_THRESHOLD, MAX_FIX_ATTEMPTS, PIPELINE_VERSION, SCHEMA_VERSION
 from E2E.phase0_parsing.code_units import as_code_unit
 from E2E.phase1_fusion.fusion import fuse_findings
 from E2E.phase1c_detector.detector import score_units_via_server, summarize_detector
 from E2E.phase2_advisor.advisor import RepairKnowledgeBase
 from E2E.phase2_advisor.advisor_phase import _generate_advisor_section
 from E2E.phase3_assessor.assessor_phase import _generate_assessor_section
-from E2E.phase4_fixer.fixer import _build_rag_knowledge_section, _feedback_from_request, _splice_unit, patch_unit
-from E2E.phase4_fixer.heuristic_fallback import _apply_heuristic_security_patch
+from E2E.phase4_fixer.fixer import _build_rag_knowledge_section, _splice_unit, patch_unit
 from E2E.phase5_verifier.candidate_check import _finding_pairs, _verification_feedback, verify_candidate
-
-
-MAX_VERIFICATION_ATTEMPTS = 3
 
 
 # In log có kèm giờ (web app đọc dòng "[PHASE x]" này để cập nhật tiến độ).
@@ -44,25 +43,27 @@ def _log(message: str) -> None:
 
 
 # [HÀM TRUNG TÂM PHẦN GPU] Chạy Phase 1C -> 5 cho một contract từ request.json (do orchestrator ghi).
+# LƯU Ý: hàm này chạy ở MÁY LOCAL, cùng tiến trình với orchestrator.main; chỉ lời gọi model đi qua HTTP tới
+# GPU server (/api/v1/detect cho detector, /api/v1/generate cho Advisor/Assessor/Fixer). solc, static, RAG
+# trong vòng tự kiểm đều chạy local.
 #   1C: kiểm tra server sống (health) -> detector chấm từng unit (score_units_via_server + summarize_detector).
-#   1F: fuse_findings -> finding confirmed / candidate; RepairKnowledgeBase gắn tri thức sửa lỗi theo SWC;
-#       (tuỳ chọn) hoãn finding chỉ-detector có xác suất thấp (detector_only_min_prob).
+#   1F: fuse_findings -> finding confirmed / candidate; RepairKnowledgeBase gắn tri thức sửa lỗi theo SWC
+#       (một KB dùng chung cho Phase 1F, Advisor và Assessor).
 #   2 : Advisor -> loại false positive khỏi tập cần sửa, sinh hướng sửa (suggestions).
-#   3 : Assessor -> CVSS v3.1 (bỏ qua ở chế độ single_pass của batch).
-#   4-5: VÒNG SỬA (tối đa 3 lần): Fixer vá từng hàm mục tiêu (patch_unit); nếu model không vá được gì thì
-#       dùng vá heuristic; rồi verify_candidate kiểm tra compile + detector + static/RAG chạy lại.
+#   3 : Assessor -> CVSS v3.1 + repair_priority (điểm CVSS cao sửa trước).
+#   4-5: VÒNG SỬA (tối đa 3 lần): Fixer vá từng hàm mục tiêu theo repair_priority (patch_unit);
+#       rồi verify_candidate kiểm tra compile + detector + static/RAG chạy lại.
 #       Chưa đạt -> tạo feedback; lần sau giữ lại các bản vá đã đạt, chỉ vá lại các hàm còn lỗi TỪ MÃ GỐC.
 #       Chọn attempt tốt nhất theo (compile được, ít hàm lỗi, nhiều hàm vá, ít thay đổi độ dài).
-# Trả về server_result: phases {detector, advisor, assessor, fixer, verifier, reporter}, fixed_code,
-# patch_outcomes, verdict PASS/WARN/UNVERIFIED/NOT_APPLICABLE, thời gian từng phần.
-# single_pass (dùng cho batch vòng 1): mỗi hàm chỉ gọi Fixer 1 lần, không Phase 3 và không Phase 5.
-# Gọi bởi: orchestrator.main, batch_audit, repair_round2.
+# Trả về server_result: phases {detector, advisor, assessor, fixer, verifier} (bản vá ở phases.fixer, kết luận vòng sửa
+# PASS/WARN/NOT_APPLICABLE ở phases.verifier.overall_verdict), thời gian từng phần.
+# Gọi bởi: orchestrator.main.
 def run_server_gpu_pipeline(
     request: dict[str, Any],
     *,
     server_url: str | None = None,
 ) -> dict[str, Any]:
-    """Thực thi pipeline phase 1C-5 thông qua dịch vụ AI trên GPU Server.
+    """Thực thi pipeline phase 1C-5 (chạy local) bằng cách gọi dịch vụ AI trên GPU Server.
 
     Vòng sửa lỗi duy nhất của backend server_gpu (tối đa 3 attempt). Mỗi attempt được
     kiểm tra bởi ba kênh: compiler (so với baseline), neural detector trên unit đã vá,
@@ -76,22 +77,20 @@ def run_server_gpu_pipeline(
     units_by_id = {unit.unit_id: unit for unit in unit_objs}
     execution = request.get("execution", {})
     detector_threshold = float(execution.get("detector_threshold") or DEFAULT_DETECTOR_THRESHOLD)
-    # single_pass: one fixer call per target unit, no Phase 5; the model's patch is the result.
-    single_pass = bool((execution.get("repair") or {}).get("single_pass"))
-    max_attempts = 1 if single_pass else min(
-        max(1, int((execution.get("repair") or {}).get("max_attempts") or MAX_VERIFICATION_ATTEMPTS)),
-        MAX_VERIFICATION_ATTEMPTS,
+    max_attempts = min(
+        max(1, int((execution.get("repair") or {}).get("max_attempts") or MAX_FIX_ATTEMPTS)),
+        MAX_FIX_ATTEMPTS,
     )
     local_phase1 = request.get("local_phase1", {})
-    static_p1 = local_phase1.get("static", {}) or request.get("static", {})
-    rag_p1 = local_phase1.get("rag", {}) or request.get("rag", {})
+    static_p1 = local_phase1.get("static", {})
+    rag_p1 = local_phase1.get("rag", {})
     rag_context = rag_p1.get("retrieved_context", [])
 
     health = check_server_health(server_url)
     if health.get("status") != "ready":
         raise ConnectionError(
             f"GPU Server tại {server_url} chưa sẵn sàng (trạng thái: {health.get('status')}). "
-            "Vui lòng đảm bảo bạn đã khởi chạy `bash run_api_server.sh` trên server."
+            "Hãy khởi động server: ./scripts/gpu_server.sh start"
         )
 
     # Phase 1C: neural detector on every unit with a body.
@@ -107,54 +106,36 @@ def run_server_gpu_pipeline(
 
     # Phase 1 fused: per-finding fusion decides what reaches the agents.
     _log("[PHASE 1 FUSED] Synchronizing multi-modal detection signals...")
-    findings, candidate_findings = fuse_findings(unit_results, static_p1, rag_p1, tau_agent=0.45)
-    try:
-        findings = RepairKnowledgeBase().enrich_findings(
-            findings, code=source_code, code_units=request.get("code_units", [])
-        )
-    except Exception:
-        pass
-    # Units flagged only by the neural detector (no SWC from static/RAG) are optional repair
-    # targets: `detector_only_min_prob` (execution.repair) raises the bar for them, and a value
-    # above 1 keeps them out of repair entirely. They are still reported.
-    detector_only_min = (execution.get("repair") or {}).get("detector_only_min_prob")
-    detector_only_deferred: list[dict[str, Any]] = []
-    if detector_only_min is not None:
-        detector_only_deferred = [
-            item for item in findings
-            if item.get("swc") == "UNMAPPED" and float(item.get("p_detector") or 0.0) < float(detector_only_min)
-        ]
-        deferred_ids = {id(item) for item in detector_only_deferred}
-        findings = [item for item in findings if id(item) not in deferred_ids]
-    _log(
-        f"[PHASE 1 FUSED] Completed: {len(findings)} confirmed finding(s), {len(candidate_findings)} candidate(s)"
-        + (f", {len(detector_only_deferred)} detector-only finding(s) not repaired." if detector_only_deferred else ".")
-    )
+    findings, candidate_findings = fuse_findings(unit_results, static_p1, rag_p1)  # tau_agent from fusion_calibration.json
+    knowledge_base = RepairKnowledgeBase()
+    findings = knowledge_base.enrich_findings(findings, code=source_code, code_units=request.get("code_units", []))
+    _log(f"[PHASE 1 FUSED] Completed: {len(findings)} confirmed finding(s), {len(candidate_findings)} candidate(s).")
 
     # Phase 2: Advisor (triage + remediation). False positives are removed from the repair set.
     _log("[PHASE 2] Running Security Advisor agent (root cause & remediation analysis)...")
-    advisor = _generate_advisor_section(findings, source_code, use_llm=True)
+    advisor = _generate_advisor_section(findings, source_code, use_llm=True, knowledge_base=knowledge_base)
     dismissed_ids = set(advisor.get("false_positives", []))
-    dismissed = [item for item in findings if finding_key(item) in dismissed_ids]
+    reasons = advisor.get("false_positive_reasons", {})
+    dismissed = [
+        {**item, "dismissal_reason": reasons.get(finding_key(item), "")}
+        for item in findings if finding_key(item) in dismissed_ids
+    ]
     findings = [item for item in findings if finding_key(item) not in dismissed_ids]
     _log(
         f"[PHASE 2] Completed: {len(advisor.get('suggestions', []))} suggestion(s), "
         f"{len(dismissed)} finding(s) dismissed as false positive."
     )
 
-    # Phase 3: Assessor (CVSS only feeds the report, so single-pass batch runs skip it).
-    if single_pass:
-        _log("[PHASE 3] Skipped (single-pass mode).")
-        assessor = {"status": "skipped", "assessments": []}
-    else:
-        _log("[PHASE 3] Running Risk Assessor agent (CVSS v3.1 scoring & priority ranking)...")
-        assessor = _generate_assessor_section(
-            findings,
-            source_code,
-            use_llm=True,
-            advisor_suggestions=advisor.get("suggestions", []),
-        )
-        _log(f"[PHASE 3] Completed: {len(assessor.get('assessments', []))} item(s) assessed.")
+    # Phase 3: Assessor (CVSS v3.1 + repair priority, feeds the report).
+    _log("[PHASE 3] Running Risk Assessor agent (CVSS v3.1 scoring & priority ranking)...")
+    assessor = _generate_assessor_section(
+        findings,
+        source_code,
+        use_llm=True,
+        advisor_suggestions=advisor.get("suggestions", []),
+        knowledge_base=knowledge_base,
+    )
+    _log(f"[PHASE 3] Completed: {len(assessor.get('assessments', []))} item(s) assessed.")
 
     # Phase 4-5: repair loop.
     finding_units = {item.get("unit_id") for item in findings if item.get("unit_id")}
@@ -162,21 +143,12 @@ def run_server_gpu_pipeline(
         unit for unit in unit_objs
         if unit.unit_id in finding_units and unit.has_body and not unit.is_view_or_pure
     ]
-    # Optional budget for very large contracts: keep the units with the strongest fused
-    # evidence; the rest are reported as `skipped_targets`, never silently dropped.
-    max_target_units = (execution.get("repair") or {}).get("max_target_units")
-    skipped_targets: list[str] = []
-    if max_target_units and len(target_units) > int(max_target_units):
-        strength = {
-            unit.unit_id: max(
-                float(item.get("p_final") or 0.0) for item in findings if item.get("unit_id") == unit.unit_id
-            )
-            for unit in target_units
-        }
-        ranked = sorted(target_units, key=lambda unit: strength[unit.unit_id], reverse=True)
-        target_units = ranked[: int(max_target_units)]
-        skipped_targets = [unit.unit_id for unit in ranked[int(max_target_units):]]
-        _log(f"[PHASE 4] Target budget: repairing {len(target_units)} unit(s), skipping {len(skipped_targets)}.")
+    # Phase 3 -> Phase 4: repair the units in the Assessor's repair-priority order (highest CVSS first).
+    unit_priority: dict[str, int] = {}
+    for item in assessor.get("assessments", []):
+        unit_id = item.get("unit_id")
+        unit_priority[unit_id] = min(unit_priority.get(unit_id, 10**6), int(item.get("repair_priority") or 10**6))
+    target_units.sort(key=lambda unit: unit_priority.get(unit.unit_id, 10**6))
     target_unit_ids = {unit.unit_id for unit in target_units}
     target_pairs = {pair for pair in _finding_pairs(findings) if pair[1] in target_unit_ids}
     known_pairs = _finding_pairs(
@@ -187,10 +159,9 @@ def run_server_gpu_pipeline(
         ]
     )
     suggestions = advisor.get("suggestions", [])
-    patch_candidates = list(findings) + suggestions
     first_swc = next((item.get("swc") for item in findings if item.get("swc") not in {None, "UNMAPPED"}), None)
     rag_section = _build_rag_knowledge_section(rag_context, target_swc=first_swc)
-    feedback_note = _feedback_from_request(request.get("repair_feedback"))
+    feedback_note = ""
 
     fixer_started = time.perf_counter()
     attempts: list[dict[str, Any]] = []
@@ -215,59 +186,30 @@ def run_server_gpu_pipeline(
                 rag_section=rag_section,
                 attempt=attempt,
                 server_url=server_url,
-                single_pass=single_pass,
             )
             outcomes.append(outcome)
-
-        if (
-            not single_pass
-            and not any(item.get("status") == "applied" for item in outcomes)
-            and base_code == source_code
-        ):
-            heuristic_code, heuristic_outcomes = _apply_heuristic_security_patch(
-                source_code, patch_candidates, code_units=unit_objs
-            )
-            if heuristic_outcomes:
-                current_code = heuristic_code
-                outcomes.extend(heuristic_outcomes)
 
         patched_ids = {
             str(item.get("unit_id")) for item in outcomes
             if item.get("status") == "applied" and item.get("unit_id")
         }
-        if single_pass:
-            _log("[PHASE 5] Skipped (single-pass mode): the fixer output is taken as the final patch.")
-            verification = {
-                "passed": False,
-                "compilation": {"state": "skipped", "failed": False},
-                "unit_results": [],
-                "detector_failing_units": [],
-                "unverified_units": [],
-                "residual_findings": [],
-                "introduced_findings": [],
-                "channel_errors": {},
-                "failing_units": [],
-                "compile_culprit_units": [],
-                "max_vulnerability_probability": None,
-            }
-        else:
-            _log(f"[PHASE 5] Verifying candidate ({label}): compiler + neural detector + static/RAG re-run...")
-            verification = verify_candidate(
-                source_code,
-                current_code,
-                patched_unit_ids=patched_ids,
-                target_unit_ids=target_unit_ids,
-                original_unit_results=unit_results,
-                target_pairs=target_pairs,
-                known_pairs=known_pairs,
-                threshold=detector_threshold,
-                server_url=server_url,
-            )
+        _log(f"[PHASE 5] Verifying candidate ({label}): compiler + neural detector + static/RAG re-run...")
+        verification = verify_candidate(
+            source_code,
+            current_code,
+            patched_unit_ids=patched_ids,
+            target_unit_ids=target_unit_ids,
+            original_unit_results=unit_results,
+            target_pairs=target_pairs,
+            known_pairs=known_pairs,
+            threshold=detector_threshold,
+            server_url=server_url,
+        )
         record = {
             "attempt": attempt,
             "max_attempts": max_attempts,
             "threshold": detector_threshold,
-            "verdict": "Unverified" if single_pass else ("Safe" if verification["passed"] else "Vulnerable"),
+            "verdict": "Safe" if verification["passed"] else "Vulnerable",
             "code": current_code,
             "patch_outcomes": outcomes,
             **verification,
@@ -314,7 +256,7 @@ def run_server_gpu_pipeline(
                     unit = units_by_id[item["unit_id"]]
                     rebuilt = _splice_unit(rebuilt, unit, item["patched_code"], str(item.get("reason") or ""))
             except (KeyError, ValueError):
-                pass  # cannot rebuild (e.g. rule-based patch without unit code): restart fully
+                pass  # a verified patch no longer splices into the original: restart from the original source
             else:
                 base_code, carried_outcomes = rebuilt, keep
                 active_targets = [unit for unit in target_units if unit.unit_id in failing]
@@ -328,10 +270,10 @@ def run_server_gpu_pipeline(
         fixed_code = best["code"]
         patch_outcomes = best["patch_outcomes"]
         final_verification = best
-        overall_verdict = "UNVERIFIED" if single_pass else ("PASS" if best["passed"] else "WARN")
+        overall_verdict = "PASS" if best["passed"] else "WARN"
     _log(f"[PHASE 5] Completed: verdict {overall_verdict} after {len(attempts)} attempt(s).")
 
-    if final_verification is not None and not single_pass:
+    if final_verification is not None:
         fixed_detector = summarize_detector(
             [item for item in final_verification["unit_results"] if item["unit_id"] in target_unit_ids],
             detector_threshold,
@@ -344,8 +286,7 @@ def run_server_gpu_pipeline(
             "vulnerability_probability": None,
             "threshold": detector_threshold,
             "unit_results": [],
-            "reason": "Verification skipped (single-pass mode)." if single_pass and final_verification
-            else "No function-level repair target.",
+            "reason": "No function-level repair target.",
         }
 
     patched_ids = {
@@ -356,12 +297,14 @@ def run_server_gpu_pipeline(
     verifier_items = []
     for item in findings:
         unit_id = item.get("unit_id")
-        if unit_id in failing_final:
-            status = "FLAGGED"
-        elif unit_id in patched_ids:
-            status = "SKIPPED" if single_pass else "PASS"
-        else:
+        # An unpatched unit keeps its original (Vulnerable) detector score, so it is also in
+        # failing_final; it must be reported as NOT_PATCHED, not as a patch that failed.
+        if unit_id not in patched_ids:
             status = "NOT_PATCHED"
+        elif unit_id in failing_final:
+            status = "FLAGGED"
+        else:
+            status = "PASS"
         verifier_items.append({
             "finding_id": finding_key(item),
             "unit_id": unit_id,
@@ -371,7 +314,6 @@ def run_server_gpu_pipeline(
 
     attempts_public = [{k: v for k, v in record.items() if k != "code"} for record in attempts]
     compilation = final_verification["compilation"] if final_verification else {}
-    applied_count = sum(1 for item in patch_outcomes if item.get("status") == "applied")
     phases = {
         "detector": {
             "status": detector_original["status"],
@@ -380,8 +322,6 @@ def run_server_gpu_pipeline(
             "candidate_findings": candidate_findings,
             "confirmed_findings": findings,
             "dismissed_findings": dismissed,
-            "skipped_targets": skipped_targets,
-            "detector_only_deferred": detector_only_deferred,
         },
         "advisor": advisor,
         "assessor": assessor,
@@ -389,15 +329,10 @@ def run_server_gpu_pipeline(
             "status": "ok",
             "fixed_code": fixed_code,
             "patch_outcomes": patch_outcomes,
-            "patches": [
-                {"finding_id": item.get("finding_id"), "description": item.get("reason")}
-                for item in patch_outcomes
-            ],
         },
         "verifier": {
             "status": "ok",
             "verification_model": "solc baseline + Qwen2.5-Coder-14B v13 detector + static/RAG re-run",
-            "verdict": overall_verdict,
             "overall_verdict": overall_verdict,
             "verifications": verifier_items,
             "attempts_count": len(attempts),
@@ -405,30 +340,15 @@ def run_server_gpu_pipeline(
             "attempts": attempts_public,
             "compilation": compilation,
             "fixed_unit_results": fixed_detector.get("unit_results", []),
-            "vulnerability_probability": fixed_detector.get("vulnerability_probability"),
-            "threshold": detector_threshold,
-            "notes": f"Self-verification over {len(attempts)} attempt(s). Final verdict: {overall_verdict}.",
-        },
-        "reporter": {
-            "status": "ok",
-            "executive_summary": (
-                f"Audit completed using the GPU server (Qwen2.5-Coder-14B v13) for run {run_id}. "
-                f"{len(findings)} confirmed finding(s), {len(dismissed)} dismissed by the Advisor, "
-                f"{applied_count} patch(es) applied."
-            ),
-            "recommendations": advisor["recommendations"],
         },
     }
     return {
-        "schema_version": "1.0.0",
-        "pipeline_version": "1.0.0",
+        "schema_version": SCHEMA_VERSION,
+        "pipeline_version": PIPELINE_VERSION,
         "status": "ok" if detector_original["status"] == "ok" else "partial",
         "run_id": run_id,
         "backend": "server_gpu_rtx4070ti",
         "source_sha256": request.get("source", {}).get("sha256", ""),
-        "fixed_code": fixed_code,
-        "patch_outcomes": patch_outcomes,
-        "verification_verdict": overall_verdict,
         "phases": phases,
         "timings": {
             "total_ms": round((time.perf_counter() - started_at) * 1000, 2),

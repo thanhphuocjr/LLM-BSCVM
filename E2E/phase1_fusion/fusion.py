@@ -30,14 +30,9 @@ from E2E.config import (
 )
 
 
-# Lấy điểm của một kênh (static/RAG/detector) từ score / final_score / vulnerability_probability.
+# Lấy điểm của một kênh (static/RAG/detector) từ score / vulnerability_probability.
 def _score(component: dict[str, Any]) -> float:
-    return float(
-        component.get("score")
-        or component.get("final_score")
-        or component.get("vulnerability_probability")
-        or 0.0
-    )
+    return float(component.get("score") or component.get("vulnerability_probability") or 0.0)
 
 
 # Kênh có "hoạt động" không: status="ok" hoặc đã có verdict kèm điểm. Kênh lỗi/pending không được tính trọng số.
@@ -63,14 +58,7 @@ def _detector_complete(component: dict[str, Any]) -> bool:
     """
     if not _active(component):
         return False
-    units = component.get("unit_results") or []
-    for unit in units:
-        if unit.get("status") in {"error", "not_run"} or (
-            unit.get("vulnerability_probability") is None
-            and unit.get("label") not in {"Skipped"}
-        ):
-            return False
-    return True
+    return all(unit.get("vulnerability_probability") is not None for unit in component.get("unit_results") or [])
 
 
 # Slither is a static tool: its findings belong to the same evidence channel as the
@@ -85,7 +73,7 @@ def _channels(sources: list[str] | set[str]) -> set[str]:
 
 
 # Nhiệm vụ: gộp finding của static và RAG theo khoá (SWC, unit_id): lấy mức nghiêm trọng cao nhất, confidence
-# cao nhất, danh sách nguồn, corroborated (>= 2 kênh khác nhau), dòng, mô tả, cách sửa, mã sửa mẫu từ RAG...
+# cao nhất, danh sách nguồn, corroborated (>= 2 kênh khác nhau), dòng, mô tả, cách sửa, cặp mã lỗi/mã sửa từ RAG.
 # Mục đích: mỗi lỗ hổng (một SWC tại một hàm) chỉ còn MỘT finding, kèm toàn bộ bằng chứng (evidence).
 def merge_findings(static_result: dict[str, Any], rag_result: dict[str, Any]) -> list[dict[str, Any]]:
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -125,10 +113,6 @@ def merge_findings(static_result: dict[str, Any], rag_result: dict[str, Any]) ->
                     (item.get("remediation") for item in evidence if item.get("remediation")),
                     "",
                 ),
-                "checklist": next(
-                    (item.get("checklist") for item in evidence if item.get("checklist")),
-                    [],
-                ),
                 "fixed_code": next(
                     (item.get("fixed_code") for item in evidence if item.get("fixed_code")),
                     "",
@@ -137,15 +121,6 @@ def merge_findings(static_result: dict[str, Any], rag_result: dict[str, Any]) ->
                     (item.get("vulnerable_code") for item in evidence if item.get("vulnerable_code")),
                     "",
                 ),
-                "best_match_id": next(
-                    (item.get("best_match_id") for item in evidence if item.get("best_match_id")),
-                    None,
-                ),
-                "similarity_score": next(
-                    (item.get("similarity_score") for item in evidence if item.get("similarity_score") is not None),
-                    None,
-                ),
-                "has_code_patch": any(bool(item.get("has_code_patch", bool(item.get("fixed_code")))) for item in evidence),
                 "evidence": evidence,
             }
         )
@@ -154,6 +129,31 @@ def merge_findings(static_result: dict[str, Any], rag_result: dict[str, Any]) ->
         key=lambda item: (RISK_ORDER.get(item["severity"], 0), item["confidence"]),
         reverse=True,
     )
+
+
+# Gắn vị trí từ kết quả detector của unit vào một finding: start_line / end_line của unit, line_scores
+# (điểm từng dòng của line head) và dòng nghi ngờ nhất = dòng có line_score cao nhất (không vượt end_line).
+#   overwrite=True  (fuse_findings): giá trị của detector thắng; không có line_scores thì dòng mặc định là start_line.
+#   overwrite=False (fuse_detection): chỉ điền những trường finding còn thiếu.
+def _apply_detector_lines(finding: dict[str, Any], unit_result: dict[str, Any], *, overwrite: bool) -> None:
+    start_line = unit_result.get("start_line")
+    end_line = unit_result.get("end_line")
+    line_scores = unit_result.get("line_scores")
+    for key, value in (("start_line", start_line), ("end_line", end_line)):
+        if value and (overwrite or not finding.get(key)):
+            finding[key] = value
+    if isinstance(line_scores, list) and line_scores:
+        finding["line_scores"] = line_scores
+        if start_line and (overwrite or not finding.get("line")):
+            line = start_line + line_scores.index(max(line_scores))
+            finding["line"] = min(line, end_line) if end_line else line
+    elif overwrite and start_line and not finding.get("line"):
+        finding["line"] = start_line
+
+
+# Trọng số logistic + ngưỡng tau_agent, đặt tay trong fusion_calibration.json (chưa fit trên tập hiệu chuẩn).
+def _load_calibration() -> dict[str, Any]:
+    return json.loads(FUSION_CALIBRATION_PATH.read_text(encoding="utf-8"))
 
 
 # [FUSION THEO TỪNG FINDING - dùng trong gpu_pipeline trước Phase 2]
@@ -165,53 +165,23 @@ def merge_findings(static_result: dict[str, Any], rag_result: dict[str, Any]) ->
 # Trả về (confirmed, candidates).
 def fuse_findings(
     unit_results: list[dict[str, Any]],
-    static_result: dict[str, Any] | list[dict[str, Any]],
-    rag_result: dict[str, Any] | list[dict[str, Any]],
-    *,
-    tau_agent: float = 0.45,
-    calibration_config: dict[str, Any] | None = None,
+    static_result: dict[str, Any],
+    rag_result: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Hợp nhất đa phương thức theo từng finding riêng biệt trước khi chuyển sang Phase 2 (Task B1 & B2).
+    """Hợp nhất đa phương thức theo từng finding riêng biệt trước khi chuyển sang Phase 2.
 
     - Gộp static + rag và dedupe duy nhất theo (swc, unit_id), không tính line vào key.
     - Tính điểm p_final cho từng (swc, unit) dựa trên điểm của chính unit đó từ Neural Detector.
     - Chỉ các finding có p_final >= tau_agent mới được chuyển sang Phase 2 (confirmed_findings).
     - Các finding còn lại được đưa vào candidate_findings (Candidates).
-    - Đảm bảo số dòng (line) không vượt quá end_line của unit (Task B7, R-08).
+    - Đảm bảo số dòng (line) không vượt quá end_line của unit.
     """
-    if calibration_config is None:
-        calib_path = FUSION_CALIBRATION_PATH
-        if calib_path.exists():
-            try:
-                calibration_config = json.loads(calib_path.read_text(encoding="utf-8"))
-            except Exception:
-                calibration_config = {}
-        else:
-            calibration_config = {}
+    calibration = _load_calibration()
+    intercept = float(calibration["intercept"])
+    weights = calibration["weights"]
+    tau_agent = float(calibration["tau_agent"])
 
-    mode = calibration_config.get("mode", "calibrated_logistic")
-    intercept = float(calibration_config.get("intercept", -2.15))
-    weights = calibration_config.get("weights", {
-        "p_detector": 3.85,
-        "static_conf": 1.20,
-        "rag_conf": 1.10,
-        "corroborated": 0.65,
-        "severity_critical": 0.80,
-        "severity_high": 0.40,
-        "severity_medium": 0.0,
-        "severity_low": -0.50,
-    })
-    paper_weights = calibration_config.get("paper_weights", {
-        "llm_detector": 0.70,
-        "rag": 0.20,
-        "static": 0.10,
-    })
-    configured_tau = float(calibration_config.get("tau_agent", tau_agent))
-
-    s_res = static_result if isinstance(static_result, dict) else {"findings": static_result}
-    r_res = rag_result if isinstance(rag_result, dict) else {"findings": rag_result}
-
-    local_merged = merge_findings(s_res, r_res)
+    local_merged = merge_findings(static_result, rag_result)
 
     unit_map = {str(item.get("unit_id")): item for item in unit_results if item.get("unit_id")}
     valid_probs = [
@@ -236,7 +206,7 @@ def fuse_findings(
 
         if u_res and u_res.get("vulnerability_probability") is not None:
             p_detector = float(u_res["vulnerability_probability"])
-        elif not u_id or u_id == "contract":
+        elif not u_id:
             p_detector = contract_max_prob
         elif u_res is not None:
             # Detector errored on this unit.
@@ -261,26 +231,15 @@ def fuse_findings(
         corroborated = bool(static_conf > 0.0 and rag_conf > 0.0)
         severity = finding.get("severity", "Medium")
 
-        if mode == "paper_weighted":
-            p_final = (
-                paper_weights.get("llm_detector", 0.70) * p_detector
-                + paper_weights.get("rag", 0.20) * rag_conf
-                + paper_weights.get("static", 0.10) * static_conf
-            )
-        else:
-            sev_w = float(weights.get(f"severity_{severity.lower()}", 0.0))
-            z = (
-                intercept
-                + float(weights.get("p_detector", 3.85)) * p_detector
-                + float(weights.get("static_conf", 1.20)) * static_conf
-                + float(weights.get("rag_conf", 1.10)) * rag_conf
-                + (float(weights.get("corroborated", 0.65)) if corroborated else 0.0)
-                + sev_w
-            )
-            try:
-                p_final = 1.0 / (1.0 + math.exp(-z))
-            except OverflowError:
-                p_final = 1.0 if z > 0 else 0.0
+        z = (
+            intercept
+            + float(weights["p_detector"]) * p_detector
+            + float(weights["static_conf"]) * static_conf
+            + float(weights["rag_conf"]) * rag_conf
+            + (float(weights["corroborated"]) if corroborated else 0.0)
+            + float(weights.get(f"severity_{severity.lower()}", 0.0))
+        )
+        p_final = 1.0 / (1.0 + math.exp(-z))  # z is bounded (inputs in [0, 1]): exp cannot overflow
 
         p_final = max(0.0, min(1.0, round(p_final, 6)))
         finding["confidence"] = p_final
@@ -289,37 +248,17 @@ def fuse_findings(
         finding["corroborated"] = corroborated
 
         if u_res:
-            st_line = u_res.get("start_line")
-            en_line = u_res.get("end_line")
-            l_scores = u_res.get("line_scores")
-            if st_line:
-                finding["start_line"] = st_line
-            if en_line:
-                finding["end_line"] = en_line
-            if l_scores:
-                finding["line_scores"] = l_scores
-                if st_line and isinstance(l_scores, list) and l_scores:
-                    max_idx = l_scores.index(max(l_scores))
-                    calc_line = st_line + max_idx
-                    if en_line and calc_line > en_line:
-                        calc_line = en_line
-                    finding["line"] = calc_line
-            elif st_line and not finding.get("line"):
-                finding["line"] = st_line
+            _apply_detector_lines(finding, u_res, overwrite=True)
 
-        if p_final >= configured_tau:
+        if p_final >= tau_agent:
             confirmed.append(finding)
         else:
             candidates.append(finding)
 
     # Units flagged only by the neural detector must still reach the repair agents;
     # otherwise a detector-driven Vulnerable verdict can never be repaired.
-    local_units = {str(item.get("unit_id")) for item in local_merged if item.get("unit_id")}
-    detector_only = detector_findings(
-        {"unit_results": unit_results, "model_name": calibration_config.get("model_name", "")},
-        [{"unit_id": unit_id} for unit_id in local_units],
-    )
-    for finding in detector_only:
+    local_units = {item.get("unit_id") for item in local_merged}
+    for finding in detector_findings(unit_results, local_units):
         p_detector = float(finding.get("confidence") or 0.0)
         finding["p_detector"] = round(p_detector, 6)
         finding["p_final"] = round(p_detector, 6)
@@ -328,27 +267,17 @@ def fuse_findings(
     return confirmed, candidates
 
 
-# Tạo finding "UNMAPPED:<unit>" cho các unit detector gắn nhãn Vulnerable mà static/RAG không có finding nào.
+# Tạo finding "UNMAPPED:<unit>" cho các unit detector gắn nhãn Vulnerable mà static/RAG không có finding nào
+# (local_units = tập unit_id đã có finding static/RAG).
 # Mục đích: detector là phân loại nhị phân (không biết SWC) nhưng tín hiệu của nó vẫn không bị bỏ qua.
 def detector_findings(
-    detector: dict[str, Any],
-    local_findings: list[dict[str, Any]],
+    unit_results: list[dict[str, Any]],
+    local_units: set[Any],
 ) -> list[dict[str, Any]]:
-    local_units = {item.get("unit_id") for item in local_findings}
-    results = detector.get("unit_results", [])
     findings = []
-    for item in results:
+    for item in unit_results:
         if item.get("label") == "Vulnerable" and item.get("unit_id") not in local_units:
             start_line = item.get("start_line")
-            end_line = item.get("end_line")
-            line_scores = item.get("line_scores")
-            line = item.get("line") or start_line
-            if line_scores and isinstance(line_scores, list) and line_scores and start_line and not line:
-                max_idx = line_scores.index(max(line_scores))
-                calc_line = start_line + max_idx
-                if end_line and calc_line > end_line:
-                    calc_line = end_line
-                line = calc_line
             det_title = "Qwen2.5-14B neural vulnerability signal"
             findings.append({
                 "finding_id": f"UNMAPPED:{item.get('unit_id') or 'source'}",
@@ -359,16 +288,15 @@ def detector_findings(
                 "confidence": round(float(item.get("vulnerability_probability") or 0.0), 6),
                 "sources": ["llm_detector"],
                 "corroborated": False,
-                "line": line,
+                "line": start_line,
                 "start_line": start_line,
                 "end_line": item.get("end_line"),
-                "line_scores": line_scores,
+                "line_scores": item.get("line_scores"),
                 "description": (
                     "The fine-tuned binary classifier crossed its vulnerability threshold. "
                     "Static/RAG did not assign a supported SWC category to this unit."
                 ),
                 "remediation": "Perform targeted manual review and use the Advisor phase for root-cause analysis.",
-                "checklist": [],
                 "evidence": [item],
             })
     return findings
@@ -385,11 +313,8 @@ def fuse_detection(
     static_result: dict[str, Any],
     rag_result: dict[str, Any],
     llm_result: dict[str, Any] | None = None,
-    *,
-    threshold: float = DEFAULT_FINAL_THRESHOLD,
-    configured_weights: dict[str, float] | None = None,
-    require_llm_for_safe: bool = True,
 ) -> dict[str, Any]:
+    threshold = DEFAULT_FINAL_THRESHOLD
     detector = llm_result or {
         "component": "llm_detector",
         "status": "pending",
@@ -408,9 +333,7 @@ def fuse_detection(
     # Adaptive weighting: khi Neural Detector offline hoặc có confidence thấp (< threshold)
     # trong khi RAG/Static phát hiện bằng chứng, tự động tái phân bổ trọng số cho RAG và Static
     # nhằm tránh việc trọng số 65% của detector dập tắt các phát hiện bảo mật đã được xác thực.
-    if configured_weights is not None:
-        weights = dict(configured_weights)
-    elif not _active(detector):
+    if not _active(detector):
         # Detector offline/pending -> chia đều 50/50 cho RAG và Static
         weights = {"llm_detector": 0.0, "rag": 0.50, "static": 0.50}
     elif component_scores["llm_detector"] < detector_threshold and local_findings:
@@ -464,7 +387,7 @@ def fuse_detection(
     )
     if score >= threshold and positive_evidence:
         verdict = "Vulnerable"
-    elif all_required_active or not require_llm_for_safe:
+    elif all_required_active:
         verdict = "Safe"
     else:
         verdict = "Inconclusive"
@@ -475,31 +398,17 @@ def fuse_detection(
         analysis_status = "partial"
     else:
         analysis_status = "inconclusive"
-    binary_findings = detector_findings(detector, local_findings)
+    unit_results = detector.get("unit_results", [])
+    binary_findings = detector_findings(unit_results, {item.get("unit_id") for item in local_findings})
     evidence_findings = [*local_findings, *binary_findings]
-    unit_map = {item.get("unit_id"): item for item in detector.get("unit_results", []) if item.get("unit_id")}
+    unit_map = {item.get("unit_id"): item for item in unit_results if item.get("unit_id")}
     for finding in evidence_findings:
         uid = finding.get("unit_id")
         if uid and uid in unit_map:
-            u_res = unit_map[uid]
-            st_line = u_res.get("start_line")
-            end_line = u_res.get("end_line")
-            l_scores = u_res.get("line_scores")
-            if st_line and not finding.get("start_line"):
-                finding["start_line"] = st_line
-            if end_line and not finding.get("end_line"):
-                finding["end_line"] = end_line
-            if l_scores and isinstance(l_scores, list) and l_scores:
-                finding["line_scores"] = l_scores
-                if not finding.get("line") and st_line:
-                    max_idx = l_scores.index(max(l_scores))
-                    calc_line = st_line + max_idx
-                    if end_line and calc_line > end_line:
-                        calc_line = end_line
-                    finding["line"] = calc_line
+            _apply_detector_lines(finding, unit_map[uid], overwrite=False)
     findings = evidence_findings if verdict == "Vulnerable" else []
     candidate_findings = evidence_findings if verdict != "Vulnerable" else []
-    risk_level = findings[0]["severity"] if findings and verdict == "Vulnerable" else "None"
+    risk_level = findings[0]["severity"] if findings else "None"
     if verdict == "Vulnerable" and not local_findings:
         risk_level = "Unknown"
 
@@ -526,9 +435,7 @@ def fuse_detection(
                 "raw_score": round(component_scores[name], 6),
                 "weight": round(effective_weights[name], 6),
                 "weighted_score": round(component_scores[name] * effective_weights[name], 6),
-                "verdict": components[name].get("verdict")
-                or components[name].get("final_verdict")
-                or "Unknown",
+                "verdict": components[name].get("verdict") or "Unknown",
             }
             for name in components
         },

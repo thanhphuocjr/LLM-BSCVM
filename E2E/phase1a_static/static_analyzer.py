@@ -1,59 +1,51 @@
 """
-static_analyzer.py
-──────────────────────────────────────────────────────────────────────────────
-Module phân tích tĩnh (Static Analysis) dành cho Detector Agent trong
-framework LLM-BSCVM.
+Phase 1A - bộ phân tích tĩnh dựa trên luật (không cần compiler, không gọi Slither).
 
-Tác giả  : Smart Contract Security Expert
-Mô tả    : Phát hiện các lỗ hổng phổ biến trong Solidity bằng cách kết hợp:
-           1. Pattern matching dựa trên Regex (nhanh, deterministic)
-           2. Phân tích ngữ cảnh (context-aware) để giảm false positive
-           3. Phân tích luồng dữ liệu đơn giản (CEI, state-change ordering)
-           4. Phân tích metadata (pragma, imports, tên biến/hàm)
+Phát hiện các lỗ hổng phổ biến trong Solidity bằng cách kết hợp:
+  1. Bảng 27 luật regex có trọng số (VULNERABILITY_REGISTRY): mỗi mẫu dương cộng trọng số vào raw_score,
+     mẫu âm (dấu hiệu phòng vệ) và guard modifier trừ điểm; luật "confirmed" khi raw_score - trừ > 0.25.
+  2. 25 kiểm tra ngữ nghĩa (_run_semantic_checks), cài lại logic tương tự các detector của Slither.
+Kết quả: {"findings": {vuln_type: VulnerabilityFinding}}; static_runner.py chuẩn hoá thành finding của pipeline.
 
-Các lỗ hổng được bao phủ (ánh xạ theo RISK_LEVELS trong Config):
-  Critical : Reentrancy, Access Control, Unchecked External Calls
-  High     : Integer Overflow/Underflow, DoS, Flash Loan, Front-Running
-  Medium   : Timestamp Dependence, Block Info Dependence, Gas Limit,
-             Transaction Ordering Dependency (TOD), Unsafe Type Casting
-  Low      : Outdated Compiler, Naming Conventions, Redundant Code
-──────────────────────────────────────────────────────────────────────────────
+Mức rủi ro của 27 luật:
+  Critical : Reentrancy, Access Control (gồm tx.origin, selfdestruct, rút ETH), Unchecked Calls, Storage Collision
+  High     : Integer Overflow/Underflow, DoS (gas limit, revert), Flash Loan, Front-Running, Signature Replay,
+             Price Oracle Manipulation
+  Medium   : Timestamp / Block Info Dependence, Transaction Ordering, Gas Griefing, Unsafe Type Casting,
+             Incorrect Unary, Tautological Comparison, Divide Before Multiply
+  Low      : Default Visibility, Floating/Outdated Pragma, Naming Conventions, Redundant Code, Deprecated Usage
 """
 
 from __future__ import annotations
 
 import re
-import logging
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Tuple
 
-logger = logging.getLogger(__name__)
-
+from E2E.phase0_parsing.code_units import mask_noncode
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Kiểu dữ liệu nội bộ
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Một lần khớp pattern: dòng, cột, đoạn text khớp, ngữ cảnh xung quanh và trọng số đóng góp vào điểm.
+# Một lần khớp pattern: dòng, đoạn text khớp, ngữ cảnh xung quanh và trọng số đóng góp vào điểm.
 @dataclass
 class PatternMatch:
     """Kết quả một lần khớp pattern."""
     line: int
-    column: int
     matched_text: str
     context: str          # ~3 dòng xung quanh để hiển thị
     pattern_weight: float # trọng số đóng góp vào score
 
 
 # Kết quả cho MỘT loại lỗ hổng (vd reentrancy, SWC-107): danh sách các lần khớp, mức rủi ro,
-# trọng số loại, đã được xác nhận (confirmed) hay chưa, ghi chú theo dòng.
+# đã được xác nhận (confirmed) hay chưa, ghi chú theo dòng.
 @dataclass
 class VulnerabilityFinding:
     """Kết quả phát hiện một loại lỗ hổng."""
     vuln_id: str          # vd: "SWC-107"
     vuln_type: str        # vd: "reentrancy"
     risk_level: str       # Critical / High / Medium / Low
-    type_weight: float    # trọng số loại lỗ hổng (dùng khi tổng hợp score)
     matches: List[PatternMatch] = field(default_factory=list)
     confirmed: bool = False   # True nếu context-check xác nhận thêm
     notes: List[str] = field(default_factory=list)
@@ -64,11 +56,6 @@ class VulnerabilityFinding:
         if not self.matches:
             return 0.0
         return min(1.0, sum(m.pattern_weight for m in self.matches))
-
-    # Điểm có trọng số = raw_score * type_weight (để cộng dồn thành static_score của cả contract).
-    @property
-    def weighted_score(self) -> float:
-        return self.raw_score * self.type_weight
 
 
 # Ranh giới một hàm (tên, tham số, header, vị trí bắt đầu/thân/kết thúc) - dùng cho các kiểm tra ngữ nghĩa.
@@ -117,9 +104,9 @@ class SolidityModifier:
 #   vuln_id      : SWC registry ID (https://swcregistry.io/)
 #   vuln_type    : tên ngắn dùng trong code
 #   risk_level   : mức rủi ro
-#   type_weight  : trọng số loại (tổng không cần = 1, sẽ chuẩn hoá)
 #   patterns     : list[Tuple[regex_str, weight, description]]
 #                  weight = đóng góp của pattern này vào raw_score
+#   negative_patterns : dấu hiệu phòng vệ, trừ điểm (_apply_negative_patterns)
 # ──────────────────────────────────────────────────────────────────────────────
 
 VULNERABILITY_REGISTRY: List[Dict] = [
@@ -130,7 +117,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-107",
         "vuln_type": "reentrancy",
         "risk_level": "Critical",
-        "type_weight": 0.30,
         "patterns": [
             # 1. Low-level call với ETH value trước khi cập nhật state
             (r'\.call\s*\{[^}]*value\s*:', 0.50,
@@ -155,16 +141,12 @@ VULNERABILITY_REGISTRY: List[Dict] = [
             (r'ReentrancyGuard', 0.35,   "Kế thừa ReentrancyGuard"),
             (r'_status\s*==\s*_NOT_ENTERED', 0.25, "Kiểm tra reentrancy thủ công"),
         ],
-        "context_checks": [
-            "check_call_before_state_update",
-        ],
     },
 
     {
         "vuln_id": "SWC-105",
         "vuln_type": "unprotected_ether_withdrawal",
         "risk_level": "Critical",
-        "type_weight": 0.25,
         "patterns": [
             (r'function\s+\w+[^{]*\bpublic\b[^{]*\{(?:(?!require|onlyOwner|modifier|\}).)*selfdestruct',
              0.60, "selfdestruct không được bảo vệ"),
@@ -189,7 +171,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-106",
         "vuln_type": "unprotected_selfdestruct",
         "risk_level": "Critical",
-        "type_weight": 0.25,
         "patterns": [
             (r'selfdestruct\s*\(\s*(?:msg\.sender|tx\.origin|_?owner)\s*\)', 0.50,
              "selfdestruct gửi ETH về owner - kiểm tra bảo vệ"),
@@ -208,7 +189,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-115",
         "vuln_type": "tx_origin_authentication",
         "risk_level": "Critical",
-        "type_weight": 0.22,
         "patterns": [
             (r'tx\.origin\s*==', 0.70,
              "Xác thực dựa trên tx.origin - dễ bị phishing attack"),
@@ -226,7 +206,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-100",
         "vuln_type": "function_default_visibility",
         "risk_level": "Low",
-        "type_weight": 0.05,
         "patterns": [
             # Hàm không có visibility specifier (Solidity < 0.5.0)
             (r'function\s+\w+\s*\([^)]*\)\s*(?:returns\s*\([^)]*\)\s*)?\{',
@@ -247,7 +226,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-101",
         "vuln_type": "access_control",
         "risk_level": "Critical",
-        "type_weight": 0.28,
         "patterns": [
             # Hàm nhạy cảm không có modifier bảo vệ
             (r'function\s+(?:setOwner|transferOwnership|updateOwner)\s*\([^)]*\)\s*(?:public|external)(?!\s+\w*[Oo]nly)',
@@ -279,7 +257,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-104",
         "vuln_type": "unchecked_low_level_calls",
         "risk_level": "Critical",
-        "type_weight": 0.25,
         "patterns": [
             # .call() không kiểm tra return value
             (r'(?<!\(bool\s)(?<!\bbool\b\s)\.\s*call\s*[\({](?:[^;]*;)', 0.45,
@@ -310,7 +287,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-101",  # reused ID for arithmetic
         "vuln_type": "integer_overflow_underflow",
         "risk_level": "High",
-        "type_weight": 0.22,
         "patterns": [
             # Phép toán trực tiếp không có SafeMath (Solidity < 0.8.0)
             (r'pragma\s+solidity\s+[^;]*0\.[0-7]\.', 0.15,
@@ -345,7 +321,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-113",
         "vuln_type": "dos_gas_limit",
         "risk_level": "High",
-        "type_weight": 0.18,
         "patterns": [
             # Unbounded loop trên dynamic array
             (r'for\s*\([^)]*;\s*\w+\s*<\s*\w+\.length\s*;', 0.45,
@@ -376,7 +351,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-128",
         "vuln_type": "dos_revert_griefing",
         "risk_level": "High",
-        "type_weight": 0.15,
         "patterns": [
             # Contract từ chối nhận ETH
             (r'receive\s*\(\s*\)\s*external\s*payable\s*\{[^}]*revert', 0.50,
@@ -396,7 +370,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-FLASHLOAN",  # custom
         "vuln_type": "flash_loan_vulnerability",
         "risk_level": "High",
-        "type_weight": 0.20,
         "patterns": [
             # Sử dụng price oracle dễ bị thao túng
             (r'getPrice\s*\(|getReserve\s*\(|getAmountsOut\s*\(', 0.40,
@@ -429,7 +402,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-114",
         "vuln_type": "front_running",
         "risk_level": "High",
-        "type_weight": 0.15,
         "patterns": [
             # Approve pattern dễ bị front-run
             (r'function\s+approve\s*\([^)]*\)[^{]*\{(?:(?!increaseAllowance|decreaseAllowance).){0,300}',
@@ -459,7 +431,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-116",
         "vuln_type": "timestamp_dependence",
         "risk_level": "Medium",
-        "type_weight": 0.12,
         "patterns": [
             (r'block\.timestamp\s*(?:<|>|<=|>=|==|!=)', 0.45,
              "So sánh block.timestamp - miner có thể điều chỉnh ~15s"),
@@ -486,7 +457,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-120",
         "vuln_type": "block_info_dependence",
         "risk_level": "Medium",
-        "type_weight": 0.10,
         "patterns": [
             # Dùng blockhash làm nguồn random
             (r'blockhash\s*\(', 0.55,
@@ -515,7 +485,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-114",
         "vuln_type": "transaction_ordering_dependency",
         "risk_level": "Medium",
-        "type_weight": 0.10,
         "patterns": [
             # State phụ thuộc vào thứ tự tx
             (r'mapping\s*\(\s*address\s*=>\s*uint\w*\s*\)\s*public\s+(?:balances|amounts)', 0.25,
@@ -536,7 +505,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-126",
         "vuln_type": "insufficient_gas_griefing",
         "risk_level": "Medium",
-        "type_weight": 0.10,
         "patterns": [
             # Forward all gas (nguy hiểm)
             (r'\.call\s*\{[^}]*\}', 0.20,
@@ -560,7 +528,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-CAST",
         "vuln_type": "unsafe_type_casting",
         "risk_level": "Medium",
-        "type_weight": 0.10,
         "patterns": [
             # uint256 -> uint8/16/32/64/128
             (r'uint(?:8|16|32|64|128)\s*\(\s*(?!uint(?:8|16|32|64|128))\w+\s*\)', 0.40,
@@ -592,7 +559,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-103",
         "vuln_type": "floating_pragma",
         "risk_level": "Low",
-        "type_weight": 0.05,
         "patterns": [
             # Floating pragma
             (r'pragma\s+solidity\s+\^0\.[0-7]\.', 0.50,
@@ -622,7 +588,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-NAMING",
         "vuln_type": "naming_convention",
         "risk_level": "Low",
-        "type_weight": 0.03,
         "patterns": [
             # Biến state không có underscore prefix
             (r'^\s*(?:uint|int|bool|address|bytes|string|mapping)\s+(?!_)\w+\s*;', 0.15,
@@ -646,7 +611,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-REDUNDANT",
         "vuln_type": "redundant_code",
         "risk_level": "Low",
-        "type_weight": 0.03,
         "patterns": [
             # Tautology trong require
             (r'require\s*\(\s*true\s*\)', 0.60,
@@ -673,7 +637,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-121",
         "vuln_type": "signature_replay",
         "risk_level": "High",
-        "type_weight": 0.18,
         "patterns": [
             # ecrecover không có nonce
             (r'ecrecover\s*\(', 0.45,
@@ -699,7 +662,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-ORACLE",
         "vuln_type": "price_oracle_manipulation",
         "risk_level": "High",
-        "type_weight": 0.18,
         "patterns": [
             # Tính toán ratio từ balance
             (r'balanceOf\s*\([^)]*\)\s*/\s*totalSupply', 0.50,
@@ -726,7 +688,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-STORAGE",
         "vuln_type": "storage_collision",
         "risk_level": "Critical",
-        "type_weight": 0.20,
         "patterns": [
             # delegatecall vào address không tin tưởng
             (r'\.delegatecall\s*\([^)]*\)', 0.55,
@@ -752,7 +713,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-111",
         "vuln_type": "deprecated_solidity_usage",
         "risk_level": "Low",
-        "type_weight": 0.05,
         "patterns": [
             (r'\bmsg\.gas\b', 0.35, "msg.gas đã bị thay thế bởi gasleft()"),
             (r'\bsha3\s*\(', 0.35, "sha3() đã bị thay thế bởi keccak256()"),
@@ -766,7 +726,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-129",
         "vuln_type": "incorrect_unary_expression",
         "risk_level": "Medium",
-        "type_weight": 0.10,
         "patterns": [
             (r'(?<![+\-*/%&|^])=\s*\+\s*(?:\d+|[A-Za-z_]\w*)', 0.55,
              "Biểu thức '= +' thường là lỗi gõ nhầm của '+='"),
@@ -778,7 +737,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "SWC-135",
         "vuln_type": "tautological_comparison",
         "risk_level": "Medium",
-        "type_weight": 0.10,
         "patterns": [
             (r'\b([A-Za-z_]\w*)\s*(?:==|!=|<=|>=|<|>)\s*\1\b', 0.55,
              "Một giá trị đang được so sánh với chính nó"),
@@ -790,7 +748,6 @@ VULNERABILITY_REGISTRY: List[Dict] = [
         "vuln_id": "STATIC-DIVIDE-BEFORE-MULTIPLY",
         "vuln_type": "divide_before_multiply",
         "risk_level": "Medium",
-        "type_weight": 0.08,
         "patterns": [
             (r'\b[A-Za-z_]\w*\s*/\s*[A-Za-z_]\w*\s*\*\s*[A-Za-z_]\w*\b',
              0.35, "Chia số nguyên trước khi nhân có thể làm mất độ chính xác"),
@@ -804,13 +761,10 @@ VULNERABILITY_REGISTRY: List[Dict] = [
 # Utility helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Đổi vị trí ký tự thành (dòng, cột).
-def _get_line_col(code: str, pos: int) -> Tuple[int, int]:
-    """Trả về (line, column) từ vị trí character trong chuỗi."""
-    prefix = code[:pos]
-    line = prefix.count('\n') + 1
-    col  = pos - prefix.rfind('\n')
-    return line, col
+# Đổi vị trí ký tự thành số dòng (bắt đầu từ 1).
+def _line_at(code: str, pos: int) -> int:
+    """Trả về số dòng của vị trí character trong chuỗi."""
+    return code.count('\n', 0, pos) + 1
 
 
 # Cắt ~120 ký tự quanh vị trí khớp để làm bằng chứng (evidence) hiển thị trong báo cáo.
@@ -822,41 +776,10 @@ def _extract_context(code: str, pos: int, window: int = 120) -> str:
     return snippet.replace('\n', ' ').strip()
 
 
-# Che comment bằng dấu cách (giữ nguyên offset/dòng) để regex không khớp nhầm vào comment.
-def _strip_comments(code: str) -> str:
-    """Mask comments while preserving source offsets and line numbers."""
-    return re.sub(
-        r'/\*[\s\S]*?\*/|//[^\n]*',
-        lambda match: _mask_text(match.group()),
-        code,
-    )
-
-
-# Che chuỗi '...'/"..." bằng dấu cách (giữ nguyên offset/dòng).
-def _strip_strings(code: str) -> str:
-    """Mask string literals while preserving source offsets and line numbers."""
-    code = re.sub(
-        r'"[^"\\]*(?:\\.[^"\\]*)*"',
-        lambda match: _mask_text(match.group()),
-        code,
-    )
-    return re.sub(
-        r"'[^'\\]*(?:\\.[^'\\]*)*'",
-        lambda match: _mask_text(match.group()),
-        code,
-    )
-
-
-# Thay mọi ký tự (trừ xuống dòng) bằng dấu cách - nền tảng cho 2 hàm che ở trên.
-def _mask_text(value: str) -> str:
-    """Replace non-newline characters with spaces so offsets stay stable."""
-    return "".join("\n" if char == "\n" else " " for char in value)
-
-
 # Che cả comment lẫn chuỗi -> mã "sạch" để các regex luật chạy trên đó.
 def _clean_code(code: str) -> str:
-    """Return Solidity code with comments and strings masked."""
-    return _strip_comments(_strip_strings(code))
+    """Return Solidity code with comments and strings masked (offsets preserved)."""
+    return mask_noncode(code)
 
 
 # Tìm vị trí ngoặc đóng khớp với ngoặc mở tại open_pos ({}, (), ...).
@@ -962,6 +885,24 @@ def _iter_modifiers(code: str) -> Iterator[SolidityModifier]:
         )
 
 
+# Kiểm tra phân quyền theo người gọi trong một thân hàm/modifier: require(msg.sender == ...), require(... == msg.sender),
+# if (msg.sender != ...) revert/throw, require(owners[msg.sender]...), require(isOwner(...)/hasRole(...)/authorized(...)).
+# Dùng chung cho extract_guard_modifiers (thân modifier) và is_function_guarded (thân hàm).
+_SENDER_CHECKS = (
+    re.compile(r'require\s*\([^;]*msg\.sender\s*=='),
+    re.compile(r'require\s*\([^;]*==\s*msg\.sender'),
+    re.compile(r'if\s*\([^)]*msg\.sender\s*!=[^)]*\)\s*(?:revert\b|throw\b)'),
+    re.compile(r'if\s*\([^)]*!=\s*msg\.sender[^)]*\)\s*(?:revert\b|throw\b)'),
+    re.compile(r'require\s*\([^;]*\[msg\.sender\]'),
+    re.compile(r'require\s*\([^;]*(?:isOwner|hasRole|authorized)\s*\('),
+)
+
+
+# Thân hàm/modifier có ít nhất một kiểm tra người gọi trong _SENDER_CHECKS không.
+def _has_sender_check(body: str) -> bool:
+    return any(pattern.search(body) for pattern in _SENDER_CHECKS)
+
+
 # Nhiệm vụ: tìm tên các modifier có chức năng phân quyền: tên kiểu onlyXxx/auth/restricted, HOẶC thân modifier
 # có require(msg.sender == ...), if (msg.sender != ...) revert, require(owners[msg.sender]) ...
 # Mục đích: hàm có guard modifier thì không bị báo lỗi access control / withdraw / selfdestruct (giảm false positive).
@@ -984,15 +925,7 @@ def extract_guard_modifiers(code: str) -> set[str]:
         if re.match(r'^(?:only[A-Z]\w*|auth|authorized|restricted)$', name):
             guards.add(name)
     for mod in _iter_modifiers(code):
-        body = mod.body
-        if (
-            re.search(r'require\s*\([^;]*msg\.sender\s*==', body)
-            or re.search(r'require\s*\([^;]*==\s*msg\.sender', body)
-            or re.search(r'if\s*\([^)]*msg\.sender\s*!=[^)]*\)\s*(?:revert\b|throw\b)', body)
-            or re.search(r'if\s*\([^)]*!=\s*msg\.sender[^)]*\)\s*(?:revert\b|throw\b)', body)
-            or re.search(r'require\s*\([^;]*\[msg\.sender\]', body)
-            or re.search(r'require\s*\([^;]*(?:isOwner|hasRole|authorized)\s*\(', body)
-        ):
+        if _has_sender_check(mod.body):
             guards.add(mod.name)
     return guards
 
@@ -1025,16 +958,7 @@ def is_function_guarded(
     for token in re.findall(r'\b([A-Za-z0-9_]+)\b', header):
         if token.startswith("only") and len(token) > 4:
             return True
-    if (
-        re.search(r'require\s*\([^;]*msg\.sender\s*==', body)
-        or re.search(r'require\s*\([^;]*==\s*msg\.sender', body)
-        or re.search(r'if\s*\([^)]*msg\.sender\s*!=[^)]*\)\s*(?:revert\b|throw\b)', body)
-        or re.search(r'if\s*\([^)]*!=\s*msg\.sender[^)]*\)\s*(?:revert\b|throw\b)', body)
-        or re.search(r'require\s*\([^;]*\[msg\.sender\]', body)
-        or re.search(r'require\s*\([^;]*(?:isOwner|hasRole|authorized)\s*\(', body)
-    ):
-        return True
-    return False
+    return _has_sender_check(body)
 
 
 # Tách danh sách đối số theo dấu phẩy ở mức ngoài cùng (không cắt trong ngoặc/chuỗi lồng nhau).
@@ -1307,7 +1231,6 @@ def _build_semantic_finding(
     vuln_id: str,
     vuln_type: str,
     risk_level: str,
-    type_weight: float,
     hits: List[Tuple[int, str, float, str]],
 ) -> Optional[VulnerabilityFinding]:
     if not hits:
@@ -1316,14 +1239,12 @@ def _build_semantic_finding(
         vuln_id=vuln_id,
         vuln_type=vuln_type,
         risk_level=risk_level,
-        type_weight=type_weight,
         confirmed=True,
     )
     for pos, matched_text, weight, description in hits:
-        line, col = _get_line_col(code, pos)
+        line = _line_at(code, pos)
         finding.matches.append(PatternMatch(
             line=line,
-            column=col,
             matched_text=matched_text[:80],
             context=_extract_context(code, pos),
             pattern_weight=weight,
@@ -1349,7 +1270,7 @@ def _detect_bidirectional_controls(code: str) -> Optional[VulnerabilityFinding]:
         if char in controls
     ]
     return _build_semantic_finding(
-        code, "SWC-130", "right_to_left_override", "High", 0.18, hits
+        code, "SWC-130", "right_to_left_override", "High", hits
     )
 
 
@@ -1378,7 +1299,6 @@ def _detect_incorrect_exponentiation(code: str) -> Optional[VulnerabilityFinding
         "STATIC-INCORRECT-EXP",
         "incorrect_exponentiation_operator",
         "High",
-        0.16,
         hits,
     )
 
@@ -1415,7 +1335,6 @@ def _detect_encode_packed_collision(code: str) -> Optional[VulnerabilityFinding]
         "SWC-133",
         "abi_encode_packed_collision",
         "High",
-        0.18,
         hits,
     )
 
@@ -1466,7 +1385,6 @@ def _detect_arbitrary_erc20_transfer_from(code: str) -> Optional[VulnerabilityFi
         "STATIC-ARBITRARY-ERC20",
         "arbitrary_erc20_transfer_from",
         "High",
-        0.16,
         hits,
     )
 
@@ -1503,7 +1421,6 @@ def _detect_unchecked_erc20_transfer(code: str) -> Optional[VulnerabilityFinding
         "STATIC-UNCHECKED-ERC20",
         "unchecked_erc20_transfer",
         "High",
-        0.15,
         hits,
     )
 
@@ -1550,7 +1467,7 @@ def _detect_locked_ether(code: str) -> Optional[VulnerabilityFinding]:
             f"Contract '{contract.name}' nhận được Ether nhưng không có đường gửi Ether ra",
         ))
     return _build_semantic_finding(
-        code, "STATIC-LOCKED-ETHER", "locked_ether", "Medium", 0.12, hits
+        code, "STATIC-LOCKED-ETHER", "locked_ether", "Medium", hits
     )
 
 
@@ -1584,7 +1501,6 @@ def _detect_msg_value_in_loop(code: str) -> Optional[VulnerabilityFinding]:
         "STATIC-MSG-VALUE-LOOP",
         "msg_value_in_loop",
         "Medium",
-        0.11,
         hits,
     )
 
@@ -1617,7 +1533,6 @@ def _detect_delegatecall_in_loop(code: str) -> Optional[VulnerabilityFinding]:
         "SWC-112",
         "delegatecall_in_loop",
         "High",
-        0.16,
         hits,
     )
 
@@ -1696,7 +1611,6 @@ def _detect_missing_zero_address(code: str) -> Optional[VulnerabilityFinding]:
         "STATIC-MISSING-ZERO-ADDRESS",
         "missing_zero_address_validation",
         "Low",
-        0.06,
         _missing_zero_address_hits(code),
     )
 
@@ -1728,7 +1642,6 @@ def _detect_incorrect_shift_in_assembly(code: str) -> Optional[VulnerabilityFind
         "STATIC-INCORRECT-SHIFT",
         "incorrect_shift_in_assembly",
         "High",
-        0.17,
         hits,
     )
 
@@ -1778,7 +1691,6 @@ def _detect_controlled_array_length(code: str) -> Optional[VulnerabilityFinding]
         "STATIC-CONTROLLED-ARRAY-LENGTH",
         "controlled_array_length",
         "High",
-        0.17,
         hits,
     )
 
@@ -1846,7 +1758,6 @@ def _detect_array_by_reference(code: str) -> Optional[VulnerabilityFinding]:
         "STATIC-ARRAY-BY-REFERENCE",
         "array_by_reference",
         "High",
-        0.17,
         hits,
     )
 
@@ -1876,7 +1787,6 @@ def _detect_multiple_constructors(code: str) -> Optional[VulnerabilityFinding]:
         "STATIC-MULTIPLE-CONSTRUCTORS",
         "multiple_constructor_schemes",
         "High",
-        0.18,
         hits,
     )
 
@@ -1912,7 +1822,6 @@ def _detect_public_mapping_nested(code: str) -> Optional[VulnerabilityFinding]:
         "STATIC-PUBLIC-MAPPING-NESTED",
         "public_mapping_with_nested_struct",
         "High",
-        0.17,
         hits,
     )
 
@@ -1947,7 +1856,6 @@ def _detect_mapping_deletion(code: str) -> Optional[VulnerabilityFinding]:
         "STATIC-MAPPING-DELETION",
         "mapping_deletion_in_struct",
         "Medium",
-        0.12,
         hits,
     )
 
@@ -2028,7 +1936,6 @@ def _detect_type_based_tautology(code: str) -> Optional[VulnerabilityFinding]:
         "STATIC-TYPE-TAUTOLOGY",
         "type_based_tautology",
         "Medium",
-        0.12,
         hits,
     )
 
@@ -2061,7 +1968,6 @@ def _detect_boolean_constant_misuse(code: str) -> Optional[VulnerabilityFinding]
         "STATIC-BOOLEAN-CONSTANT",
         "boolean_constant_misuse",
         "Medium",
-        0.10,
         hits,
     )
 
@@ -2114,7 +2020,6 @@ def _detect_dangerous_balance_equality(code: str) -> Optional[VulnerabilityFindi
         "STATIC-DANGEROUS-BALANCE-EQUALITY",
         "dangerous_balance_equality",
         "Medium",
-        0.12,
         hits,
     )
 
@@ -2144,7 +2049,6 @@ def _detect_dangerous_enum_conversion(code: str) -> Optional[VulnerabilityFindin
         "STATIC-ENUM-CONVERSION",
         "dangerous_enum_conversion",
         "Medium",
-        0.11,
         hits,
     )
 
@@ -2191,7 +2095,6 @@ def _detect_return_instead_of_leave(code: str) -> Optional[VulnerabilityFinding]
         "STATIC-RETURN-INSTEAD-OF-LEAVE",
         "return_instead_of_leave",
         "High",
-        0.16,
         hits,
     )
 
@@ -2246,7 +2149,6 @@ def _detect_incorrect_assembly_return(code: str) -> Optional[VulnerabilityFindin
         "STATIC-INCORRECT-ASSEMBLY-RETURN",
         "incorrect_assembly_return",
         "High",
-        0.16,
         hits,
     )
 
@@ -2309,7 +2211,6 @@ def _detect_storage_abiencoderv2_array(code: str) -> Optional[VulnerabilityFindi
         "STATIC-ABIENCODERV2-STORAGE-ARRAY",
         "storage_abiencoderv2_array",
         "High",
-        0.18,
         hits,
     )
 
@@ -2356,7 +2257,6 @@ def _detect_storage_signed_integer_array(code: str) -> Optional[VulnerabilityFin
         "STATIC-SIGNED-STORAGE-ARRAY",
         "signed_storage_array_compiler_bug",
         "High",
-        0.17,
         hits,
     )
 
@@ -2413,7 +2313,6 @@ def _detect_state_variable_shadowing(code: str) -> Optional[VulnerabilityFinding
         "STATIC-STATE-SHADOWING",
         "state_variable_shadowing",
         "High",
-        0.18,
         hits,
     )
 
@@ -2460,7 +2359,6 @@ def _detect_uninitialized_state_address(code: str) -> Optional[VulnerabilityFind
         "STATIC-UNINITIALIZED-STATE-ADDRESS",
         "uninitialized_state_address",
         "High",
-        0.18,
         hits,
     )
 
@@ -2504,102 +2402,22 @@ def _run_semantic_checks(code: str) -> List[VulnerabilityFinding]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Context checks nâng cao (CEI pattern, state-update ordering)
-# ──────────────────────────────────────────────────────────────────────────────
-
-# [Kiểm tra ngữ cảnh] Vi phạm mẫu CEI (Checks-Effects-Interactions): có external call (.call/.transfer/.send)
-# rồi SAU đó mới cập nhật balances/amount/... -> dấu hiệu reentrancy.
-def check_call_before_state_update(code: str) -> List[str]:
-    """
-    Phát hiện vi phạm CEI (Checks-Effects-Interactions):
-    Nếu có external call trước khi cập nhật state variable cùng function,
-    đây là dấu hiệu reentrancy.
-    Trả về danh sách mô tả vi phạm.
-    """
-    violations: List[str] = []
-    # Tìm tất cả function bodies
-    func_pattern = re.compile(
-        r'function\s+(\w+)\s*\([^)]*\)[^{]*\{', re.DOTALL
-    )
-    for func_match in func_pattern.finditer(code):
-        func_name = func_match.group(1)
-        start = func_match.end()
-        # Tìm phần thân hàm (đơn giản: đến dấu } cân bằng)
-        depth, body_start = 1, start
-        for i, ch in enumerate(code[start:], start):
-            if ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0:
-                    body = code[body_start:i]
-                    break
-        else:
-            continue
-
-        clean = _clean_code(body)
-
-        # Tìm vị trí external call
-        call_m = re.search(
-            r'\.call\s*\{[^}]*value|\.call\s*\(|\.transfer\s*\(|\.send\s*\(',
-            clean
-        )
-        if not call_m:
-            continue
-
-        # Tìm state change sau call
-        after_call = clean[call_m.end():]
-        state_change = re.search(
-            r'\b(?:balances?|amounts?|stakes?|deposits?|locked|totalSupply)\b'
-            r'\s*(?:\[.*?\]\s*)?(?:-=|=(?!=)|\+=)',
-            after_call
-        )
-        if state_change:
-            violations.append(
-                f"Hàm '{func_name}': cập nhật state SAU external call "
-                f"(vi phạm CEI pattern)"
-            )
-    return violations
-
-
-# [Kiểm tra ngữ cảnh] Danh sách mô tả các tham số address thiếu kiểm tra zero-address (từ _missing_zero_address_hits).
-def check_missing_zero_address(code: str) -> List[str]:
-    """
-    Report only address parameters that reach state or a call destination.
-
-    This deliberately avoids flagging every address parameter. The usage-based
-    filter mirrors the useful part of Slither's missing-zero-check detector and
-    keeps ordinary lookup/query parameters out of the result.
-    """
-    return [description for _, _, _, description in _missing_zero_address_hits(code)]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # StaticAnalyzer – class chính
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Bộ phân tích tĩnh chính: chạy bảng luật VULNERABILITY_REGISTRY (regex có trọng số + negative pattern)
-# + 25 kiểm tra ngữ nghĩa + kiểm tra ngữ cảnh, rồi tổng hợp thành static_score/verdict.
+# + 25 kiểm tra ngữ nghĩa, trả về các finding theo loại lỗ hổng (static_runner chuẩn hoá và tính điểm).
 class StaticAnalyzer:
     """
     Phân tích tĩnh Smart Contract Solidity.
 
     Cách dùng:
-        analyzer = StaticAnalyzer()
-        result   = analyzer.analyze(solidity_code)
-        score    = result["static_score"]        # float [0, 1]
-        findings = result["findings"]            # Dict[str, VulnerabilityFinding]
+        findings = StaticAnalyzer().analyze(solidity_code)["findings"]   # Dict[str, VulnerabilityFinding]
     """
 
-    RISK_ORDER = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
-
-    # Nạp bảng luật VULNERABILITY_REGISTRY một lần.
+    # Gắn bảng luật VULNERABILITY_REGISTRY.
     def __init__(self):
-        # Build registry một lần
         self._registry = VULNERABILITY_REGISTRY
-        logger.info(
-            f"[StaticAnalyzer] Loaded {len(self._registry)} vulnerability patterns"
-        )
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public API
@@ -2607,28 +2425,15 @@ class StaticAnalyzer:
 
     # [HÀM CHÍNH] Phân tích một đoạn mã (cả contract hoặc một hàm):
     # (1) với mỗi luật: khớp regex, trừ điểm theo negative pattern / guard modifier, confirmed nếu điểm > 0.25;
-    # (2) cộng thêm kết quả 25 kiểm tra ngữ nghĩa; (3) kiểm tra CEI + zero-address (+0.05 điểm mỗi vấn đề);
-    # (4) tính static_score (<= 1), verdict (> 0.25 hoặc có lỗi High/Critical -> Vulnerable), risk_level, summary.
+    # (2) cộng thêm kết quả 25 kiểm tra ngữ nghĩa. Cùng vuln_type thì gộp các lần khớp.
     def analyze(self, contract_code: str, guard_modifiers: Optional[set[str]] = None) -> Dict:
-        """
-        Phân tích contract_code và trả về dict:
-        {
-            "static_score"   : float,          # 0.0 – 1.0
-            "verdict"        : str,             # "Vulnerable" | "Safe"
-            "risk_level"     : str,             # mức rủi ro cao nhất tìm thấy
-            "findings"       : Dict[str, VulnerabilityFinding],
-            "high_risk_list" : List[Dict],      # sorted by risk
-            "context_issues" : List[str],       # từ advanced context checks
-            "summary"        : str,
-        }
-        """
+        """Phân tích contract_code, trả {"findings": Dict[vuln_type, VulnerabilityFinding]}."""
         clean = _clean_code(contract_code)
         if guard_modifiers is None:
             guard_modifiers = extract_guard_modifiers(contract_code)
         functions = list(_iter_functions(clean))
 
         findings: Dict[str, VulnerabilityFinding] = {}
-        total_score = 0.0
 
         for entry in self._registry:
             finding = self._run_pattern_check(
@@ -2646,7 +2451,6 @@ class StaticAnalyzer:
                 finding.confirmed = (
                     finding.raw_score - neg_reduction
                 ) > 0.25
-                total_score += max(0.0, finding.weighted_score - neg_reduction * entry["type_weight"])
                 key = entry["vuln_type"]
                 # Nếu cùng vuln_type xuất hiện nhiều lần, merge
                 if key in findings:
@@ -2658,7 +2462,6 @@ class StaticAnalyzer:
         # Focused semantic checks derived from detector behavior, implemented
         # locally without importing or invoking Slither.
         for finding in _run_semantic_checks(contract_code):
-            total_score += finding.weighted_score
             key = finding.vuln_type
             if key in findings:
                 findings[key].matches.extend(finding.matches)
@@ -2669,36 +2472,7 @@ class StaticAnalyzer:
             else:
                 findings[key] = finding
 
-        # Context checks nâng cao
-        context_issues = check_call_before_state_update(contract_code)
-        context_issues += check_missing_zero_address(contract_code)
-
-        # Nếu context checks phát hiện thêm vấn đề → tăng nhẹ score
-        if context_issues:
-            total_score = min(1.0, total_score + 0.05 * len(context_issues))
-
-        # Chuẩn hoá score
-        static_score = min(1.0, total_score)
-
-        # Mức rủi ro cao nhất
-        max_risk = self._get_max_risk(findings)
-
-        # Danh sách high-risk findings để export
-        high_risk_list = self._build_high_risk_list(findings)
-
-        verdict = "Vulnerable" if static_score > 0.25 or high_risk_list else "Safe"
-
-        summary = self._build_summary(findings, context_issues, static_score, verdict)
-
-        return {
-            "static_score":   static_score,
-            "verdict":        verdict,
-            "risk_level":     max_risk,
-            "findings":       findings,
-            "high_risk_list": high_risk_list,
-            "context_issues": context_issues,
-            "summary":        summary,
-        }
+        return {"findings": findings}
 
     # ─────────────────────────────────────────────────────────────────────────
     # Internal helpers
@@ -2718,7 +2492,6 @@ class StaticAnalyzer:
             vuln_id=entry["vuln_id"],
             vuln_type=entry["vuln_type"],
             risk_level=entry["risk_level"],
-            type_weight=entry["type_weight"],
         )
 
         vuln_id = entry.get("vuln_id")
@@ -2726,52 +2499,48 @@ class StaticAnalyzer:
 
         for pat_tuple in entry.get("patterns", []):
             regex, weight, desc = pat_tuple
-            try:
-                compiled = re.compile(regex, re.DOTALL | re.MULTILINE)
-                for m in compiled.finditer(clean_code):
-                    # Bỏ qua finding nếu nằm trong hàm được bảo vệ hoặc burn số dư chính mình
-                    if is_access_sensitive:
-                        m_pos = m.start()
-                        containing_func = (
-                            next((f for f in functions if f.start <= m_pos <= f.end), None)
-                            if functions
-                            else None
-                        )
-                        if containing_func:
-                            func_body = clean_code[containing_func.body_start:containing_func.end]
-                            if is_function_guarded(containing_func.header, func_body, guard_modifiers):
+            compiled = re.compile(regex, re.DOTALL | re.MULTILINE)
+            for m in compiled.finditer(clean_code):
+                # Bỏ qua finding nếu nằm trong hàm được bảo vệ hoặc burn số dư chính mình
+                if is_access_sensitive:
+                    m_pos = m.start()
+                    containing_func = (
+                        next((f for f in functions if f.start <= m_pos <= f.end), None)
+                        if functions
+                        else None
+                    )
+                    if containing_func:
+                        func_body = clean_code[containing_func.body_start:containing_func.end]
+                        if is_function_guarded(containing_func.header, func_body, guard_modifiers):
+                            continue
+                        if containing_func.name == "burn" and (
+                            "balances[msg.sender]" in func_body
+                            or "burner = msg.sender" in func_body
+                            or "require(_value <= balances[msg.sender])" in func_body
+                        ):
+                            continue
+                    elif not functions and clean_code.strip().startswith("function"):
+                        hdr_m = re.search(r'function\s+[^{]*\{', clean_code)
+                        if hdr_m:
+                            hdr = clean_code[:hdr_m.end()]
+                            bdy = clean_code[hdr_m.end():]
+                            if is_function_guarded(hdr, bdy, guard_modifiers):
                                 continue
-                            if containing_func.name == "burn" and (
-                                "balances[msg.sender]" in func_body
-                                or "burner = msg.sender" in func_body
-                                or "require(_value <= balances[msg.sender])" in func_body
+                            if "function burn" in hdr and (
+                                "balances[msg.sender]" in bdy
+                                or "burner = msg.sender" in bdy
                             ):
                                 continue
-                        elif not functions and clean_code.strip().startswith("function"):
-                            hdr_m = re.search(r'function\s+[^{]*\{', clean_code)
-                            if hdr_m:
-                                hdr = clean_code[:hdr_m.end()]
-                                bdy = clean_code[hdr_m.end():]
-                                if is_function_guarded(hdr, bdy, guard_modifiers):
-                                    continue
-                                if "function burn" in hdr and (
-                                    "balances[msg.sender]" in bdy
-                                    or "burner = msg.sender" in bdy
-                                ):
-                                    continue
 
-                    line, col = _get_line_col(clean_code, m.start())
-                    context = _extract_context(original_code, m.start())
-                    finding.matches.append(PatternMatch(
-                        line=line,
-                        column=col,
-                        matched_text=m.group()[:80],
-                        context=context,
-                        pattern_weight=weight,
-                    ))
-                    finding.notes.append(f"L{line}: {desc}")
-            except re.error as e:
-                logger.debug(f"[StaticAnalyzer] Regex error in {entry['vuln_type']}: {e}")
+                line = _line_at(clean_code, m.start())
+                context = _extract_context(original_code, m.start())
+                finding.matches.append(PatternMatch(
+                    line=line,
+                            matched_text=m.group()[:80],
+                    context=context,
+                    pattern_weight=weight,
+                ))
+                finding.notes.append(f"L{line}: {desc}")
 
         return finding
 
@@ -2790,11 +2559,8 @@ class StaticAnalyzer:
         reduction = 0.0
         for pat_tuple in entry.get("negative_patterns", []):
             regex, weight, _ = pat_tuple
-            try:
-                if re.search(regex, clean_code, re.DOTALL):
-                    reduction += weight
-            except re.error:
-                pass
+            if re.search(regex, clean_code, re.DOTALL):
+                reduction += weight
 
         if guard_modifiers and entry.get("vuln_id") in {"SWC-101", "SWC-105", "SWC-106"}:
             for mod in guard_modifiers:
@@ -2803,64 +2569,6 @@ class StaticAnalyzer:
                     break
 
         return min(raw_score, reduction)
-
-    # Mức rủi ro cao nhất trong các finding (Critical > High > Medium > Low).
-    def _get_max_risk(self, findings: Dict[str, VulnerabilityFinding]) -> str:
-        if not findings:
-            return "None"
-        return max(
-            (f.risk_level for f in findings.values()),
-            key=lambda r: self.RISK_ORDER.get(r, 0),
-            default="None"
-        )
-
-    # Danh sách các match mức High/Critical (sắp theo rủi ro) để xuất ra kết quả.
-    def _build_high_risk_list(
-        self, findings: Dict[str, VulnerabilityFinding]
-    ) -> List[Dict]:
-        result = []
-        for f in findings.values():
-            if self.RISK_ORDER.get(f.risk_level, 0) >= 3:  # Critical or High
-                for m in f.matches:
-                    result.append({
-                        "vuln_id":    f.vuln_id,
-                        "vuln_type":  f.vuln_type,
-                        "risk_level": f.risk_level,
-                        "line":       m.line,
-                        "context":    m.context,
-                        "note":       f.notes[f.matches.index(m)] if f.notes else "",
-                    })
-        return sorted(
-            result,
-            key=lambda x: self.RISK_ORDER.get(x["risk_level"], 0),
-            reverse=True,
-        )
-
-    # Tạo đoạn tóm tắt văn bản: verdict, điểm, các lỗi theo từng mức rủi ro, vấn đề ngữ cảnh.
-    def _build_summary(
-        self,
-        findings: Dict[str, VulnerabilityFinding],
-        context_issues: List[str],
-        score: float,
-        verdict: str,
-    ) -> str:
-        lines = [f"[Static Analysis] Verdict: {verdict}  |  Score: {score:.3f}"]
-        if not findings and not context_issues:
-            lines.append("  → Không phát hiện dấu hiệu lỗ hổng rõ ràng.")
-        else:
-            by_level: Dict[str, List[str]] = {}
-            for f in findings.values():
-                by_level.setdefault(f.risk_level, []).append(
-                    f"{f.vuln_type} ({len(f.matches)} match(es))"
-                )
-            for level in ["Critical", "High", "Medium", "Low"]:
-                if level in by_level:
-                    lines.append(f"  [{level}] " + ", ".join(by_level[level]))
-            if context_issues:
-                lines.append("  [Context Issues]")
-                for ci in context_issues:
-                    lines.append(f"    - {ci}")
-        return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2872,19 +2580,5 @@ def run_static_analysis(
     contract_code: str,
     guard_modifiers: Optional[set[str]] = None,
 ) -> Dict:
-    """
-    Convenience wrapper cho Detector Agent.
-
-    Returns:
-        {
-            "static_score"   : float,
-            "verdict"        : "Vulnerable" | "Safe",
-            "risk_level"     : str,
-            "findings"       : Dict,
-            "high_risk_list" : List[Dict],
-            "context_issues" : List[str],
-            "summary"        : str,
-        }
-    """
-    analyzer = StaticAnalyzer()
-    return analyzer.analyze(contract_code, guard_modifiers=guard_modifiers)
+    """Return {"findings": Dict[vuln_type, VulnerabilityFinding]} for one contract or function."""
+    return StaticAnalyzer().analyze(contract_code, guard_modifiers=guard_modifiers)

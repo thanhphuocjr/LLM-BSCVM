@@ -1,19 +1,15 @@
 """
-E2E/phase5_verifier/behavior_verifier.py
-──────────────────────────────────────────────────────────────────────────────
-Module kiểm tra bảo toàn hành vi dựa trên AST và tín hiệu Observable (Phase 5).
-Thực hiện các yêu cầu trong kế hoạch thẩm định (B5, R-03):
-  - Phân tích cú pháp AST bằng `solc --ast-compact-json` cho cả bản gốc và bản vá.
-  - So sánh tập:
-      * Biến state bị ghi kèm toán tử (ví dụ: balances, _allowances, ...)
-      * Event được gọi (cả cú pháp 0.4 không emit và emit hiện đại)
-      * Lời gọi ngoài (call.value, transfer, send, call)
-      * Biểu thức return và chữ ký hàm
-  - Bản vá chỉ được thêm điều kiện kiểm tra (require, assert) hoặc sắp xếp lại thứ tự câu lệnh (CEI).
-  - Mất một câu lệnh ghi state hoặc transfer ETH/token hợp lệ => REJECT.
-  - Đổi giá trị return => WARN.
-  - Tích hợp kiểm tra Slither locked-ether.
-──────────────────────────────────────────────────────────────────────────────
+Phase 5 - behaviour preservation of the patched units (behavior_verifier.py).
+
+1. Compile original and patch with `solc --ast-compact-json` and compare every patched
+   function on the AST: losing a written state variable or a value-moving call is High,
+   losing an event or the return statement is Medium. Safe rewrites (SafeMath, transfer ->
+   call{value}, safe wrappers) are accepted.
+2. Functions the AST could not cover fall back to the syntactic guard of Phase 4
+   (behavior_guard.validate_observable_behavior) - e.g. every function on solc < 0.4.12,
+   which has no compact JSON AST.
+3. A Slither `locked-ether` finding the patch introduced (absent from the original) is a regression.
+Any finding -> status "failed" -> "Patch rejected: behavioral regression detected".
 """
 
 from __future__ import annotations
@@ -139,7 +135,7 @@ def _collect_function_ast_features(fn_node: dict, state_vars: Set[str] | None = 
             else:
                 return_exprs.append("void")
 
-        for key, val in node.items():
+        for val in node.values():
             if isinstance(val, dict):
                 walk(val)
             elif isinstance(val, list):
@@ -201,10 +197,9 @@ def _compare_unit_behavior_ast(
     fixed_feats = _collect_function_ast_features(fixed_fn_ast, state_vars)
 
     # 1. Kiểm tra mất mát câu lệnh ghi state
-    missing_writes = orig_feats["state_writes"] - fixed_feats["state_writes"]
     # Bỏ qua nếu chỉ đổi toán tử (ví dụ: gán SafeMath qua add)
-    orig_vars = {v for v, op in orig_feats["state_writes"]}
-    fixed_vars = {v for v, op in fixed_feats["state_writes"]}
+    orig_vars = {v for v, _ in orig_feats["state_writes"]}
+    fixed_vars = {v for v, _ in fixed_feats["state_writes"]}
     completely_missing_vars = orig_vars - fixed_vars
 
     if completely_missing_vars:
@@ -255,7 +250,7 @@ def _compare_unit_behavior_ast(
 # [KIỂM TRA HỒI QUY HÀNH VI - Phase 5] Với các hàm đã vá:
 #   1) compile cả 2 bản lấy AST và so sánh từng hàm (_compare_unit_behavior_ast);
 #   2) hàm không so được bằng AST -> dùng guard regex validate_observable_behavior (của Phase 4);
-#   3) thêm cảnh báo Slither "locked-ether" nếu có.
+#   3) thêm cảnh báo Slither "locked-ether" nếu bản vá sinh ra nó (bản gốc không có).
 # status = failed nếu có bất kỳ vi phạm nào -> decide_overall_verdict sẽ ra "Patch rejected: behavioral regression".
 def verify_patch_behavior(
     original_code: str,
@@ -266,18 +261,14 @@ def verify_patch_behavior(
     """
     Xác minh bảo toàn hành vi của bản vá thông qua:
       1. So sánh AST chi tiết (solc --ast-compact-json).
-      2. Bộ tín hiệu Observable regex (fallback & tăng cường).
-      3. Slither locked-ether check.
+      2. Guard regex của Phase 4 cho hàm AST không so được.
+      3. Slither locked-ether do bản vá sinh ra.
     """
-    applied_units = set()
-    for item in patch_outcomes or []:
-        if item.get("status") != "applied":
-            continue
-        uid = str(item.get("unit_id") or "").strip()
-        if not uid and ":" in str(item.get("finding_id") or ""):
-            uid = str(item.get("finding_id")).split(":", 1)[1].strip()
-        if uid and uid not in {"source", "contract"}:
-            applied_units.add(uid)
+    applied_units = {
+        str(item.get("unit_id") or "").strip()
+        for item in patch_outcomes or []
+        if item.get("status") == "applied"
+    } - {"", "source", "contract"}
 
     if not applied_units:
         return {
@@ -354,8 +345,11 @@ def verify_patch_behavior(
                 "evidence": str(error),
             })
 
-    # Tích hợp kiểm tra Slither locked-ether nếu có trong tool_result
-    if tool_result:
+    # Slither locked-ether trên bản vá: chỉ là hồi quy khi bản gốc chưa có cảnh báo này (cảnh báo sẵn có của
+    # contract gốc không phải lỗi của bản vá).
+    tool_result = tool_result or {}
+    original_slither = (tool_result.get("tools") or {}).get("slither", {}).get("original_findings", [])
+    if not any((item.get("check") or item.get("name")) == "locked-ether" for item in original_slither):
         for finding in (tool_result.get("slither") or {}).get("findings", []):
             if (finding.get("check") or finding.get("name")) == "locked-ether":
                 findings.append({

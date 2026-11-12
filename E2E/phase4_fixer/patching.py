@@ -13,7 +13,7 @@ import json
 import re
 from typing import Iterable
 
-from E2E.phase0_parsing.code_units import CodeUnit
+from E2E.phase0_parsing.code_units import CodeUnit, mask_noncode
 
 
 # Căn lề lại hàm thay thế theo thụt lề của contract gốc (mỗi cấp { } thêm 4 dấu cách).
@@ -120,7 +120,8 @@ def lenient_json_string_field(text: str, field: str) -> str | None:
 
 # Nhiệm vụ: lấy ĐÚNG MỘT khai báo hàm từ câu trả lời của model, theo thứ tự:
 # (1) JSON {"replacement": ...} (kể cả JSON hỏng), (2) code fence ```solidity có chứa tên hàm,
-# (3) tìm "function <tên>(" rồi đếm ngoặc (bỏ qua chuỗi/comment); nếu dính thêm hàm khác thì cắt bỏ.
+# (3) tìm "function <tên>(" rồi đếm ngoặc trên mã đã che comment/chuỗi (mask_noncode, giữ nguyên độ dài);
+# nếu dính thêm hàm khác thì cắt bỏ.
 def extract_declaration_body(text: str, target_name: str | None = None) -> str:
     """
     Trích xuất một khai báo hàm/constructor duy nhất từ phản hồi của model.
@@ -174,62 +175,32 @@ def extract_declaration_body(text: str, target_name: str | None = None) -> str:
         return search_space.strip()
 
     start_idx = match.start()
-    brace_idx = search_space.find("{", start_idx)
+    declaration = search_space[start_idx:]
+    # Comments and strings blanked (same length): a brace or `//` inside them is not structure.
+    masked = mask_noncode(declaration)
+    brace_idx = masked.find("{")
     if brace_idx < 0:
-        return search_space[start_idx:].strip()
+        return declaration.strip()
 
-    # 4. Đếm ngoặc chính xác từ brace_idx, bỏ qua string & comment
+    # 4. Đếm ngoặc từ dấu "{" đầu tiên của thân hàm
+    end = len(masked)
     depth = 0
-    quote = ""
-    line_comment = False
-    block_comment = False
-    cursor = brace_idx
-
-    while cursor < len(search_space):
-        char = search_space[cursor]
-        pair = search_space[cursor : cursor + 2]
-        if line_comment:
-            if char == "\n":
-                line_comment = False
-            cursor += 1
-            continue
-        if block_comment:
-            if pair == "*/":
-                block_comment = False
-                cursor += 2
-                continue
-            cursor += 1
-            continue
-        if pair == "//":
-            line_comment = True
-            cursor += 2
-            continue
-        if pair == "/*":
-            block_comment = True
-            cursor += 2
-            continue
-        if char in {'"', "'"}:
-            if not quote:
-                quote = char
-            elif quote == char:
-                quote = ""
-        elif not quote:
-            if char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-                if depth == 0:
-                    cursor += 1
-                    break
-        cursor += 1
-
-    extracted = search_space[start_idx:cursor].strip()
+    for position in range(brace_idx, len(masked)):
+        if masked[position] == "{":
+            depth += 1
+        elif masked[position] == "}":
+            depth -= 1
+            if depth == 0:
+                end = position + 1
+                break
+    extracted = declaration[:end].strip()
 
     # Kiểm tra đảm bảo extracted chỉ chứa MỘT khai báo hàm duy nhất
-    inner_declarations = list(re.finditer(r"\bfunction\s+[A-Za-z_$][\w$]*\s*\(", extracted[10:]))
+    masked_extracted = mask_noncode(extracted)
+    inner_declarations = list(re.finditer(r"\bfunction\s+[A-Za-z_$][\w$]*\s*\(", masked_extracted[10:]))
     if inner_declarations:
         first_inner = inner_declarations[0].start() + 10
-        last_close = extracted.rfind("}", 0, first_inner)
+        last_close = masked_extracted.rfind("}", 0, first_inner)
         if last_close > 0:
             extracted = extracted[: last_close + 1].strip()
 

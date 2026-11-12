@@ -2,7 +2,7 @@
 
 Thư mục này không được đẩy lên GitHub (trừ file này và `data_manifest.json`).
 Mọi đường dẫn được khai báo một lần trong `E2E/config.py`.
-Kiểm tra toàn vẹn: `.venv/bin/python -m E2E.data_tools.build_data_manifest` (SHA-256 của dataset + adapter).
+`data_manifest.json`: SHA-256 của dataset + adapter, chụp ngày 2026-11-04.
 
 ```text
 data/
@@ -19,10 +19,10 @@ data/
 │
 ├── detector_dataset/               DATASET HUẤN LUYỆN DETECTOR (Phase 1C)
 │   └── final-dataset-v12-train.json   10,356 hàm, split train/val/test (dappscan, iaudit_trustllm, kaggle_ds2)
-│                                      `scripts/gpu_server.sh deploy` chép lên GPU server; evaluate_local_detectors dùng test split
+│                                      `scripts/gpu_server.sh deploy` chép lên GPU server
 │
 ├── smartbugs_wild/                 47,398 contract SmartBugs-Wild đã bỏ comment (+ LICENSE, README gốc)
-│                                   đầu vào của VÒNG 1 (scripts/run_batch.sh) và evaluation/benchmark.py
+│                                   đầu vào của VÒNG 1; 3 contract dùng trong tests/test_benchmark_regression.py
 ├── solodit_eval/                   iaudit_solodit.jsonl — tập đánh giá benchmark 9 công cụ
 │
 └── results/                        KẾT QUẢ CHẠY
@@ -42,12 +42,11 @@ data/
     │   └── ham_sua_lan_2_ket_qua.csv (+ _blind: bỏ cột nhận xét của giám khảo vòng 1)
     ├── round2_regress/             VÒNG 2, nhóm 18 hàm mà bản vá vòng 1 sinh lỗi mới (có self-check)
     ├── solodit_9tools/             kết quả benchmark 9 công cụ (details / summary CSV, report.md)
-    ├── local_detector_eval.json    (sinh khi chạy evaluate_local_detectors) static & RAG trên test split
     └── audit_runs/<run_id>/        mỗi lần audit từ web app / CLI (web app đọc lịch sử từ đây)
 ```
 
 Ghi chú:
 
-- `ham_sua_lan_2_ket_qua.csv` của nhóm chính được export trước khi có các cột `selfcheck_*`;
-  export lại (`bash scripts/run_round2.sh export`) cho cùng dữ liệu, thêm 5 cột self-check để trống.
+- Vòng 1, vòng 2 và benchmark 9 công cụ là các lần chạy đã hoàn tất; kết quả nằm ở đây, còn script chạy
+  đã được gỡ khỏi repo ngày 2026-11-12 (vẫn còn trong lịch sử git).
 - Dữ liệu đã xoá/thay thế trong các lần dọn dẹp nằm trong Thùng rác (`~/.Trash/RAG-cleanup-*`) cho tới khi dọn Thùng rác.

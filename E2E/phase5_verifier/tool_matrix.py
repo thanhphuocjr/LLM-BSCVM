@@ -1,21 +1,20 @@
 """
-Phase 5 - security tool matrix on the original and the patched contract.
+Phase 5 - Slither on the original and the patched contract.
 
-Slither (+ Mythril, SmartCheck through SmartBugs/Docker when enabled) runs on both
-versions. Per tool: a finding of the targeted vulnerability class still present on the
-patched lines -> FAIL; a new finding the original did not have -> FAIL; a clean run of a
-tool that does not cover the class -> inconclusive, not PASS. `_policy_verdict` combines
-the tools into passed / failed / inconclusive. The patch must also compile (baseline
-compared with the original, so a contract that never compiled does not blame the patch).
+The patch must first compile (compared with the original as a baseline, so a contract
+that never compiled standalone does not blame the patch). Slither then runs natively on
+both versions:
+  - a finding of the targeted vulnerability class still on the patched lines -> FAIL;
+  - a new High/Critical finding the original did not have                  -> FAIL;
+  - a clean run when Slither does not cover the targeted class              -> inconclusive.
+`_policy_verdict` turns the Slither result into passed / failed / inconclusive.
+(Phase 5 is Slither-only: Mythril/SmartCheck through SmartBugs were removed on 2026-11-12.)
 """
 
 from __future__ import annotations
 
-import concurrent.futures
-import os
 import platform
 import re
-import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -25,169 +24,48 @@ from E2E.common.security_tools import (
     _copy_source_tree,
     _run,
     _run_native_slither,
-    _run_smartbugs_tool,
-    _smartbugs_executable,
 )
+from E2E.common.solc import compiler_error_signatures, select_best_solc
+from E2E.config import RISK_ORDER
+from E2E.phase0_parsing.code_units import parse_code_units
 
 
-SOLC_SELECT_ARTIFACTS = Path.home() / ".solc-select" / "artifacts"
-
-
-SECURITY_TOOL_NAMES = [
-    "slither",
-    "mythril",
-    "smartcheck",
-]
-
-
-CRITICAL_SECURITY_TOOLS = {"slither", "mythril"}
-
-
-DEFAULT_TOOL_TIMEOUTS = {
-    "honeybadger": 180,
-    "maian": 420,
-    "manticore": 900,
-    "mythril": 240,
-    "osiris": 180,
-    "oyente": 180,
-    "securify": 600,
-    "slither": 180,
-    "smartcheck": 180,
-}
-
-
-SEVERITY_ORDER = {
-    "critical": 4,
-    "high": 3,
-    "medium": 2,
-    "low": 1,
-    "informational": 0,
-    "info": 0,
-    "optimization": 0,
-    "unknown": 0,
-}
-
-
-# Đổi mức độ (critical/high/...) thành số để so sánh.
+# Đổi mức độ của tool (High/Medium/Low/Informational...) thành số để so sánh (thang RISK_ORDER của config).
 def _severity_rank(value: Any) -> int:
-    return SEVERITY_ORDER.get(str(value or "unknown").strip().lower(), 0)
+    return RISK_ORDER.get(str(value or "").strip().capitalize(), 0)
 
 
-SWC_CATEGORY_ALIASES = {
-    "SWC-100": {"visibility", "access_control"},
-    "SWC-101": {"arithmetic", "overflow", "underflow"},
-    "SWC-104": {"unchecked_low_level_calls", "unchecked_call", "low_level_call"},
-    "SWC-105": {"prodigal", "unprotected_withdrawal", "ether_withdrawal"},
-    "SWC-106": {"suicidal", "selfdestruct"},
-    "SWC-107": {"reentrancy"},
-    "SWC-113": {"denial_of_service", "dos"},
-    "SWC-115": {"tx_origin"},
-    "SWC-116": {"timestamp", "time_manipulation"},
-    "SWC-128": {"denial_of_service", "dos"},
+# Nhóm lỗ hổng (theo _classify_category của common/security_tools.py) ứng với từng SWC mục tiêu.
+SWC_CATEGORY = {
+    "SWC-100": "access_control",
+    "SWC-101": "arithmetic",
+    "SWC-104": "unchecked_low_level_calls",
+    "SWC-105": "prodigal",
+    "SWC-106": "selfdestruct",
+    "SWC-107": "reentrancy",
+    "SWC-113": "denial_of_service",
+    "SWC-115": "tx_origin",
+    "SWC-116": "timestamp",
+    "SWC-128": "denial_of_service",
 }
 
 
-TOOL_COVERAGE = {
-    "honeybadger": {"honeypot", "prodigal", "reentrancy"},
-    "maian": {"prodigal", "suicidal", "greedy", "selfdestruct", "ether_withdrawal"},
-    "manticore": {
-        "access_control",
-        "arithmetic",
-        "overflow",
-        "reentrancy",
-        "timestamp",
-        "unchecked_low_level_calls",
-    },
-    "mythril": {
-        "access_control",
-        "arithmetic",
-        "overflow",
-        "underflow",
-        "reentrancy",
-        "selfdestruct",
-        "unchecked_low_level_calls",
-        "tx_origin",
-    },
-    "osiris": {"arithmetic", "overflow", "underflow"},
-    "oyente": {"arithmetic", "overflow", "underflow", "reentrancy", "timestamp"},
-    "securify": {
-        "access_control",
-        "front_running",
-        "reentrancy",
-        "unchecked_low_level_calls",
-    },
-    "slither": {
-        "access_control",
-        "arithmetic",
-        "denial_of_service",
-        "reentrancy",
-        "selfdestruct",
-        "timestamp",
-        "tx_origin",
-        "unchecked_low_level_calls",
-    },
-    "smartcheck": {
-        "access_control",
-        "arithmetic",
-        "denial_of_service",
-        "reentrancy",
-        "timestamp",
-        "unchecked_low_level_calls",
-    },
+# Nhóm lỗ hổng Slither phát hiện được. Lỗi mục tiêu ngoài nhóm này: Slither chạy sạch cũng không chứng minh đã sửa.
+SLITHER_COVERAGE = {
+    "access_control",
+    "arithmetic",
+    "denial_of_service",
+    "reentrancy",
+    "selfdestruct",
+    "timestamp",
+    "tx_origin",
+    "unchecked_low_level_calls",
 }
 
 
-# Lấy (major, minor, patch) từ pragma solidity.
-def _pragma_version(code: str) -> tuple[int, int, int] | None:
-    match = re.search(r"pragma\s+solidity\s+([^;]+);", code)
-    if not match:
-        return None
-    version = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", match.group(1))
-    if not version:
-        return None
-    return int(version.group(1)), int(version.group(2)), int(version.group(3) or 0)
-
-
-# Danh sách solc đã cài qua solc-select (phiên bản, đường dẫn), sắp tăng dần.
-def _installed_solc() -> list[tuple[tuple[int, int, int], Path]]:
-    versions = []
-    for path in SOLC_SELECT_ARTIFACTS.glob("solc-*/solc-*"):
-        match = re.search(r"solc-(\d+)\.(\d+)\.(\d+)$", path.name)
-        if match and os.access(path, os.X_OK):
-            versions.append((tuple(map(int, match.groups())), path))
-    return sorted(versions)
-
-
-# Chọn solc cho ma trận tool: bản MỚI NHẤT cùng minor với pragma -> bản gần nhất tương thích -> bản mới nhất.
-def choose_solc(code: str) -> tuple[Path | None, str]:
-    installed = _installed_solc()
-    if not installed:
-        executable = shutil.which("solc")
-        return (Path(executable), "system solc") if executable else (None, "solc not installed")
-    requested = _pragma_version(code)
-    if requested:
-        same_minor = [item for item in installed if item[0][:2] == requested[:2]]
-        if same_minor:
-            return same_minor[-1][1], f"matched pragma {requested[0]}.{requested[1]}"
-        compatible = [item for item in installed if item[0][0] == requested[0] and item[0] >= requested]
-        if compatible:
-            return compatible[0][1], "nearest installed compiler"
-    return installed[-1][1], "latest installed compiler"
-
-
-_ERROR_LOCATION_RE = re.compile(r"(-->\s*\S+:\d+:\d+:?|\S+\.sol:\d+:\d+:?)")
-
-
-# Tập dòng lỗi compile đã bỏ vị trí (để so lỗi bản vá với lỗi bản gốc).
-def _error_lines(text: str) -> set[str]:
-    return {
-        _ERROR_LOCATION_RE.sub("", line).strip()
-        for line in (text or "").splitlines()
-        if "Error" in line
-    }
-
-
-# Biên dịch mã (kèm file phụ thuộc) bằng solc --ast-compact-json trong thư mục tạm; trả trạng thái compile.
+# Biên dịch mã (kèm file phụ thuộc) bằng solc trong thư mục tạm; trả trạng thái compile (theo mã thoát của solc).
+# Không yêu cầu output nào (như vòng sửa): solc < 0.4.12 không có --ast-compact-json, nếu yêu cầu thì mọi contract
+# 0.4.11 bị coi là "không biên dịch được" và Slither không bao giờ chạy ở Phase 5.
 def _compile_source(
     solc: Path,
     code: str,
@@ -196,21 +74,22 @@ def _compile_source(
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="e2e-compile-") as temp_dir:
         source_path, dependency_count = _copy_source_tree(Path(temp_dir), code, file_name, source_root)
-        result = _run([str(solc), "--ast-compact-json", str(source_path)])
-    result.pop("stdout", None)  # the AST is large and not needed here
+        result = _run([str(solc), str(source_path)])
+    result.pop("stdout", None)
     result["compiler"] = str(solc)
     result["host_architecture"] = platform.machine()
     result["copied_solidity_dependencies"] = dependency_count
     return result
 
 
-# Từ các finding mục tiêu -> tập nhóm lỗ hổng (reentrancy, arithmetic...) qua SWC_CATEGORY_ALIASES + từ khoá.
+# Từ các finding mục tiêu -> tập nhóm lỗ hổng (reentrancy, arithmetic...) qua SWC_CATEGORY + từ khoá.
 # Mục đích: biết finding nào của tool là "cùng loại lỗi đã sửa".
 def _target_categories(target_findings: list[dict[str, Any]] | None) -> set[str]:
     categories: set[str] = set()
     for finding in target_findings or []:
         swc = str(finding.get("swc") or finding.get("vuln_id") or "").upper()
-        categories.update(SWC_CATEGORY_ALIASES.get(swc, set()))
+        if swc in SWC_CATEGORY:
+            categories.add(SWC_CATEGORY[swc])
         categories.add(_classify_category(finding.get("title"), finding.get("description"), swc))
     categories.discard("other")
     return categories
@@ -231,8 +110,6 @@ def _finding_lines(finding: dict[str, Any]) -> set[int]:
 # Tập các dòng của bản vá thuộc những hàm đã được nhắm sửa.
 def _target_line_ranges(fixed_code: str, target_findings: list[dict[str, Any]] | None) -> set[int]:
     """Lines of the patched source that belong to the units the findings targeted."""
-    from E2E.phase0_parsing.code_units import parse_code_units
-
     unit_ids = {str(item.get("unit_id")) for item in target_findings or [] if item.get("unit_id")}
     lines: set[int] = set()
     for unit in parse_code_units(fixed_code):
@@ -280,8 +157,9 @@ def _finding_signature(finding: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
-# Chấm MỘT tool: residual (lỗi mục tiêu còn sót) hoặc introduced (lỗi High+ mới) -> FAIL; còn finding khác -> WARN;
-# sạch -> PASS; tool lỗi -> ERROR; không chạy -> SKIPPED. Ghi thêm tool có "phủ" loại lỗi mục tiêu không (applicable).
+# Chấm kết quả Slither: residual (lỗi mục tiêu còn sót) hoặc introduced (lỗi High+ mới) -> FAIL; còn finding khác
+# -> WARN; sạch -> PASS; tool lỗi -> ERROR; không chạy -> SKIPPED. Ghi thêm Slither có "phủ" loại lỗi mục tiêu
+# không (applicable).
 def _evaluate_tool_result(
     tool: str,
     run_status: str,
@@ -300,9 +178,9 @@ def _evaluate_tool_result(
         item
         for item in fixed_findings
         if _finding_signature(item) not in original_signatures
-        and _severity_rank(item.get("severity")) >= SEVERITY_ORDER["high"]
+        and _severity_rank(item.get("severity")) >= RISK_ORDER["High"]
     ]
-    applicable = not target_categories or bool(TOOL_COVERAGE.get(tool, set()) & target_categories)
+    applicable = not target_categories or bool(SLITHER_COVERAGE & target_categories)
     has_fatal_error = bool(error and any(err in error.lower() for err in ("compilation failed", "exception in constructor", "invalid solc compilation")))
     if run_status in {"unavailable", "skipped"}:
         verdict = "SKIPPED"
@@ -341,12 +219,10 @@ def _evaluate_tool_result(
     }
 
 
-# Gộp kết quả các tool thành passed/failed/inconclusive: có tool FAIL -> failed; Slither/Mythril lỗi -> inconclusive;
-# không tool nào chạy xong -> inconclusive; không tool nào phủ loại lỗi mục tiêu -> inconclusive
-# (chạy sạch nhưng tool không phát hiện được loại lỗi đó thì không phải bằng chứng đã sửa); còn lại -> passed.
+# Kết luận của tool: có FAIL -> failed; tool lỗi hoặc không chạy xong -> inconclusive; tool chạy sạch nhưng
+# không phủ loại lỗi mục tiêu -> inconclusive (không phải bằng chứng đã sửa); còn lại -> passed.
 def _policy_verdict(
     tool_results: dict[str, dict[str, Any]],
-    policy: str = "balanced",
     require_applicable: bool = False,
 ) -> dict[str, Any]:
     failed = [name for name, result in tool_results.items() if result.get("verdict") == "FAIL"]
@@ -356,21 +232,15 @@ def _policy_verdict(
         for name, result in tool_results.items()
         if result.get("run_status") == "completed" and result.get("verdict") not in {"ERROR", "SKIPPED"}
     ]
-    critical_errors = sorted(CRITICAL_SECURITY_TOOLS & set(errors))
     if failed:
         return {
             "verdict": "failed",
             "reason": f"Security tools still report residual or introduced findings: {', '.join(failed)}",
         }
-    if policy == "strict" and errors:
+    if errors:
         return {
             "verdict": "inconclusive",
-            "reason": f"Strict policy requires every tool to complete; errors: {', '.join(errors)}",
-        }
-    if critical_errors:
-        return {
-            "verdict": "inconclusive",
-            "reason": f"Critical tool(s) did not complete: {', '.join(critical_errors)}",
+            "reason": f"Tool(s) did not complete: {', '.join(errors)}",
         }
     if not completed:
         return {
@@ -388,89 +258,15 @@ def _policy_verdict(
     }
 
 
-# Chạy MỘT tool trên cả bản gốc và bản vá: Slither chạy native (hoặc qua Docker nếu ưu tiên SmartBugs),
-# các tool khác qua SmartBugs. Trả (kết quả bản gốc, kết quả bản vá).
-def _run_security_tool_pair(
-    tool: str,
-    original_code: str,
-    fixed_code: str,
-    file_name: str,
-    source_root: str | Path | None,
-    smartbugs_executable: Path | None,
-    results_root: Path,
-    solc: Path | None,
-    solc_reason: str,
-    timeout: int,
-    prefer_docker_slither: bool = True,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    # When Docker / SmartBugs is preferred and available, run Slither in Docker
-    use_docker_slither = prefer_docker_slither and smartbugs_executable is not None
-    if tool == "slither" and not use_docker_slither and shutil.which("slither") and solc is not None:
-        original = _run_native_slither(
-            original_code,
-            file_name,
-            source_root,
-            solc,
-            solc_reason,
-        )
-        fixed = _run_native_slither(
-            fixed_code,
-            file_name,
-            source_root,
-            solc,
-            solc_reason,
-        )
-        return original, fixed
-    if smartbugs_executable is not None:
-        original = _run_smartbugs_tool(
-            tool,
-            original_code,
-            file_name,
-            source_root,
-            smartbugs_executable,
-            results_root,
-            "original",
-            timeout,
-        )
-        fixed = _run_smartbugs_tool(
-            tool,
-            fixed_code,
-            file_name,
-            source_root,
-            smartbugs_executable,
-            results_root,
-            "fixed",
-            timeout,
-        )
-        return original, fixed
-    if tool == "slither" and shutil.which("slither") and solc is not None:
-        original = _run_native_slither(
-            original_code,
-            file_name,
-            source_root,
-            solc,
-            solc_reason,
-        )
-        fixed = _run_native_slither(
-            fixed_code,
-            file_name,
-            source_root,
-            solc,
-            solc_reason,
-        )
-        return original, fixed
-    unavailable = {
-        "run_status": "unavailable",
-        "findings": [],
-        "error": "SmartBugs (Docker) is unavailable and no native executable exists for this tool",
-        "elapsed_ms": 0.0,
-    }
-    return unavailable, unavailable
+# Trạng thái ngắn của Slither cho báo cáo (passed / failed / warn / error / skipped / not run).
+def _slither_status(result: dict[str, Any]) -> str:
+    verdict = str(result.get("verdict") or "").upper()
+    status = {"PASS": "passed", "FAIL": "failed", "WARN": "warn", "ERROR": "error", "SKIPPED": "skipped"}
+    return status.get(verdict) or result.get("run_status", "not run")
 
 
-# [HÀM CHÍNH MA TRẬN TOOL] Compile bản vá (so baseline với bản gốc) -> chạy song song các tool (tối đa 4 luồng)
-# trên bản gốc và bản vá -> chấm từng tool (_evaluate_tool_result) -> _policy_verdict -> policy_verdict + summary
-# (pass/fail/warn/error) + tóm tắt riêng cho Slither.
+# [HÀM CHÍNH] Compile bản vá (so baseline với bản gốc) -> chạy Slither native trên bản gốc và bản vá
+# -> chấm (_evaluate_tool_result) -> _policy_verdict -> policy_verdict + tóm tắt riêng cho Slither.
 # Gọi bởi: final_verification.verify_final_patch.
 def verify_security_tool_matrix(
     original_code: str,
@@ -479,15 +275,10 @@ def verify_security_tool_matrix(
     file_name: str = "Contract.sol",
     source_root: str | Path | None = None,
     target_findings: list[dict[str, Any]] | None = None,
-    smartbugs_home: str | Path | None = None,
-    tools: list[str] | None = None,
-    policy: str = "balanced",
-    results_dir: str | Path | None = None,
-    use_smartbugs: bool = True,
-    prefer_docker_slither: bool = True,
 ) -> dict[str, Any]:
-    selected_tools = tools or list(SECURITY_TOOL_NAMES)
-    solc, selection_reason = choose_solc(fixed_code)
+    # Same compiler choice as the repair loop and the AST check (common/solc.py): the lowest
+    # installed solc that satisfies the ORIGINAL pragma, so original and patch are compared fairly.
+    solc, selection_reason, _ = select_best_solc(original_code)
     if solc is None:
         compile_result = {"status": "unavailable", "reason": selection_reason}
     else:
@@ -497,7 +288,9 @@ def verify_security_tool_matrix(
             baseline = _compile_source(solc, original_code, file_name, source_root)
             compile_result["baseline_status"] = baseline["status"]
             if baseline["status"] != "passed":
-                new_errors = _error_lines(compile_result.get("stderr", "")) - _error_lines(baseline.get("stderr", ""))
+                new_errors = compiler_error_signatures(compile_result.get("stderr", "")) - compiler_error_signatures(
+                    baseline.get("stderr", "")
+                )
                 if not new_errors:
                     # The original itself does not compile here (e.g. unresolved imports):
                     # the patch cannot be blamed, but nothing can be verified either.
@@ -505,66 +298,37 @@ def verify_security_tool_matrix(
 
     target_categories = _target_categories(target_findings)
     target_lines = _target_line_ranges(fixed_code, target_findings)
-    if use_smartbugs:
-        smartbugs_executable, smartbugs_reason = _smartbugs_executable(smartbugs_home)
-    else:
-        smartbugs_executable, smartbugs_reason = None, "SmartBugs disabled for this run"
-    result_root = Path(results_dir) if results_dir else Path(tempfile.mkdtemp(prefix="e2e-smartbugs-results-"))
-    tool_results: dict[str, dict[str, Any]] = {}
-
-    # Chạy và chấm một tool (bỏ qua nếu bản vá không compile được).
-    def _execute_single_tool(tool: str) -> tuple[str, dict[str, Any]]:
-        timeout = DEFAULT_TOOL_TIMEOUTS.get(tool, 240)
-        if compile_result.get("status") != "passed":
-            original_run = fixed_run = {
-                "run_status": "skipped",
-                "findings": [],
-                "error": "fixed source did not compile",
-                "elapsed_ms": 0.0,
-            }
-        else:
-            original_run, fixed_run = _run_security_tool_pair(
-                tool,
-                original_code,
-                fixed_code,
-                file_name,
-                source_root,
-                smartbugs_executable,
-                result_root,
-                solc,
-                selection_reason,
-                timeout,
-                prefer_docker_slither=prefer_docker_slither,
-            )
-        evaluated = _evaluate_tool_result(
-            tool,
-            str(fixed_run.get("run_status") or "error"),
-            list(fixed_run.get("findings", [])),
-            list(original_run.get("findings", [])),
-            target_categories,
-            str(fixed_run.get("error") or original_run.get("error") or "") or None,
-            target_lines,
-        )
-        evaluated["elapsed_ms"] = round(
-            float(original_run.get("elapsed_ms") or 0.0)
-            + float(fixed_run.get("elapsed_ms") or 0.0),
-            3,
-        )
-        evaluated["original_run_status"] = original_run.get("run_status")
-        evaluated["fixed_run_status"] = fixed_run.get("run_status")
-        evaluated["command"] = fixed_run.get("command")
-        return tool, evaluated
-
-    max_workers = min(4, len(selected_tools)) if len(selected_tools) > 1 else 1
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_execute_single_tool, tool) for tool in selected_tools]
-        for future in concurrent.futures.as_completed(futures):
-            tool_name, evaluated = future.result()
-            tool_results[tool_name] = evaluated
-
     compile_status = compile_result.get("status")
+
+    # Slither is only run on a patch that compiles.
+    if compile_status != "passed":
+        original_run = fixed_run = {
+            "run_status": "skipped",
+            "findings": [],
+            "error": "fixed source did not compile",
+            "elapsed_ms": 0.0,
+        }
+    else:
+        original_run = _run_native_slither(original_code, file_name, source_root, solc, selection_reason)
+        fixed_run = _run_native_slither(fixed_code, file_name, source_root, solc, selection_reason)
+    slither = _evaluate_tool_result(
+        "slither",
+        str(fixed_run.get("run_status") or "error"),
+        list(fixed_run.get("findings", [])),
+        list(original_run.get("findings", [])),
+        target_categories,
+        str(fixed_run.get("error") or original_run.get("error") or "") or None,
+        target_lines,
+    )
+    slither["elapsed_ms"] = round(
+        float(original_run.get("elapsed_ms") or 0.0) + float(fixed_run.get("elapsed_ms") or 0.0),
+        3,
+    )
+    slither["command"] = fixed_run.get("command")
+    tool_results = {"slither": slither}
+
     if compile_status == "passed":
-        policy_result = _policy_verdict(tool_results, policy, require_applicable=bool(target_categories))
+        policy_result = _policy_verdict(tool_results, require_applicable=bool(target_categories))
     elif compile_status == "failed":
         policy_result = {"verdict": "failed", "reason": "Fixed source does not compile."}
     elif compile_status == "baseline_failed":
@@ -577,52 +341,18 @@ def verify_security_tool_matrix(
             "verdict": "inconclusive",
             "reason": f"Compiler unavailable ({compile_result.get('reason') or compile_status}).",
         }
-    summary = {
-        "pass": sum(1 for item in tool_results.values() if item.get("verdict") == "PASS"),
-        "fail": sum(1 for item in tool_results.values() if item.get("verdict") == "FAIL"),
-        "warn": sum(1 for item in tool_results.values() if item.get("verdict") == "WARN"),
-        "error": sum(1 for item in tool_results.values() if item.get("verdict") == "ERROR"),
-    }
-    slither_result = tool_results.get("slither", {})
-    slither_verdict = str(slither_result.get("verdict") or "").upper()
-    if slither_verdict == "PASS":
-        slither_status = "passed"
-    elif slither_verdict == "FAIL":
-        slither_status = "failed"
-    elif slither_verdict == "WARN":
-        slither_status = "warn"
-    elif slither_verdict == "ERROR":
-        slither_status = "error"
-    elif slither_verdict == "SKIPPED":
-        slither_status = "skipped"
-    elif slither_result.get("run_status") == "completed":
-        slither_status = (
-            "failed"
-            if slither_result.get("residual_target_findings")
-            or slither_result.get("introduced_findings")
-            else "passed"
-        )
-    else:
-        slither_status = slither_result.get("run_status", "not run")
 
     return {
         "component": "tool_verification",
         "status": "ok" if policy_result["verdict"] == "passed" else "partial",
-        "engine": "security_3_tool_matrix",
-        "policy": policy,
+        "engine": "slither",
         "policy_verdict": policy_result["verdict"],
         "policy_reason": policy_result["reason"],
         "compile": compile_result,
-        "smartbugs": {
-            "status": "available" if smartbugs_executable else "unavailable",
-            "reason": smartbugs_reason,
-            "results_dir": str(result_root),
-        },
         "tools": tool_results,
-        "summary": summary,
         "slither": {
-            "status": slither_status,
-            "findings": slither_result.get("findings", []),
-            "verdict": slither_result.get("verdict", "Not run"),
+            "status": _slither_status(slither),
+            "findings": slither.get("findings", []),
+            "verdict": slither.get("verdict", "Not run"),
         },
     }

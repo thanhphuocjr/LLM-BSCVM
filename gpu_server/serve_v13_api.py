@@ -7,10 +7,11 @@ Deploy chuyên dụng trên GPU 0 (NVIDIA RTX 4070 Ti SUPER 16GB).
 
 Kiến trúc "All-in-One":
   - Dùng chung 1 instance mô hình Qwen2.5-Coder-14B-Instruct trong VRAM (~8.5GB).
-  - Phase 1 (Detector): Sử dụng LoRA v13 adapter + score head + line_head để
-    phân loại nhị phân và xuất xác suất chính xác theo ngưỡng tau = 0.700.
-  - Phase 2, 3, 4, 5, 6 (Generative): Sử dụng lm_head để sinh bản vá, phân tích
-    nguyên nhân (Advisor), đánh giá CVSS (Assessor), và đối kháng (Verifier).
+  - POST /api/v1/detect   (Phase 1C, chấm lại bản vá ở Phase 5): LoRA v13 + score head + line_head,
+    phân loại nhị phân, xác suất theo ngưỡng tau = 0.700.
+  - POST /api/v1/generate (Phase 2 Advisor, 3 Assessor, 4 Fixer): tắt adapter, dùng model Instruct gốc.
+  - GET  /api/v1/health   trạng thái server, GPU, VRAM.
+Client phía máy local: E2E/common/gpu_client.py.
 
 Cổng mặc định: 6868
 ══════════════════════════════════════════════════════════════════════════════
@@ -21,11 +22,9 @@ from __future__ import annotations
 import argparse
 import bisect
 import contextlib
-import gc
 import json
 import logging
 import os
-import sys
 import threading
 import time
 from pathlib import Path
@@ -85,12 +84,6 @@ class DetectResponse(BaseModel):
     elapsed_ms: float
 
 
-# Một tin nhắn (role + content) theo định dạng chat.
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
-
 # Body của POST /api/v1/generate: prompt, system prompt, temperature, top_p, max_tokens.
 class ChatRequest(BaseModel):
     prompt: str = Field(..., description="User prompt or instructions")
@@ -105,16 +98,6 @@ class ChatResponse(BaseModel):
     status: str = "ok"
     response: str
     elapsed_ms: float
-
-
-# Body của endpoint tương thích OpenAI /v1/chat/completions.
-class OpenAIChatRequest(BaseModel):
-    model: Optional[str] = "qwen25-v13-14b"
-    messages: List[ChatMessage]
-    max_tokens: Optional[int] = 1500
-    temperature: Optional[float] = 0.2
-    top_p: Optional[float] = 0.9
-    stream: Optional[bool] = False
 
 
 # ─── FastAPI App ───
@@ -282,9 +265,8 @@ def root():
         "docs_url": "/docs",
         "health_url": "/api/v1/health",
         "endpoints": [
-            "POST /api/v1/detect (Phase 1 Classification)",
-            "POST /api/v1/generate (Phase 2-6 Generative Agent)",
-            "POST /v1/chat/completions (OpenAI compatible)",
+            "POST /api/v1/detect (Phase 1C classification)",
+            "POST /api/v1/generate (Phase 2-4 generative agents)",
         ],
     }
 
@@ -393,10 +375,9 @@ def _sampling_kwargs(temperature: Optional[float], top_p: Optional[float]) -> Di
     return {"do_sample": True, "temperature": temperature, "top_p": 0.9 if top_p is None else top_p}
 
 
-# [PHASE 2/3/4 trên server] POST /api/v1/generate (và /api/v1/chat): áp chat template, từ chối prompt > 4096 token
+# [PHASE 2/3/4 trên server] POST /api/v1/generate: áp chat template, từ chối prompt > 4096 token
 # (HTTP 413), sinh văn bản với LoRA TẮT (disable_adapter -> model Instruct gốc), trả câu trả lời.
 @app.post("/api/v1/generate", response_model=ChatResponse)
-@app.post("/api/v1/chat", response_model=ChatResponse)
 def generate_text(req: ChatRequest):
     if not CONTAINER.is_ready:
         raise HTTPException(status_code=503, detail="Mô hình đang khởi tạo, vui lòng thử lại sau.")
@@ -417,7 +398,7 @@ def generate_text(req: ChatRequest):
     if len(prompt_tokens) > 4096:
         raise HTTPException(
             status_code=413,
-            detail=f"Prompt context length exceeded: {len(prompt_tokens)} tokens > 4096. Client must budget contract context (Task B3).",
+            detail=f"Prompt context length exceeded: {len(prompt_tokens)} tokens > 4096. Client must budget contract context.",
         )
 
     inputs = CONTAINER.tokenizer(
@@ -449,71 +430,6 @@ def generate_text(req: ChatRequest):
         response=response_text,
         elapsed_ms=round(elapsed, 2),
     )
-
-
-# POST /v1/chat/completions: endpoint tương thích OpenAI (để cắm vào client agent bất kỳ), cũng tắt LoRA khi sinh.
-@app.post("/v1/chat/completions")
-def openai_chat_completions(req: OpenAIChatRequest):
-    """Endpoint tương thích chuẩn OpenAI để cắm trực tiếp vào bất kỳ agent client nào."""
-    if not CONTAINER.is_ready:
-        raise HTTPException(status_code=503, detail="Mô hình đang khởi tạo.")
-
-    start_t = time.time()
-    formatted_messages = [{"role": m.role, "content": m.content} for m in req.messages]
-    prompt_text = CONTAINER.tokenizer.apply_chat_template(
-        formatted_messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-    prompt_tokens = CONTAINER.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
-    if len(prompt_tokens) > 4096:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Prompt context length exceeded: {len(prompt_tokens)} tokens > 4096. Client must budget contract context (Task B3).",
-        )
-
-    inputs = CONTAINER.tokenizer(
-        prompt_text,
-        return_tensors="pt",
-        truncation=False,
-    ).to(CONTAINER.device)
-
-    input_len = inputs["input_ids"].shape[1]
-    disable_adapter_ctx = (
-        CONTAINER.causal_model.disable_adapter()
-        if hasattr(CONTAINER.causal_model, "disable_adapter")
-        else contextlib.nullcontext()
-    )
-    with GPU_LOCK, torch.no_grad(), disable_adapter_ctx:
-        output_ids = CONTAINER.causal_model.generate(
-            **inputs,
-            **_sampling_kwargs(req.temperature, req.top_p),
-            max_new_tokens=req.max_tokens or 1500,
-            pad_token_id=CONTAINER.tokenizer.pad_token_id or CONTAINER.tokenizer.eos_token_id,
-        )
-
-    generated_ids = output_ids[0][input_len:]
-    content = CONTAINER.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-
-    return {
-        "id": f"chatcmpl-{int(time.time()*1000)}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": req.model or "qwen25-v13-14b",
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {
-            "prompt_tokens": input_len,
-            "completion_tokens": len(generated_ids),
-            "total_tokens": input_len + len(generated_ids),
-        },
-    }
 
 
 # Điểm vào: đọc tham số (host, port 6868, base model, adapter), nạp model rồi chạy uvicorn.

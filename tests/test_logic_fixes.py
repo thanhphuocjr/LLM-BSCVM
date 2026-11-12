@@ -1,5 +1,6 @@
 """Regression tests for the pipeline logic fixes (fusion fail-closed, corroboration,
-RAG exact match, repair-loop carry-over, compile baseline, behaviour guard, CVSS)."""
+RAG exact match, repair-loop carry-over, compile baseline, behaviour guard, CVSS, prompt
+context, LLM JSON salvage, Phase 5 behaviour check)."""
 
 from __future__ import annotations
 
@@ -226,6 +227,18 @@ class CvssAndAgentsTests(unittest.TestCase):
         result = _generate_assessor_section([{"swc": "SWC-107", "unit_id": "A.w"}])
         self.assertEqual(result["assessments"][0]["cvss_score"], 9.1)
         self.assertEqual(result["assessments"][0]["severity"], "Critical")
+        self.assertEqual(result["assessments"][0]["cvss_source"], "swc_default")
+
+    # repair_priority: điểm CVSS cao nhất sửa trước (Fixer vá theo thứ tự này).
+    def test_repair_priority_follows_cvss_score(self) -> None:
+        findings = [
+            {"swc": "SWC-102", "unit_id": "contract"},
+            {"swc": "SWC-107", "unit_id": "A.withdraw"},
+            {"swc": "SWC-116", "unit_id": "A.lottery"},
+        ]
+        result = _generate_assessor_section(findings)
+        order = [(item["swc"], item["repair_priority"]) for item in result["assessments"]]
+        self.assertEqual(order, [("SWC-107", 1), ("SWC-116", 2), ("SWC-102", 3)])
 
     # Advisor kết luận false positive -> finding nằm trong false_positives và không có suggestion.
     def test_advisor_false_positive_is_reported_to_caller(self) -> None:
@@ -233,6 +246,7 @@ class CvssAndAgentsTests(unittest.TestCase):
         class FakeSuggestion:
             error = None
             is_true_positive = False
+            root_cause = "setOwner is guarded by onlyOwner."
 
         # AdvisorAgent giả, luôn trả FakeSuggestion.
         class FakeAgent:
@@ -248,7 +262,41 @@ class CvssAndAgentsTests(unittest.TestCase):
         with patch("E2E.phase2_advisor.advisor_phase.AdvisorAgent", FakeAgent):
             advisor = _generate_advisor_section(findings, "", use_llm=True)
         self.assertEqual(advisor["false_positives"], ["SWC-105:A.setOwner"])
+        self.assertEqual(advisor["false_positive_reasons"], {"SWC-105:A.setOwner": "setOwner is guarded by onlyOwner."})
         self.assertEqual(advisor["suggestions"], [])
+
+    # Kết luận Phase 5 khi không có bản vá: Advisor loại hết -> không cần vá; chỉ còn finding cấp contract -> chưa kết luận.
+    def test_verdict_when_no_patch_was_needed_or_possible(self) -> None:
+        from E2E.phase5_verifier.final_verification import decide_overall_verdict, skipped_verification
+
+        tool_result, behaviour = skipped_verification()
+
+        # Kết luận cho một kết quả GPU giả (finding còn lại / bị loại, số attempt của vòng sửa).
+        def verdict(confirmed: list, dismissed: list, attempts: int) -> str:
+            remote = {"status": "ok", "phases": {
+                "detector": {"confirmed_findings": confirmed, "dismissed_findings": dismissed},
+                "verifier": {"attempts_count": attempts},
+            }}
+            return decide_overall_verdict(
+                remote=remote, fused={"verdict": "Vulnerable"}, code="c", fixed_code="c", patch_applied=False,
+                tool_result=tool_result, behavioral_result=behaviour, fixed_static=None, fixed_rag=None,
+            )
+
+        pragma = {"finding_id": "SWC-103:contract", "swc": "SWC-103"}
+        self.assertEqual(verdict([], [pragma], 0),
+                         "No patch required: the Advisor dismissed every finding as a false positive")
+        self.assertEqual(verdict([pragma], [], 0),
+                         "Inconclusive: no function-level repair target for the confirmed findings")
+        self.assertEqual(verdict([pragma], [], 3), "Patch rejected: no effective patch was applied")
+
+    # Luật triage của Advisor nói rõ kiểm tra tx.origin không phải guard (SWC-115).
+    def test_advisor_rule_does_not_treat_tx_origin_as_a_guard(self) -> None:
+        from E2E.phase2_advisor.advisor import AdvisorAgent
+
+        prompt = AdvisorAgent(llm=object(), knowledge_base=object())._build_prompt(
+            BANK, {"swc": "SWC-115", "unit_code": "function f() public { if (tx.origin == owner) { x = 1; } }"}, ""
+        )
+        self.assertIn("A check on `tx.origin` is NOT a valid guard", prompt)
 
 
 # Chính sách ma trận tool (Phase 5).
@@ -320,8 +368,8 @@ class CompileBaselineTests(unittest.TestCase):
             self.assertTrue(candidate_check.evaluate_compilation("a", "b")["failed"])
 
 
-# Các hàm hỗ trợ batch/Fixer.
-class BatchSupportTests(unittest.TestCase):
+# Các hàm hỗ trợ Fixer / vòng sửa.
+class FixerSupportTests(unittest.TestCase):
     # _version_rules sinh luật cú pháp đúng theo pragma.
     def test_version_rules_follow_the_pragma(self) -> None:
         rules_0424 = fixer._version_rules("pragma solidity ^0.4.24;")
@@ -331,6 +379,16 @@ class BatchSupportTests(unittest.TestCase):
         self.assertIn("DO NOT use the `constructor` keyword", rules_0418)
         self.assertEqual(fixer._version_rules("pragma solidity ^0.8.0;"), "")
 
+    # Feedback lỗi compile giữ dòng mã + dấu ^ của solc (biết định danh nào sai), bỏ đường dẫn file tạm.
+    def test_compiler_feedback_keeps_the_offending_source_line(self) -> None:
+        error = ("Error: Identifier not found or not unique.\n  --> /var/folders/x/T/tmpab.sol:14:56:\n   |\n"
+                 "14 |     function mint(address to, uint256 amount) external onlyOwner {\n"
+                 "   |                                                        ^^^^^^^^^")
+        feedback = candidate_check._compiler_feedback(error)
+        self.assertIn("external onlyOwner {", feedback)
+        self.assertIn("--> Contract.sol:14:56:", feedback)
+        self.assertNotIn("/var/folders", feedback)
+
     # Lỗi solc được ánh xạ đúng về hàm chứa dòng lỗi.
     def test_compiler_errors_are_mapped_to_units(self) -> None:
         new_style = "Error: Invalid token.\n  --> /tmp/x.sol:11:35:\n"
@@ -339,26 +397,116 @@ class BatchSupportTests(unittest.TestCase):
         self.assertEqual(candidate_check.units_with_compiler_errors(BANK, old_style), {"Bank.withdrawAll"})
 
 
-# Khung giờ chạy của batch.
-class BatchScheduleTests(unittest.TestCase):
-    # Khung "19:00-07:30" vắt qua nửa đêm được xử lý đúng.
-    def test_active_hours_window_crossing_midnight(self) -> None:
-        import time as _time
+# Ngữ cảnh contract trong prompt Advisor/Fixer (phase0_parsing/contract_context.py).
+class PromptContextTests(unittest.TestCase):
+    # Contract 0.4: modifier không ngoặc ở contract cha, chuỗi có ";{}", event cũ không emit.
+    LEGACY = """pragma solidity ^0.4.24;
+contract Owned {
+    address public owner;
+    modifier onlyOwner { require(msg.sender == owner); _; }
+}
+contract Vault is Owned {
+    mapping(address => uint) balances;
+    string constant NOTE = "a;b{c}";
+    event Paid(address to, uint amount);
+    function pay(uint amt) public onlyOwner {
+        uint local = amt;
+        balances[msg.sender] -= local;
+        msg.sender.transfer(local);
+        Paid(msg.sender, local);
+    }
+}
+"""
 
-        from E2E.experiments.batch_audit import parse_active_hours, within_active_hours
+    # Biến trạng thái = khai báo cấp contract (có mapping), KHÔNG lấy biến cục bộ trong thân hàm.
+    def test_state_variables_are_contract_level_declarations(self) -> None:
+        from E2E.phase0_parsing.contract_context import build_contract_context
 
-        window = parse_active_hours("19:00-07:30")
+        withdraw_all = next(unit for unit in parse_code_units(BANK) if unit.name == "withdrawAll")
+        context = build_contract_context(withdraw_all, BANK)
+        state_section = context.split("\n\n")[0]
+        self.assertIn("mapping(address => uint256) public balances;", state_section)
+        self.assertNotIn("uint256 amount", state_section)
+        self.assertIn("State writes to preserve: balances[msg.sender] =", context)
+        self.assertNotIn("amount =", context)
 
-        # Tạo thời điểm giả (giờ:phút) để kiểm tra.
-        def at(hour, minute):
-            return _time.struct_time((2026, 1, 1, hour, minute, 0, 0, 1, -1))
+    # Modifier không có dấu ngoặc và modifier của contract cha mà hàm dùng đều được đưa vào ngữ cảnh.
+    def test_inherited_modifier_without_parentheses_is_shown(self) -> None:
+        from E2E.phase0_parsing.contract_context import build_contract_context
 
-        self.assertTrue(within_active_hours(window, at(23, 0)))
-        self.assertTrue(within_active_hours(window, at(7, 29)))
-        self.assertFalse(within_active_hours(window, at(7, 30)))
-        self.assertFalse(within_active_hours(window, at(12, 0)))
-        self.assertTrue(within_active_hours(parse_active_hours("09:00-17:00"), at(9, 0)))
-        self.assertTrue(within_active_hours(None, at(12, 0)))
+        pay = next(unit for unit in parse_code_units(self.LEGACY) if unit.name == "pay")
+        context = build_contract_context(pay, self.LEGACY)
+        self.assertIn("modifier onlyOwner { require(msg.sender == owner); _; }", context)
+        self.assertIn('string constant NOTE = "a;b{c}";', context)
+        self.assertIn("event Paid(address to, uint amount);", context)
+        self.assertIn("State writes to preserve: balances[msg.sender] -=", context)
+        self.assertNotIn("local", context.split("Observable Invariants:")[1].split("\n")[1])
+
+
+# Vớt JSON hỏng của model (common/gpu_client.extract_json) và chuẩn hoá metric CVSS (Phase 3).
+class LlmOutputTests(unittest.TestCase):
+    # JSON hỏng vẫn lấy được đúng các khoá Advisor / Assessor đọc.
+    def test_broken_json_salvages_the_keys_the_agents_read(self) -> None:
+        from E2E.common.gpu_client import extract_json
+
+        advisor = extract_json('{"is_true_positive": false, "root_cause": "guarded by "onlyOwner"", '
+                               '"fix_strategy": "Apply CEI", "evidence_lines": [3,')
+        self.assertIs(advisor["is_true_positive"], False)
+        self.assertEqual(advisor["fix_strategy"], "Apply CEI")
+        assessor = extract_json('{"attack_vector": "N", "privileges_required": "H", "integrity": "H", '
+                                '"justification": "owner only" "scope": "U"}')
+        self.assertEqual((assessor["attack_vector"], assessor["privileges_required"]), ("N", "H"))
+
+    # Metric viết dạng từ ("High", "network") được đổi về chữ cái: điểm và vector luôn khớp nhau.
+    def test_cvss_metric_words_are_normalised(self) -> None:
+        self.assertEqual(
+            compute_cvss_31_base_score("Network", "low", "None", "None", "Unchanged", "None", "Low", "None"),
+            (5.3, "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:N"),
+        )
+        self.assertEqual(compute_cvss_31_base_score("?", "", "x", "y", "z", "q", "w", "e"), compute_cvss_31_base_score())
+
+
+# Advisor: finding cấp contract (không có hàm) được xét trên CHÍNH contract, không phải ca mẫu trong KB.
+class AdvisorTargetTests(unittest.TestCase):
+    # <TargetFunction> của finding SWC-102 (cấp contract) chứa contract Bank, không chứa vulnerable_code của KB.
+    def test_contract_level_finding_targets_the_audited_contract(self) -> None:
+        from E2E.phase2_advisor.advisor import AdvisorAgent
+
+        agent = AdvisorAgent(llm=object(), knowledge_base=object())
+        finding = {"swc": "SWC-102", "title": "Outdated Compiler Version", "severity": "Low",
+                   "vulnerable_code": "contract KnowledgeBaseExample { }"}
+        prompt = agent._build_prompt(BANK, finding, "<RetrievedSecurityKnowledge></RetrievedSecurityKnowledge>")
+        target = prompt.split("<TargetFunction", 1)[1].split("</TargetFunction>", 1)[0]
+        self.assertIn("contract Bank {", target)
+        self.assertNotIn("KnowledgeBaseExample", target)
+
+
+# Phase 5: cảnh báo Slither locked-ether chỉ là hồi quy khi bản vá sinh ra nó.
+class LockedEtherTests(unittest.TestCase):
+    # Một finding locked-ether của Slither (đã chuẩn hoá).
+    LOCKED = {"check": "locked-ether", "name": "locked-ether", "severity": "Medium", "message": "locks Ether"}
+
+    # Chạy verify_patch_behavior với kết quả Slither giả (bản gốc / bản vá).
+    def _behaviour(self, original_findings: list) -> dict:
+        from E2E.phase5_verifier.behavior_verifier import verify_patch_behavior
+
+        tool_result = {
+            "slither": {"findings": [self.LOCKED]},
+            "tools": {"slither": {"original_findings": original_findings}},
+        }
+        withdraw = next(unit for unit in parse_code_units(BANK) if unit.name == "withdraw")
+        patched = BANK.replace(withdraw.code, FIXED_WITHDRAW)
+        return verify_patch_behavior(BANK, patched, [{"unit_id": "Bank.withdraw", "status": "applied"}], tool_result)
+
+    # Bản gốc đã có locked-ether (cảnh báo sẵn có) -> không phải hồi quy của bản vá.
+    def test_pre_existing_locked_ether_is_not_a_regression(self) -> None:
+        self.assertNotIn("slither-locked-ether", [item["check"] for item in self._behaviour([self.LOCKED])["findings"]])
+
+    # Bản vá sinh ra locked-ether -> hồi quy hành vi (status failed).
+    def test_introduced_locked_ether_is_a_regression(self) -> None:
+        behaviour = self._behaviour([])
+        self.assertEqual(behaviour["status"], "failed")
+        self.assertIn("slither-locked-ether", [item["check"] for item in behaviour["findings"]])
 
 
 # Chạy thật gpu_pipeline với server GPU GIẢ (detector giả + Fixer giả) để kiểm tra vòng sửa.
@@ -382,7 +530,7 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
         }
 
     # Chạy run_server_gpu_pipeline với các phụ thuộc được patch (health, detect, generate, Advisor, Assessor...).
-    def _run(self, generate, detect=None, repair=None) -> dict:
+    def _run(self, generate, detect=None) -> dict:
         # Detector giả dùng _reentrancy_probability.
         def fake_detect(code, threshold=0.7, server_url=None, timeout=60):
             return {"vulnerable_probability": _reentrancy_probability(code)}
@@ -400,71 +548,10 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
                 patch.object(fixer, "generate_via_server", side_effect=generate), \
                 patch.object(gpu_pipeline, "_generate_advisor_section", side_effect=deterministic_advisor), \
                 patch.object(gpu_pipeline, "_generate_assessor_section", side_effect=deterministic_assessor), \
-                patch.object(gpu_pipeline, "_apply_heuristic_security_patch", side_effect=lambda code, *a, **k: (code, [])), \
                 patch.object(candidate_check, "run_rag", return_value=dict(self.EMPTY_RAG)), \
                 patch("builtins.print"):
             request = self._request()
-            request["execution"]["repair"].update(repair or {})
             return gpu_pipeline.run_server_gpu_pipeline(request)
-
-    # single_pass: lấy bản vá đầu tiên, gọi Fixer đúng 1 lần, không kiểm chứng.
-    def test_single_pass_keeps_first_patch_without_verification(self) -> None:
-        prompts: list[str] = []
-
-        # Fixer giả trả bản vá đúng (CEI).
-        def generate(prompt, **kwargs):
-            prompts.append(prompt)
-            if "Target vulnerable function: `withdrawAll`" in prompt:
-                return json.dumps({"replacement": FIXED_WITHDRAW_ALL})
-            return json.dumps({"replacement": FIXED_WITHDRAW})
-
-        with patch.object(gpu_pipeline, "verify_candidate", side_effect=AssertionError("must not verify")):
-            result = self._run(generate, repair={"single_pass": True})
-        verifier = result["phases"]["verifier"]
-        self.assertEqual(verifier["overall_verdict"], "UNVERIFIED")
-        self.assertEqual(verifier["attempts_count"], 1)
-        self.assertEqual(len(prompts), 2)
-        applied = {item["unit_id"] for item in result["patch_outcomes"] if item["status"] == "applied"}
-        self.assertEqual(applied, {"Bank.withdraw", "Bank.withdrawAll"})
-        self.assertEqual(
-            {item["status"] for item in verifier["verifications"] if item["unit_id"] in applied}, {"SKIPPED"}
-        )
-        self.assertEqual(result["phases"]["detector"]["fixed"]["unit_results"], [])
-
-    # single_pass: bản vá vi phạm guard vẫn được giữ, chỉ ghi guard_warning.
-    def test_single_pass_keeps_guard_violation_as_warning(self) -> None:
-        # Fixer giả trả bản vá xoá mất hành vi.
-        def generate(prompt, **kwargs):
-            if "Target vulnerable function: `withdraw`" in prompt:
-                return json.dumps({"replacement": (
-                    "function withdraw(uint256 amount) external {\n"
-                    "        require(balances[msg.sender] >= amount);\n"
-                    "    }"
-                )})
-            return json.dumps({"replacement": FIXED_WITHDRAW_ALL})
-
-        result = self._run(generate, repair={"single_pass": True})
-        outcome = next(item for item in result["patch_outcomes"] if item["unit_id"] == "Bank.withdraw")
-        self.assertEqual(outcome["status"], "applied")
-        self.assertIn("removed", outcome["guard_warning"])
-
-    # single_pass: model trả nguyên hàm cũ -> status "unchanged" kèm lý do của model.
-    def test_single_pass_reports_unchanged_reply_with_rationale(self) -> None:
-        original_withdraw_all = next(u.code for u in parse_code_units(BANK) if u.name == "withdrawAll")
-
-        # Fixer giả trả lại hàm gốc.
-        def generate(prompt, **kwargs):
-            if "Target vulnerable function: `withdrawAll`" in prompt:
-                return json.dumps({"replacement": original_withdraw_all, "why": "Not exploitable here."})
-            return json.dumps({"replacement": FIXED_WITHDRAW, "why": "Moved the state update before the call."})
-
-        result = self._run(generate, repair={"single_pass": True})
-        by_unit = {item["unit_id"]: item for item in result["patch_outcomes"]}
-        self.assertEqual(by_unit["Bank.withdrawAll"]["status"], "unchanged")
-        self.assertEqual(by_unit["Bank.withdrawAll"]["rationale"], "Not exploitable here.")
-        self.assertEqual(by_unit["Bank.withdraw"]["rationale"], "Moved the state update before the call.")
-        self.assertEqual({item["engine"] for item in by_unit.values()}, {"llm_fixer"})
-        self.assertEqual(result["phases"]["assessor"]["status"], "skipped")
 
     # Vòng sửa: lần 2 giữ bản vá đã đạt của lần 1, chỉ vá lại hàm còn lỗi.
     def test_second_attempt_keeps_first_attempt_patch(self) -> None:
@@ -481,14 +568,14 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
 
         result = self._run(generate)
         verifier = result["phases"]["verifier"]
-        fixed_code = result["fixed_code"]
+        fixed_code = result["phases"]["fixer"]["fixed_code"]
         self.assertEqual(verifier["overall_verdict"], "PASS")
         self.assertEqual(verifier["attempts_count"], 2)
         self.assertEqual(_reentrancy_probability(FIXED_WITHDRAW), 0.05)
         for unit in parse_code_units(fixed_code):
             if unit.name in {"withdraw", "withdrawAll"}:
                 self.assertEqual(_reentrancy_probability(unit.code), 0.05, unit.unit_id)
-        applied = {item["unit_id"] for item in result["patch_outcomes"] if item["status"] == "applied"}
+        applied = {item["unit_id"] for item in result["phases"]["fixer"]["patch_outcomes"] if item["status"] == "applied"}
         self.assertEqual(applied, {"Bank.withdraw", "Bank.withdrawAll"})
         self.assertEqual(result["phases"]["detector"]["fixed"]["verdict"], "Safe")
 

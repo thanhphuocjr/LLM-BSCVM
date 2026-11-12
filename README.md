@@ -17,14 +17,12 @@ RAG/
 ├── README.md, requirements.txt, .env.example
 ├── scripts/               các lệnh chạy (gọi từ thư mục gốc hoặc bất kỳ đâu)
 │   ├── run_webapp.sh      chạy web app (http://127.0.0.1:8080)
-│   ├── run_batch.sh       VÒNG 1: batch audit SmartBugs-Wild (nền, resume được)
-│   ├── run_round2.sh      VÒNG 2: sửa lại các hàm bị chấm chưa đạt ở vòng 1
 │   └── gpu_server.sh      điều khiển GPU server: start | stop | status | logs | deploy | pull
 │
 ├── E2E/                   toàn bộ code chạy trên máy local (package Python)
-│   ├── config.py          NƠI DUY NHẤT khai báo đường dẫn, ngưỡng, trọng số
+│   ├── config.py          NƠI DUY NHẤT khai báo đường dẫn, ngưỡng, trọng số, số lần gọi LLM
 │   ├── run.py             CLI: python -m E2E.run <file.sol>
-│   ├── pipeline/          LUỒNG CHẠY: orchestrator.py (Phase 0→6), gpu_pipeline.py (Phase 1C→5), phases.py
+│   ├── pipeline/          LUỒNG CHẠY: orchestrator.py (Phase 0→6), gpu_pipeline.py (Phase 1C→5)
 │   ├── phase0_parsing/    tách contract thành hàm (code_units.py), ngữ cảnh cho prompt (contract_context.py)
 │   ├── phase1a_static/    phân tích tĩnh: static_analyzer.py (bộ luật), static_runner.py (+ Slither)
 │   ├── phase1b_rag/       XÂY cơ sở tri thức (build_knowledge_base.py), 37 SWC agent, retriever TF-IDF, rag_runner
@@ -32,22 +30,18 @@ RAG/
 │   ├── phase1_fusion/     fusion.py + fusion_calibration.json
 │   ├── phase2_advisor/    advisor.py (LLM + tri thức sửa lỗi), advisor_phase.py (lọc false positive)
 │   ├── phase3_assessor/   assessor.py (CVSS v3.1), assessor_phase.py
-│   ├── phase4_fixer/      fixer.py (prompt + vá), patching.py, behavior_guard.py, heuristic_fallback.py
+│   ├── phase4_fixer/      fixer.py (prompt + vá), patching.py, behavior_guard.py
 │   ├── phase5_verifier/   candidate_check.py (trong vòng sửa), final_verification.py, tool_matrix.py, behavior_verifier.py
 │   ├── phase6_reporter/   report.py (MD/HTML/PDF), vulnerability_reference.py
-│   ├── common/            gpu_client.py, security_tools.py (Slither/SmartBugs), solc.py, io_utils.py, ...
-│   ├── experiments/       batch_audit.py (vòng 1), repair_round2.py (vòng 2)
-│   ├── evaluation/        benchmark.py, evaluate_local_detectors.py, benchmark_solodit_9tools.py
-│   └── data_tools/        strip_comments.py (làm sạch SmartBugs-Wild), build_data_manifest.py
+│   └── common/            gpu_client.py, security_tools.py (Slither), solc.py, io_utils.py, ...
 │
 ├── gpu_server/            code chạy TRÊN GPU server (scripts/gpu_server.sh deploy đẩy lên ~/server_train)
 │   ├── train_qwen25_v13.py, run_train.sh, setup.sh    huấn luyện detector v13
-│   ├── serve_v13_api.py, service.sh, run/stop/status_api_server.sh   API /detect + /generate
-│   └── merge_lora_weights.py                          gộp LoRA vào base model (tuỳ chọn)
+│   └── serve_v13_api.py, service.sh, run/stop/status_api_server.sh   API /health + /detect + /generate
 │
 ├── webapp/                app.py (FastAPI) + static/ (giao diện)
 ├── demo_contracts/        VulnerableBank, SafeBank, AccessControl (web app "Mẫu", CLI, test)
-├── tests/                 89 unit/integration test
+├── tests/                 89 unit/integration test (gồm hồi quy static + fusion trên 3 contract SmartBugs-Wild)
 ├── data/                  (local) MỌI dataset + kết quả chạy — xem data/README.md
 ├── models/                (local) qwen25-v13-14b-detector-final/ — adapter LoRA + threshold_config.json
 └── docs/                  (local) bài báo LLM-BSCVM (PDF)
@@ -68,7 +62,7 @@ Phase 2   Advisor: đúng/sai, nguyên nhân, hướng sửa  phase2_advisor/
 Phase 3   Assessor: CVSS v3.1, thứ tự ưu tiên        phase3_assessor/
 Phase 4   Fixer: vá từng hàm                          phase4_fixer/fixer.py
 Phase 5   kiểm chứng: compile + detector + static/RAG (vòng sửa ≤ 3 lần, candidate_check.py)
-          rồi ma trận Slither/Mythril/SmartCheck + so sánh AST (final_verification.py)
+          rồi compile + Slither + so sánh AST + static/RAG (final_verification.py)
 Phase 6   báo cáo Markdown / HTML / PDF              phase6_reporter/report.py
 ```
 
@@ -95,8 +89,7 @@ python3.12 -m venv .venv
 cp .env.example .env            # điền SERVER_GPU_URL
 ```
 
-Công cụ ngoài: `solc-select` (+ các bản solc cần dùng) và `slither-analyzer`; tuỳ chọn SmartBugs tại
-`.tools/smartbugs` + Docker cho Mythril/SmartCheck.
+Công cụ ngoài: `solc-select` (+ các bản solc cần dùng) và `slither-analyzer`.
 
 > Không bọc `.venv/bin/python` bằng `timeout`/`gtimeout` (binary x86_64 làm python chạy sai kiến trúc, lỗi `pydantic_core`).
 
@@ -106,10 +99,8 @@ Công cụ ngoài: `solc-select` (+ các bản solc cần dùng) và `slither-an
 
 | Bước | Lệnh | Đầu vào → đầu ra |
 | --- | --- | --- |
-| Làm sạch corpus | `.venv/bin/python -m E2E.data_tools.strip_comments` | bỏ comment 47,398 contract SmartBugs-Wild |
 | Xây cơ sở tri thức (Phase 1B/2) | `.venv/bin/python -m E2E.phase1b_rag.build_knowledge_base` | `data/knowledge_base/source/` → `built/` (tất định: cùng đầu vào cho artifact giống hệt từng byte) |
 | Huấn luyện detector (Phase 1C) | trên server: `cd ~/server_train && bash setup.sh && bash run_train.sh` | `data/detector_dataset/` → adapter v13; `./scripts/gpu_server.sh pull` kéo về `models/` |
-| Kiểm tra toàn vẹn dữ liệu | `.venv/bin/python -m E2E.data_tools.build_data_manifest` | ghi `data/data_manifest.json` |
 
 ---
 
@@ -129,30 +120,9 @@ SERVER_IP=100.122.153.35 ./scripts/gpu_server.sh status
 
 ```bash
 .venv/bin/python -m E2E.run demo_contracts/VulnerableBank.sol
-.venv/bin/python -m E2E.run Contract.sol --tools slither mythril smartcheck   # ma trận Phase 5
 ```
 
-Tham số: `--run-id`, `--detector-threshold`, `--max-fix-attempts 1..3`, `--full-matrix`, `--solidity-root`.
-
-**Vòng 1 — batch SmartBugs-Wild** (một contract một lúc, tự chờ server, dừng/tiếp tục bất kỳ lúc nào)
-
-```bash
-bash scripts/run_batch.sh start | stop | stop-now | status | log | export [N] | retry-failed
-ACTIVE_HOURS=19:00-07:30 bash scripts/run_batch.sh start
-```
-
-Mỗi hàm lỗi được gọi Fixer một lần (single-pass), không kiểm chứng trong pipeline; kết quả
-`data/results/round1/round1_functions.csv` được chấm bởi giám khảo ngoài (`data/results/round1_judge/`).
-
-**Vòng 2 — sửa lại các hàm chưa đạt**
-
-```bash
-bash scripts/run_round2.sh prepare | preview <stt> | start | stop | status | export [--blind]
-GROUP=regress bash scripts/run_round2.sh start     # 18 hàm mà bản vá vòng 1 sinh lỗi mới (có self-check)
-```
-
-Không cột `claude_*` (nhận xét của giám khảo) nào được đưa vào prompt. Nhóm chính 614 hàm chạy **không**
-self-check, nhóm 18 hàm hồi quy chạy **có** self-check — báo cáo riêng hai nhóm.
+Tham số: `--run-id`, `--detector-threshold`, `--max-fix-attempts 1..3`, `--solidity-root`.
 
 ---
 
@@ -160,10 +130,9 @@ self-check, nhóm 18 hàm hồi quy chạy **có** self-check — báo cáo riê
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest discover -s tests -t .   # 89 test
-.venv/bin/python -m E2E.evaluation.benchmark                     # hồi quy static trên 3 contract SmartBugs
-.venv/bin/python -m E2E.evaluation.evaluate_local_detectors      # static & RAG trên test split v12
-.venv/bin/python -m E2E.evaluation.benchmark_solodit_9tools --split test --workers 4
 ```
+
+Kết quả các lần chạy thực nghiệm (vòng 1, vòng 2, benchmark 9 công cụ) đã lưu trong `data/results/` (xem `data/README.md`).
 
 Kết quả detector v13 trên test split (`data/results/detector_v13_training/train_v13_20261005_143623.log`):
 

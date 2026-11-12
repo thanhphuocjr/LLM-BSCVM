@@ -1,5 +1,14 @@
+"""
+Web app (FastAPI) of the audit pipeline: ./scripts/run_webapp.sh -> http://127.0.0.1:8080.
+
+The app has no audit logic of its own: POST /api/audit/submit runs the CLI
+(`python -m E2E.run <file>`, Phase 0 -> 6) in a subprocess and the other endpoints read the
+artifacts of data/results/audit_runs/<run_id>/ for the page in webapp/static/.
+"""
+
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -11,28 +20,19 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from E2E.common.gpu_client import check_server_health, load_env_file
-from E2E.config import DEMO_CONTRACTS_DIR, DETECTOR_ADAPTER_DIR, KNOWLEDGE_BASE_DIR, PROJECT_ROOT, RUNS_DIR
+from E2E.common.gpu_client import check_server_health
+from E2E.config import DEMO_CONTRACTS_DIR, PROJECT_ROOT, RUNS_DIR
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 app = FastAPI(
     title="Smart Contract Vulnerability Audit API (LLM-BSCVM v13 Qwen2.5-Coder-14B)",
-    description="Full-featured Web App API for Smart Contract Security Auditing",
+    description="Web app API of the LLM-BSCVM audit pipeline",
     version="2.0.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
 )
 
 
@@ -45,13 +45,13 @@ async def add_no_cache_headers(request, call_next):
     response.headers["Expires"] = "0"
     return response
 
-# In-memory execution tracker: run_id -> { "process": Popen, "log": str, "status": str, "started_at": float }
+
+# In-memory execution tracker: run_id -> {"process": Popen | None, "status": str, "started_at": float}
 ACTIVE_TASKS: Dict[str, Dict[str, Any]] = {}
 TASK_LOCK = threading.Lock()
 
 
 RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
-ALLOWED_TOOLS = {"slither", "mythril", "smartcheck"}
 
 
 # Trả thư mục data/results/audit_runs/<run_id>; từ chối run_id có ".." hoặc ký tự lạ (chống path traversal) -> HTTP 400.
@@ -69,160 +69,6 @@ def safe_contract_file_name(file_name: str) -> str:
     return f"{stem[:64]}.sol"
 
 
-# Body của POST /api/audit/submit: mã Solidity, tên file, ngưỡng detector (mặc định 0.70), tool Phase 5 ("slither" hoặc "all").
-class AuditRequest(BaseModel):
-    code: str = Field(..., description="Solidity smart contract code")
-    file_name: str = Field(default="Contract.sol", description="Contract filename")
-    detector_threshold: float = Field(default=0.700, description="Detector threshold (default 0.700 for v13)")
-    tools: str = Field(default="slither", description="Security tools: slither or all")
-
-
-# Body của POST /api/contract/prepare: mã Solidity + tên file.
-class PrepareRequest(BaseModel):
-    code: str = Field(..., description="Solidity smart contract code to decompose")
-    file_name: str = Field(default="Contract.sol", description="Contract filename")
-
-
-# [Phase 0 xem trước trên web] Tách contract thành các hàm (parse_code_units) và trích "khung" contract:
-# pragma, import, tên contract, biến trạng thái, modifier, event, ngữ cảnh từng hàm, skeleton.
-# Mục đích: ngay khi dán mã, giao diện hiển thị được danh sách hàm trước khi chạy audit thật.
-def prepare_contract_context(code: str, file_name: str = "Contract.sol") -> Dict[str, Any]:
-    """Phase 0 Prepare: Decomposes full contract into individual functions and extracts contract skeleton context."""
-    from E2E.phase0_parsing.code_units import parse_code_units
-
-    if not code.strip():
-        return {
-            "status": "empty",
-            "file_name": file_name,
-            "contract_name": "Contract",
-            "pragmas": [],
-            "imports": [],
-            "contracts": [],
-            "state_variables": [],
-            "modifiers": [],
-            "events": [],
-            "code_units": [],
-            "total_units": 0,
-            "total_lines": 0,
-            "skeleton": "",
-        }
-
-    lines = code.splitlines()
-    total_lines = len(lines)
-
-    # 1. Extract AST code units
-    units = parse_code_units(code)
-
-    # 2. Extract Pragma, Imports, Contracts, Modifiers, Events
-    pragmas = [line.strip() for line in re.findall(r"pragma\s+[^;]+;", code)]
-    imports = [line.strip() for line in re.findall(r"import\s+[^;]+;", code)]
-    contracts = re.findall(r"\b(?:abstract\s+)?(?:contract|library|interface)\s+([A-Za-z_$][\w$]*)", code)
-    primary_contract = contracts[0] if contracts else Path(file_name).stem
-
-    modifiers_declared = re.findall(r"\bmodifier\s+([A-Za-z_$][\w$]*)", code)
-    events_declared = re.findall(r"\bevent\s+([A-Za-z_$][\w$]*)", code)
-
-    # State variables
-    state_variables = []
-    for line in lines:
-        st = line.strip()
-        if (
-            st.startswith(("mapping", "address", "uint", "int", "bool", "bytes", "string"))
-            and ";" in st
-            and "(" not in st.split(";")[0].split("=")[0]
-        ):
-            state_variables.append(st)
-
-    # Process each unit with enriched metadata
-    processed_units = []
-    for u in units:
-        u_dict = u.to_dict()
-        u_code = u.code.strip()
-        u_lines = u_code.splitlines()
-        first_line = u_lines[0] if u_lines else ""
-
-        # Determine visibility
-        vis = "public"
-        for v in ("external", "public", "internal", "private"):
-            if re.search(rf"\b{v}\b", first_line):
-                vis = v
-                break
-
-        # Determine mutability
-        mut = "nonpayable"
-        for m in ("pure", "view", "payable"):
-            if re.search(rf"\b{m}\b", first_line):
-                mut = m
-                break
-
-        # Modifiers applied
-        applied_mods = []
-        for mod in modifiers_declared:
-            if re.search(rf"\b{re.escape(mod)}\b", first_line):
-                applied_mods.append(mod)
-
-        # Signature header (up to '{' or ';')
-        sig_match = re.search(r"^(.*?)(?:\{|;)", u_code, re.DOTALL)
-        signature = sig_match.group(1).strip() if sig_match else first_line.strip()
-        signature = re.sub(r"\s+", " ", signature)
-
-        u_dict.update({
-            "line_count": u.end_line - u.start_line + 1,
-            "signature": signature,
-            "visibility": vis,
-            "mutability": mut,
-            "modifiers": applied_mods,
-        })
-        processed_units.append(u_dict)
-
-    # Generate Contract Skeleton (context without function bodies)
-    unit_line_ranges = set()
-    for u in units:
-        for l_idx in range(u.start_line, u.end_line + 1):
-            unit_line_ranges.add(l_idx)
-
-    skeleton_lines = []
-    for idx, line in enumerate(lines, 1):
-        if idx in unit_line_ranges:
-            continue
-        skeleton_lines.append(line)
-    skeleton = "\n".join(skeleton_lines).strip()
-    if skeleton and not skeleton.endswith("}"):
-        skeleton += "\n}"
-
-    contract_ctx = {
-        "primary_contract": primary_contract,
-        "pragma": pragmas[0] if pragmas else "solc >=0.8.0",
-        "pragmas": pragmas,
-        "imports": imports,
-        "contracts": contracts,
-        "state_variables": state_variables,
-        "modifiers": modifiers_declared,
-        "events": events_declared,
-        "enclosing_skeleton": skeleton,
-        "total_lines": total_lines,
-    }
-
-    return {
-        "status": "success",
-        "file_name": file_name,
-        "contract_name": primary_contract,
-        "pragmas": pragmas,
-        "imports": imports,
-        "contracts": contracts,
-        "state_variables": state_variables,
-        "modifiers": modifiers_declared,
-        "events": events_declared,
-        "code_units": processed_units,
-        "units": processed_units,
-        "contract_context": contract_ctx,
-        "total_units": len(processed_units),
-        "total_lines": total_lines,
-        "skeleton": skeleton,
-        "enclosing_skeleton": skeleton,
-    }
-
-
 # Đọc file JSON; file không có hoặc hỏng -> None (giao diện không bị lỗi khi run đang chạy dở).
 def read_json_safe(path: Path) -> Any:
     if not path.exists():
@@ -233,64 +79,37 @@ def read_json_safe(path: Path) -> Any:
         return None
 
 
-load_env_file(override=True)
+# Nhiệm vụ: trạng thái của một run, dùng chung cho danh sách, chi tiết và log.
+#   - Run do web app này khởi chạy (ACTIVE_TASKS): running / completed / failed / cancelled theo tiến trình CLI.
+#   - Run khác (chạy từ CLI, hoặc trước khi web app khởi động lại): completed nếu manifest.json đã qua Phase 6
+#     (status complete/partial); còn lại (dừng ở pending_remote hay chưa có manifest) là failed.
+def run_status(run_id: str, run_dir: Path) -> str:
+    with TASK_LOCK:
+        task = ACTIVE_TASKS.get(run_id)
+        if task:
+            process = task.get("process")
+            if task["status"] == "running" and process and process.poll() is not None:
+                task["status"] = "completed" if process.returncode == 0 else "failed"
+            return task["status"]
+    manifest = read_json_safe(run_dir / "manifest.json") or {}
+    return "completed" if manifest.get("status") in {"complete", "partial"} else "failed"
 
 
-# GET /api/system/status: trạng thái GPU server (online, GPU, VRAM, model - KHÔNG lộ IP/port ra trình duyệt),
-# thông tin adapter v13 (ngưỡng, LoRA rank...), số ca trong KB.
+# Body của POST /api/audit/submit: mã Solidity và tên file (ngưỡng detector lấy từ threshold_config.json).
+class AuditRequest(BaseModel):
+    code: str = Field(..., description="Solidity smart contract code")
+    file_name: str = Field(default="Contract.sol", description="Contract filename")
+
+
+# GET /api/system/status: GPU server có sẵn sàng không + tên GPU (KHÔNG lộ IP/port ra trình duyệt).
 @app.get("/api/system/status")
 def get_system_status() -> Dict[str, Any]:
-    """Returns system status, active models, and environment readiness."""
-    threshold_cfg = read_json_safe(DETECTOR_ADAPTER_DIR / "threshold_config.json") or {}
-
-    # GPU server (RTX 4070 Ti SUPER, Qwen v13). Its IP/port are never sent to the browser.
-    raw_info = check_server_health(timeout=1)
-    server_gpu_online = raw_info.get("status") == "ready"
-    server_gpu_info = {}
-    if raw_info.get("status") != "offline":
-        used_mb = raw_info.get("vram_used_mb")
-        allocated_gb = round(used_mb / 1024, 2) if used_mb is not None else raw_info.get("vram_allocated_gb")
-        server_gpu_info = {
-            "status": raw_info.get("status"),
-            "gpu_device": raw_info.get("gpu_device", "NVIDIA GeForce RTX 4070 Ti SUPER"),
-            "model": raw_info.get("model_name") or raw_info.get("model", "qwen25-v13-14b-detector-final"),
-            "model_name": raw_info.get("model_name") or raw_info.get("model", "qwen25-v13-14b-detector-final"),
-            "vram_used_mb": used_mb,
-            "vram_total_mb": raw_info.get("vram_total_mb"),
-            "vram_allocated_gb": allocated_gb,
-        }
-
-    kb_file = KNOWLEDGE_BASE_DIR / "knowledge_items.json"
-    kb_count = 0
-    if kb_file.exists():
-        try:
-            kb_count = len(json.loads(kb_file.read_text(encoding="utf-8")))
-        except Exception:
-            kb_count = 0
-
+    """Returns whether the GPU server is ready."""
+    health = check_server_health(timeout=1)
     return {
-        "model_version": threshold_cfg.get("model_name", "qwen25-v13-14b-detector-final"),
-        "train_mode": threshold_cfg.get("train_mode", "Qwen2.5-Coder-14B-Instruct v13 Quality-First (Focal Loss + Decoupled Line Head + Multi-GPU)"),
-        "base_model": threshold_cfg.get("base_model", "Qwen/Qwen2.5-Coder-14B-Instruct"),
-        "best_threshold": threshold_cfg.get("best_threshold", 0.700),
-        "max_context_length": threshold_cfg.get("max_len", 1024),
-        "lora_rank": threshold_cfg.get("lora_r", 64),
-        "lora_alpha": threshold_cfg.get("lora_alpha", 128),
-        "adapter_present": (DETECTOR_ADAPTER_DIR / "adapter_model.safetensors").exists(),
-        "adapter_size_bytes": (DETECTOR_ADAPTER_DIR / "adapter_model.safetensors").stat().st_size if (DETECTOR_ADAPTER_DIR / "adapter_model.safetensors").exists() else 0,
-        "knowledge_store_cases": kb_count,
-        "server_gpu_online": server_gpu_online,
-        "server_gpu_info": server_gpu_info,
-        "python_env": sys.executable,
+        "server_gpu_online": health.get("status") == "ready",
+        "server_gpu_info": {"status": health.get("status"), "gpu_device": health.get("gpu_device")},
     }
-
-
-# GET /api/phases: danh sách phase (tên, engine, mô tả) từ E2E/pipeline/phases.py để giao diện hiển thị.
-@app.get("/api/phases")
-def get_pipeline_phases() -> List[Dict[str, Any]]:
-    """Single Source of Truth cho các Phase của pipeline."""
-    from E2E.pipeline.phases import PHASES
-    return PHASES
 
 
 # GET /api/contracts/examples: trả 3 contract mẫu trong demo_contracts/ (nút "Mẫu" trên giao diện).
@@ -298,40 +117,28 @@ def get_pipeline_phases() -> List[Dict[str, Any]]:
 def get_example_contracts() -> List[Dict[str, Any]]:
     """Demo contracts shown under "Mẫu" (demo_contracts/)."""
     examples = []
-    if DEMO_CONTRACTS_DIR.exists():
-        for file in sorted(DEMO_CONTRACTS_DIR.glob("*.sol")):
-            code = file.read_text(encoding="utf-8")
-            vuln_type = "Unknown"
-            if "VulnerableBank" in file.name:
-                vuln_type = "Reentrancy (SWC-107)"
-            elif "AccessControl" in file.name:
-                vuln_type = "Access Control / tx.origin (SWC-105/115)"
-            elif "Safe" in file.name:
-                vuln_type = "Secure Benchmark (Safe)"
-
-            examples.append({
-                "file_name": file.name,
-                "title": file.stem,
-                "vuln_type": vuln_type,
-                "code": code,
-                "line_count": len(code.splitlines()),
-            })
+    for file in sorted(DEMO_CONTRACTS_DIR.glob("*.sol")):
+        code = file.read_text(encoding="utf-8")
+        vuln_type = "Unknown"
+        if "VulnerableBank" in file.name:
+            vuln_type = "Reentrancy (SWC-107)"
+        elif "AccessControl" in file.name:
+            vuln_type = "Access Control / tx.origin (SWC-105/115)"
+        elif "Safe" in file.name:
+            vuln_type = "Secure Benchmark (Safe)"
+        examples.append({
+            "file_name": file.name,
+            "title": file.stem,
+            "vuln_type": vuln_type,
+            "code": code,
+            "line_count": len(code.splitlines()),
+        })
     return examples
 
 
-# POST /api/contract/prepare: gọi prepare_contract_context (Phase 0 xem trước).
-@app.post("/api/contract/prepare")
-def prepare_contract_endpoint(req: PrepareRequest) -> Dict[str, Any]:
-    """Phase 0 Prepare: Immediately decomposes contract into individual functions and extracts contract skeleton context."""
-    try:
-        return prepare_contract_context(req.code, req.file_name)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to prepare contract AST: {str(e)}")
-
-
 # [ENDPOINT CHÍNH] POST /api/audit/submit: kiểm tra đầu vào, tạo run_id + thư mục run, lưu file .sol, rồi chạy
-# lệnh CLI `python -m E2E.run <file> --run-id ... --detector-threshold ... --max-fix-attempts 3 [--tools|--full-matrix]`
-# trong một subprocess ở luồng nền; stdout được ghi vào execution.log. Trả về run_id ngay để giao diện theo dõi.
+# lệnh CLI `python -m E2E.run <file> --run-id ... --max-fix-attempts 3` trong một subprocess ở luồng nền;
+# stdout được ghi vào execution.log. Trả về run_id ngay để giao diện theo dõi.
 # Mục đích: web app KHÔNG có logic audit riêng - nó tái sử dụng đúng CLI orchestrator.
 @app.post("/api/audit/submit")
 def submit_audit(req: AuditRequest) -> Dict[str, Any]:
@@ -339,55 +146,27 @@ def submit_audit(req: AuditRequest) -> Dict[str, Any]:
     if not req.code.strip():
         raise HTTPException(status_code=400, detail="Contract code cannot be empty.")
 
-    requested_tools = [item for item in re.split(r"[\s,]+", req.tools or "") if item]
-    unknown_tools = sorted(set(requested_tools) - ALLOWED_TOOLS - {"all"})
-    if unknown_tools:
-        raise HTTPException(status_code=400, detail=f"Unsupported tool(s): {', '.join(unknown_tools)}")
-    from E2E.pipeline.orchestrator import make_run_id
+    from E2E.pipeline.orchestrator import make_run_id  # lazy: the pipeline modules load sklearn/scipy
 
     file_name = safe_contract_file_name(req.file_name)
     run_id = make_run_id(file_name, req.code)
-
     run_dir = run_dir_for(run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
-
     input_file = run_dir / file_name
     input_file.write_text(req.code, encoding="utf-8")
 
-    cmd = [
-        sys.executable,
-        "-u",
-        "-m",
-        "E2E.run",
-        str(input_file),
-        "--run-id",
-        run_id,
-        "--detector-threshold",
-        str(req.detector_threshold),
-        "--max-fix-attempts",
-        "3",
-    ]
-    if "all" in requested_tools:
-        cmd.append("--full-matrix")
-    elif requested_tools:
-        cmd.extend(["--tools", *requested_tools])
-
+    cmd = [sys.executable, "-u", "-m", "E2E.run", str(input_file), "--run-id", run_id, "--max-fix-attempts", "3"]
     log_file = run_dir / "execution.log"
 
     with TASK_LOCK:
-        ACTIVE_TASKS[run_id] = {
-            "process": None,
-            "status": "running",
-            "log_file": str(log_file),
-            "started_at": time.time(),
-        }
+        ACTIVE_TASKS[run_id] = {"process": None, "status": "running", "started_at": time.time()}
 
     # Luồng nền: chạy subprocess CLI, ghi từng dòng log vào execution.log, cập nhật trạng thái completed/failed khi xong.
     def run_worker():
         with open(log_file, "w", encoding="utf-8") as out:
             out.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting E2E audit run: {run_id}\n")
             out.write(f"Command: {' '.join(cmd)}\n")
-            out.write(f"Backend: server_gpu | Threshold: {req.detector_threshold}\n\n")
+            out.write("Backend: server_gpu\n\n")
             out.flush()
 
             env = dict(os.environ)
@@ -401,10 +180,8 @@ def submit_audit(req: AuditRequest) -> Dict[str, Any]:
                 bufsize=1,
                 env=env,
             )
-
             with TASK_LOCK:
-                if run_id in ACTIVE_TASKS:
-                    ACTIVE_TASKS[run_id]["process"] = proc
+                ACTIVE_TASKS[run_id]["process"] = proc
 
             if proc.stdout:
                 for line in iter(proc.stdout.readline, ""):
@@ -417,236 +194,90 @@ def submit_audit(req: AuditRequest) -> Dict[str, Any]:
             out.flush()
 
             with TASK_LOCK:
-                if run_id in ACTIVE_TASKS:
+                if ACTIVE_TASKS[run_id]["status"] == "running":
                     ACTIVE_TASKS[run_id]["status"] = "completed" if proc.returncode == 0 else "failed"
 
     threading.Thread(target=run_worker, daemon=True).start()
-
-    return {
-        "status": "started",
-        "run_id": run_id,
-        "backend": "server_gpu",
-        "detector_threshold": req.detector_threshold,
-        "run_dir": str(run_dir),
-    }
+    return {"status": "started", "run_id": run_id}
 
 
-# GET /api/runs: liệt kê các lần audit (mới nhất trước) với tên file, verdict, điểm, trạng thái - cho trang lịch sử.
+# GET /api/runs: liệt kê các lần audit (mới nhất trước) với tên file, verdict, điểm, số lỗi, trạng thái - cho trang lịch sử.
 @app.get("/api/runs")
 def list_runs() -> List[Dict[str, Any]]:
     """Returns list of all audit runs from newest to oldest."""
     runs = []
-    if RUNS_DIR.exists():
-        for d in sorted(RUNS_DIR.iterdir(), reverse=True):
-            if not d.is_dir() or d.name.startswith("."):
-                continue
-
-            manifest = read_json_safe(d / "manifest.json")
-            phase0 = read_json_safe(d / "phase0_input.json")
-
-            has_pdf = (d / "phase6_audit_report.pdf").exists()
-            has_html = (d / "phase6_audit_report.html").exists()
-            has_md = (d / "phase6_audit_report.md").exists()
-            has_report = has_pdf or has_html or has_md
-
-            run_info: Dict[str, Any] = {
-                "run_id": d.name,
-                "status": "completed",
-                "created_at": None,
-                "contract_name": "Contract.sol",
-                "verdict": "Unknown",
-                "score": 0.0,
-                "risk_level": "None",
-                "finding_count": 0,
-                "has_pdf": has_pdf,
-                "has_html": has_html,
-                "has_md": has_md,
-            }
-
-            if manifest:
-                run_info["created_at"] = manifest.get("completed_at")
-                det = manifest.get("detection", {})
-                run_info["verdict"] = det.get("verdict", "Unknown")
-                run_info["score"] = det.get("score", 0.0)
-                run_info["risk_level"] = det.get("risk_level", "None")
-                run_info["finding_count"] = det.get("finding_count", 0)
-
-            if phase0:
-                run_info["contract_name"] = phase0.get("source", {}).get("file_name", d.name)
-                if not run_info["created_at"]:
-                    run_info["created_at"] = phase0.get("created_at")
-
-            # Xác định trạng thái thực thi chính xác
-            is_actively_running = False
+    if not RUNS_DIR.exists():
+        return runs
+    for run_dir in sorted(RUNS_DIR.iterdir(), reverse=True):
+        if not run_dir.is_dir() or run_dir.name.startswith("."):
+            continue
+        manifest = read_json_safe(run_dir / "manifest.json") or {}
+        phase0 = read_json_safe(run_dir / "phase0_input.json") or {}
+        detection = manifest.get("detection", {})
+        run_info: Dict[str, Any] = {
+            "run_id": run_dir.name,
+            "status": run_status(run_dir.name, run_dir),
+            "created_at": manifest.get("completed_at") or phase0.get("created_at"),
+            "contract_name": phase0.get("source", {}).get("file_name") or run_dir.name,
+            "verdict": detection.get("verdict", "Unknown"),
+            "score": detection.get("score", 0.0),
+            "finding_count": detection.get("finding_count", 0),
+        }
+        if run_info["status"] == "running":
             with TASK_LOCK:
-                if d.name in ACTIVE_TASKS:
-                    proc_info = ACTIVE_TASKS[d.name]
-                    if proc_info["status"] == "running":
-                        proc = proc_info.get("process")
-                        if proc and proc.poll() is not None:
-                            proc_info["status"] = "completed" if proc.returncode == 0 else "failed"
-                        else:
-                            is_actively_running = True
-                            run_info["status"] = "running"
-                            run_info["elapsed_seconds"] = round(time.time() - proc_info["started_at"], 1)
-
-            if not is_actively_running:
-                if has_report or (manifest and manifest.get("completed_at")):
-                    run_info["status"] = "completed"
-                elif manifest and manifest.get("status") == "failed":
-                    run_info["status"] = "failed"
-                else:
-                    run_info["status"] = "completed"
-
-            runs.append(run_info)
-
+                started_at = ACTIVE_TASKS.get(run_dir.name, {}).get("started_at", time.time())
+            run_info["elapsed_seconds"] = round(time.time() - started_at, 1)
+        runs.append(run_info)
     return runs
 
 
-# GET /api/runs/{run_id}: đọc mọi artifact phase (phase0 ... phase5, manifest, report) của một run và gom lại
-# cho giao diện hiển thị chi tiết (findings, bản vá, kết quả kiểm chứng, link báo cáo).
+# GET /api/runs/{run_id}: những gì trang kết quả cần: mã gốc / mã vá + diff, kết luận (manifest, fusion),
+# findings giống hệt báo cáo, CVSS của Phase 3, kết luận Phase 5 và báo cáo nào đã có.
 @app.get("/api/runs/{run_id}")
 def get_run_detail(run_id: str) -> Dict[str, Any]:
-    """Returns all detail artifacts and phase states for a run."""
+    """Returns the artifacts the result page shows for one run."""
     run_dir = run_dir_for(run_id)
     if not run_dir.exists():
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found.")
 
     manifest = read_json_safe(run_dir / "manifest.json") or {}
     phase0 = read_json_safe(run_dir / "phase0_input.json") or {}
-    static = read_json_safe(run_dir / "phase1a_static.json") or {}
-    rag = read_json_safe(run_dir / "phase1b_rag.json") or {}
     fused = read_json_safe(run_dir / "phase1_fused.json") or {}
-    advisor = read_json_safe(run_dir / "phase2_advisor.json") or {}
     assessor = read_json_safe(run_dir / "phase3_assessor.json") or {}
     fixer = read_json_safe(run_dir / "phase4_fixer.json") or {}
-    verifier = read_json_safe(run_dir / "phase5_verification.json") or {}
+    verification = read_json_safe(run_dir / "phase5_verification.json") or {}
     report_data = read_json_safe(run_dir / "phase6_report_data.json") or {}
 
     original_code = phase0.get("source", {}).get("code", "")
-    contract_name = phase0.get("source", {}).get("file_name", "")
-
-    # Fallback 1: Direct .sol files in run directory
-    if not original_code:
-        sol_files = sorted(run_dir.glob("*.sol"))
-        if sol_files:
-            try:
-                original_code = sol_files[0].read_text(encoding="utf-8")
-                if not contract_name:
-                    contract_name = sol_files[0].name
-            except Exception:
-                pass
-
-    # Fallback 2: request.json
-    if not original_code:
-        req_json = read_json_safe(run_dir / "request.json") or {}
-        original_code = req_json.get("source", {}).get("code", "") or req_json.get("code", "")
-        if not contract_name:
-            contract_name = req_json.get("source", {}).get("file_name", "") or req_json.get("file_name", "")
-
-    # Fallback 3: phase6_report_data.json
-    if not original_code:
-        rep_data = read_json_safe(run_dir / "phase6_report_data.json") or {}
-        original_code = rep_data.get("original_code", "")
-        if not contract_name:
-            contract_name = rep_data.get("contract_name", "")
-
-    if not contract_name:
-        parts = run_id.split("-")
-        if len(parts) >= 3:
-            contract_name = f"{parts[2]}.sol"
-        else:
-            contract_name = "Contract.sol"
-
     fixed_code = fixer.get("fixed_code", "")
-
-    has_pdf = (run_dir / "phase6_audit_report.pdf").exists()
-    has_html = (run_dir / "phase6_audit_report.html").exists()
-    has_md = (run_dir / "phase6_audit_report.md").exists()
-    has_report = has_pdf or has_html or has_md
-
-    # Xác định trạng thái
-    status = "completed" if has_report or manifest.get("completed_at") else "unknown"
-    is_actively_running = False
-    with TASK_LOCK:
-        if run_id in ACTIVE_TASKS:
-            proc_info = ACTIVE_TASKS[run_id]
-            if proc_info["status"] == "running":
-                proc = proc_info.get("process")
-                if proc and proc.poll() is not None:
-                    proc_info["status"] = "completed" if proc.returncode == 0 else "failed"
-                    status = proc_info["status"]
-                else:
-                    is_actively_running = True
-                    status = "running"
-            else:
-                status = proc_info["status"]
-
-    if not is_actively_running:
-        if has_report or manifest.get("completed_at"):
-            status = "completed"
-        elif manifest.get("status") == "failed":
-            status = "failed"
-        else:
-            status = "completed"
-
-    diff_text = fixer.get("diff", "")
-    if not diff_text and original_code and fixed_code and original_code != fixed_code:
-        import difflib
-        diff_lines = list(difflib.unified_diff(
+    diff = ""
+    if original_code and fixed_code and original_code != fixed_code:
+        diff = "".join(difflib.unified_diff(
             original_code.splitlines(keepends=True),
             fixed_code.splitlines(keepends=True),
             fromfile="Original.sol",
             tofile="Fixed.sol",
         ))
-        diff_text = "".join(diff_lines)
-
-    code_units = phase0.get("code_units", [])
-    if not code_units and original_code:
-        try:
-            prep = prepare_contract_context(original_code, contract_name)
-            code_units = prep.get("code_units", [])
-        except Exception:
-            code_units = []
 
     return {
         "run_id": run_id,
-        "status": status,
         "manifest": manifest,
-        "contract_name": contract_name,
+        "contract_name": phase0.get("source", {}).get("file_name") or "Contract.sol",
         "original_code": original_code,
         "fixed_code": fixed_code,
-        "diff": diff_text,
-        "code_units": code_units,
-        "contract_context": {
-            "pragmas": [p.strip() for p in re.findall(r"pragma\s+[^;]+;", original_code)],
-            "contracts": re.findall(r"\b(?:abstract\s+)?(?:contract|library|interface)\s+([A-Za-z_$][\w$]*)", original_code),
-            "modifiers": re.findall(r"\bmodifier\s+([A-Za-z_$][\w$]*)", original_code),
-            "total_units": len(code_units),
-        },
-        "phases": {
-            "phase0_input": phase0 if phase0 else bool(phase0),
-            "phase1a_static": static,
-            "phase1b_rag": rag,
-            "phase1c_llm": {"status": "ok"},
-            "phase1_fused": fused,
-            "phase2_advisor": advisor,
-            "phase3_assessor": assessor,
-            "phase4_fixer": fixer,
-            "phase5_verification": verifier,
-            "phase6_report": bool(report_data) or has_report,
-        },
-        "findings": fused.get("findings", []),
-        "patch_outcomes": fixer.get("patch_outcomes", []),
-        "verification_verdict": verifier.get("policy_verdict") or verifier.get("overall_verdict", "Pending"),
-        "has_pdf": has_pdf,
-        "has_html": has_html,
-        "has_md": has_md,
+        "diff": diff,
+        "phases": {"phase1_fused": fused, "phase3_assessor": assessor},
+        # Same list as the audit report: after the GPU phases, findings the Advisor dismissed as
+        # false positives are excluded (they stay in phase1_fused.json for transparency).
+        "findings": report_data["findings"] if "findings" in report_data else fused.get("findings", []),
+        "verification_verdict": verification.get("overall_verdict", "Pending"),
+        "has_pdf": (run_dir / "phase6_audit_report.pdf").exists(),
+        "has_html": (run_dir / "phase6_audit_report.html").exists(),
     }
 
 
-# GET /api/runs/{run_id}/logs: trả log realtime + trạng thái (running/completed/failed) + phase nào đã có file thật
-# (để giao diện tô sáng tiến độ từng phase).
+# GET /api/runs/{run_id}/logs: log realtime (execution.log) + trạng thái run - giao diện đọc tag "[PHASE x]"
+# trong log để tô tiến độ 5 bước.
 @app.get("/api/runs/{run_id}/logs")
 def get_run_logs(run_id: str) -> Dict[str, Any]:
     """Returns realtime logs of a run."""
@@ -658,67 +289,7 @@ def get_run_logs(run_id: str) -> Dict[str, Any]:
             logs = log_file.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             logs = "(Unable to read log file)"
-
-    status = "unknown"
-    with TASK_LOCK:
-        if run_id in ACTIVE_TASKS:
-            proc_info = ACTIVE_TASKS[run_id]
-            proc = proc_info.get("process")
-            if proc_info.get("status") == "running":
-                if proc and proc.poll() is not None:
-                    proc_info["status"] = "completed" if proc.returncode == 0 else "failed"
-                    status = proc_info["status"]
-                else:
-                    status = "running"
-            else:
-                status = proc_info.get("status", "unknown")
-        else:
-            # Task not active in memory (historical run or after server reload)
-            if "Run completed successfully." in logs or "Process exited with code 0" in logs:
-                status = "completed"
-            elif "Process exited with code" in logs or "Traceback (most recent call last)" in logs:
-                status = "failed"
-            elif (run_dir / "manifest.json").exists():
-                manifest = read_json_safe(run_dir / "manifest.json") or {}
-                if manifest.get("status") == "complete":
-                    status = "completed"
-
-    # File phase có tồn tại và không phải trạng thái "pending" không (phase đã chạy thật).
-    def is_phase_real(filename: str) -> bool:
-        p = run_dir / filename
-        if not p.exists():
-            return False
-        data = read_json_safe(p)
-        if isinstance(data, dict):
-            if data.get("status") == "pending":
-                return False
-            if "overall_verdict" in data and "pending" in str(data.get("overall_verdict", "")).lower():
-                return False
-        return True
-
-    is_p6_done = (
-        (status == "completed" or "[PHASE 6] Completed" in logs or "Run completed successfully" in logs)
-        and (run_dir / "phase6_audit_report.html").exists()
-    )
-
-    phase_files = {
-        "phase0": is_phase_real("phase0_input.json"),
-        "phase1a": is_phase_real("phase1a_static.json"),
-        "phase1b": is_phase_real("phase1b_rag.json"),
-        "fusion": is_phase_real("phase1_fused.json"),
-        "phase2": is_phase_real("phase2_advisor.json"),
-        "phase3": is_phase_real("phase3_assessor.json"),
-        "phase4": is_phase_real("phase4_fixer.json"),
-        "phase5": is_phase_real("phase5_verification.json"),
-        "phase6": is_p6_done,
-    }
-
-    return {
-        "run_id": run_id,
-        "status": status,
-        "logs": logs,
-        "phase_files": phase_files,
-    }
+    return {"run_id": run_id, "status": run_status(run_id, run_dir), "logs": logs}
 
 
 # GET /api/runs/{run_id}/report/html: trả báo cáo HTML của Phase 6.
@@ -741,35 +312,25 @@ def get_report_pdf(run_id: str):
     return FileResponse(path, media_type="application/pdf", filename=f"audit_report_{run_id}.pdf")
 
 
-# GET /api/runs/{run_id}/report/md: trả báo cáo Markdown dạng text.
-@app.get("/api/runs/{run_id}/report/md")
-def get_report_md(run_id: str):
-    """Returns markdown report text."""
-    path = run_dir_for(run_id) / "phase6_audit_report.md"
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Markdown report not yet generated.")
-    return PlainTextResponse(content=path.read_text(encoding="utf-8"))
-
-
 # POST /api/runs/{run_id}/cancel: dừng subprocess audit đang chạy (terminate, sau 0.5s thì kill).
 @app.post("/api/runs/{run_id}/cancel")
 def cancel_run(run_id: str) -> Dict[str, Any]:
     """Cancels a currently active run process."""
     with TASK_LOCK:
-        if run_id in ACTIVE_TASKS:
-            task = ACTIVE_TASKS[run_id]
-            proc = task.get("process")
-            if proc and proc.poll() is None:
-                try:
-                    proc.terminate()
-                    time.sleep(0.5)
-                    if proc.poll() is None:
-                        proc.kill()
-                    task["status"] = "cancelled"
-                    return {"status": "cancelled", "run_id": run_id}
-                except Exception as e:
-                    raise HTTPException(status_code=500, detail=f"Failed to cancel process: {e}")
+        task = ACTIVE_TASKS.get(run_id)
+        proc = task.get("process") if task else None
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                time.sleep(0.5)
+                if proc.poll() is None:
+                    proc.kill()
+                task["status"] = "cancelled"
+                return {"status": "cancelled", "run_id": run_id}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to cancel process: {e}")
     raise HTTPException(status_code=404, detail=f"Run {run_id} is not running.")
+
 
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -782,11 +343,3 @@ def serve_index():
     if not index_file.exists():
         return HTMLResponse("<h1>Web App Static Files Initializing...</h1>", status_code=200)
     return HTMLResponse(content=index_file.read_text(encoding="utf-8"))
-
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8080))
-    print(f"🚀 Launching Smart Contract Audit Web App on http://localhost:{port}")
-    uvicorn.run("webapp.app:app", host="0.0.0.0", port=port, reload=True)
-

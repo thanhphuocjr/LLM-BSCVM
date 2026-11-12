@@ -15,25 +15,12 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from E2E.common.solc import check_compilation_with_baseline
+from E2E.common.solc import check_compilation_with_baseline, compiler_error_signatures
 from E2E.config import RISK_ORDER
 from E2E.phase0_parsing.code_units import parse_code_units
 from E2E.phase1a_static.static_runner import run_static
 from E2E.phase1b_rag.rag_runner import run_rag
 from E2E.phase1c_detector.detector import score_units_via_server
-
-
-_ERROR_LOCATION_RE = re.compile(r"(-->\s*\S+:\d+:\d+:?|/\S+\.sol:\d+:\d+:?)")
-
-
-# Tập "chữ ký" lỗi compile (bỏ phần vị trí file:dòng:cột) để so lỗi của bản vá với lỗi sẵn có của bản gốc.
-def _compiler_error_signatures(text: str) -> set[str]:
-    signatures = set()
-    for line in (text or "").splitlines():
-        if "Error" not in line:
-            continue
-        signatures.add(_ERROR_LOCATION_RE.sub("", line).strip())
-    return signatures
 
 
 # Nhiệm vụ: biên dịch bản vá so với bản gốc (baseline) -> state:
@@ -55,7 +42,7 @@ def evaluate_compilation(original_code: str, fixed_code: str) -> dict[str, Any]:
     elif fixed.get("passed"):
         state = "passed"
     elif result.get("baseline_failed"):
-        new_errors = _compiler_error_signatures(fixed.get("error", "")) - _compiler_error_signatures(
+        new_errors = compiler_error_signatures(fixed.get("error", "")) - compiler_error_signatures(
             baseline.get("error", "")
         )
         state = "failed" if new_errors else "not_applicable"
@@ -68,8 +55,6 @@ def evaluate_compilation(original_code: str, fixed_code: str) -> dict[str, Any]:
         "selection_reason": result.get("selection_reason"),
         "baseline_failed": result.get("baseline_failed", False),
         "error": fixed.get("error", "") if state == "failed" else "",
-        "passed": {"passed": True, "failed": False}.get(state),
-        "status": state,
     }
 
 
@@ -190,17 +175,24 @@ def verify_candidate(
     }
 
 
-# Viết feedback cho lần Fixer tiếp theo: lỗi compile (tối đa 8 dòng), hàm detector vẫn báo Vulnerable,
+_SOURCE_PATH_RE = re.compile(r"(?:/[^\s:]+)+\.sol")
+
+
+# Lỗi compile đưa vào feedback: tối đa 3 khối lỗi của solc (extract_solc_errors), mỗi khối giữ dòng "Error",
+# vị trí, dòng mã và dấu ^ chỉ chỗ sai (tối đa 6 dòng); đường dẫn file tạm được thay bằng Contract.sol.
+# Mục đích: Fixer biết chính xác định danh / dòng nào làm hỏng compile (chỉ dòng "Error" thì không đủ để sửa).
+def _compiler_feedback(error_text: str) -> str:
+    blocks = [block.splitlines()[:6] for block in (error_text or "").split("\n\n") if block.strip()][:3]
+    return _SOURCE_PATH_RE.sub("Contract.sol", "\n".join(line for block in blocks for line in block))
+
+
+# Viết feedback cho lần Fixer tiếp theo: lỗi compile (kèm dòng mã bị lỗi), hàm detector vẫn báo Vulnerable,
 # finding static/RAG còn sót hoặc mới phát sinh.
 def _verification_feedback(attempt: int, max_attempts: int, verification: dict[str, Any]) -> str:
     parts = [f"\n\n[CRITICAL RESIDUAL ERROR FEEDBACK - ATTEMPT {attempt}/{max_attempts}]"]
     compile_info = verification["compilation"]
     if compile_info["failed"]:
-        error_lines = [
-            line for line in compile_info.get("error", "").splitlines()
-            if "Error" in line
-        ]
-        clean = "\n".join(error_lines[:8]) or compile_info.get("error", "")[:400]
+        clean = _compiler_feedback(compile_info.get("error", "")) or compile_info.get("error", "")[:400]
         parts.append(
             f"Solidity compiler ({compile_info.get('compiler')}) failed with error:\n{clean}\n"
             "Your patch broke compilation. You MUST fix this compiler error."

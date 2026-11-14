@@ -14,7 +14,6 @@ both versions:
 from __future__ import annotations
 
 import platform
-import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -25,6 +24,7 @@ from E2E.common.security_tools import (
     _run,
     _run_native_slither,
 )
+from E2E.common.regex_patterns import RE_LOCATION_IN_MESSAGE, RE_WHITESPACE
 from E2E.common.solc import compiler_error_signatures, select_best_solc
 from E2E.config import RISK_ORDER
 from E2E.phase0_parsing.code_units import parse_code_units
@@ -139,21 +139,17 @@ def _finding_matches_target(
     return True
 
 
-# Source paths (temporary directories differ per run) and line references.
-_LOCATION_IN_MESSAGE_RE = re.compile(r"(\S*\.sol(?:#\d+(?:-\d+)?|:\d+(?::\d+)?)?|#\d+(?:-\d+)?|\blines?\s+\d+(?:-\d+)?)")
-
-
 # Định danh finding không phụ thuộc vị trí (nhóm, tên check, thông điệp đã bỏ số dòng/đường dẫn).
 # Mục đích: bản vá làm lệch số dòng thì finding cũ không bị coi là "mới phát sinh".
 def _finding_signature(finding: dict[str, Any]) -> tuple[str, str, str]:
     """Location-independent identity of a tool finding: a patch that shifts line numbers
     must not make every pre-existing finding look newly introduced."""
     message = str(finding.get("message") or finding.get("description") or "")
-    message = _LOCATION_IN_MESSAGE_RE.sub("", message)
+    message = RE_LOCATION_IN_MESSAGE.sub("", message)
     return (
         str(finding.get("category") or "other").lower(),
         str(finding.get("name") or finding.get("check") or "").strip().lower(),
-        re.sub(r"\s+", " ", message).strip().lower()[:160],
+        RE_WHITESPACE.sub(" ", message).strip().lower()[:160],
     )
 
 

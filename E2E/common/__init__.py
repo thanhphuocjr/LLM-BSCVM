@@ -7,4 +7,5 @@ solc.py            chọn solc theo pragma, biên dịch, so với bản gốc (
 findings.py        finding_key: định danh một finding giữa các phase.
 safe_run.py        chạy một thành phần, lỗi thành status=error thay vì dừng cả pipeline.
 io_utils.py        đọc/ghi JSON, SHA-256, thời gian UTC.
+regex_patterns.py  MỌI regex mà các hàm Phase 0 -> 6 dùng, đặt tên theo nội dung (RE_XXX, re_xxx(name)).
 """

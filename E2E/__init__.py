@@ -13,5 +13,5 @@ Thư mục theo đúng thứ tự pipeline:
   phase4_fixer/      Fixer: vá từng hàm, guard hành vi (không có nguồn vá dự phòng)
   phase5_verifier/   kiểm chứng bản vá: compile, detector, static/RAG, Slither, AST
   phase6_reporter/   báo cáo Markdown / HTML / PDF
-  common/            dùng chung: client GPU server, solc, chạy Slither, IO
+  common/            dùng chung: client GPU server, solc, chạy Slither, IO, regex (regex_patterns.py)
 """

@@ -13,16 +13,14 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
-
-DECLARATION_RE = re.compile(
-    r"\b(function\s+(?P<function>[A-Za-z_$][\w$]*)\s*\(|"
-    r"function\s*(?P<unnamed_fallback>\()\s*|"
-    r"(?P<special>constructor|receive|fallback)\s*\()",
-    re.MULTILINE,
+from E2E.common.regex_patterns import (
+    RE_CONTRACT_DECLARATION,
+    RE_NONCODE,
+    RE_NOT_NEWLINE,
+    RE_UNIT_DECLARATION,
+    RE_VIEW_PURE_CONSTANT,
+    RE_VISIBILITY,
 )
-
-
-CONTRACT_RE = re.compile(r"\b(?:abstract\s+)?(contract|library|interface)\s+([A-Za-z_$][\w$]*)")
 
 
 # [Phase 0] Cấu trúc dữ liệu cho MỘT đơn vị mã (hàm / constructor / fallback / receive).
@@ -55,18 +53,6 @@ def _line_number(code: str, offset: int) -> int:
     return code.count("\n", 0, max(0, offset)) + 1
 
 
-# Comment hoặc chuỗi, theo đúng thứ tự xuất hiện. Regex luôn khớp token SỚM NHẤT trước nên `//` nằm trong
-# "http://..." thuộc về chuỗi, còn dấu ' trong `// don't` thuộc về comment. Comment / chuỗi chưa đóng kéo tới
-# hết mã.
-_NONCODE_RE = re.compile(
-    r"//[^\n]*"                               # comment một dòng
-    r"|/\*[\s\S]*?(?:\*/|\Z)"                 # comment khối
-    r"|\"(?:\\[\s\S]?|[^\"\\])*(?:\"|\Z)"     # "chuỗi" (có ký tự thoát)
-    r"|'(?:\\[\s\S]?|[^'\\])*(?:'|\Z)"        # 'chuỗi'
-)
-_NOT_NEWLINE_RE = re.compile(r"[^\n]")
-
-
 # [NƠI DUY NHẤT BỎ COMMENT CỦA CẢ PIPELINE] Thay mọi ký tự trong comment (và chuỗi, nếu mask_strings=True)
 # bằng dấu cách, giữ nguyên xuống dòng và độ dài -> offset / số dòng vẫn khớp với mã gốc.
 #   mask_strings=True : che cả comment lẫn chuỗi (Phase 0 tìm hàm, Phase 1A chạy luật, tìm bất biến của hàm).
@@ -78,9 +64,9 @@ def mask_noncode(code: str, *, mask_strings: bool = True) -> str:
         text = match.group()
         if not mask_strings and text[0] in "\"'":
             return text
-        return _NOT_NEWLINE_RE.sub(" ", text)
+        return RE_NOT_NEWLINE.sub(" ", text)
 
-    return _NONCODE_RE.sub(blank, code)
+    return RE_NONCODE.sub(blank, code)
 
 
 # Từ chỗ bắt đầu khai báo hàm, tìm vị trí kết thúc trên mã ĐÃ CHE comment/chuỗi (mask_noncode giữ nguyên độ dài,
@@ -115,7 +101,7 @@ def _declaration_end(masked_code: str, search_start: int) -> tuple[int, bool]:
 # Mục đích: gán unit vào đúng contract để tạo unit_id "Contract.func".
 def _contract_at(masked_code: str, offset: int) -> tuple[str, str]:
     """Trả về (contract_name, contract_kind) tại vị trí offset."""
-    matches = list(CONTRACT_RE.finditer(masked_code, 0, offset))
+    matches = list(RE_CONTRACT_DECLARATION.finditer(masked_code, 0, offset))
     if matches:
         return matches[-1].group(2), matches[-1].group(1)
     return "UnknownContract", "contract"
@@ -130,7 +116,7 @@ def parse_code_units(code: str) -> list[CodeUnit]:
     units: list[CodeUnit] = []
     names: dict[str, int] = {}
     masked_code = mask_noncode(code)
-    for match in DECLARATION_RE.finditer(masked_code):
+    for match in RE_UNIT_DECLARATION.finditer(masked_code):
         if match.group("unnamed_fallback"):
             name = "fallback"
             kind = "fallback"
@@ -149,8 +135,8 @@ def parse_code_units(code: str) -> list[CodeUnit]:
 
         # Kiểm tra view/pure và visibility
         header_part = snippet[: snippet.find("{")] if "{" in snippet else snippet
-        is_view_or_pure = bool(re.search(r"\b(view|pure|constant)\b", header_part))  # `constant` = pre-0.5 view
-        vis_match = re.search(r"\b(public|external|internal|private)\b", header_part)
+        is_view_or_pure = bool(RE_VIEW_PURE_CONSTANT.search(header_part))  # `constant` = pre-0.5 view
+        vis_match = RE_VISIBILITY.search(header_part)
         visibility = vis_match.group(1) if vis_match else "public"
 
         units.append(

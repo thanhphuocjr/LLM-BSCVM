@@ -10,9 +10,16 @@ Phase 4 - turn the Fixer's reply into a patched contract.
 from __future__ import annotations
 
 import json
-import re
 from typing import Iterable
 
+from E2E.common.regex_patterns import (
+    RE_JSON_WITH_REPLACEMENT,
+    RE_NAMED_FUNCTION_START,
+    RE_SOLIDITY_FENCE,
+    RE_WHITESPACE,
+    re_declaration_start,
+    re_json_string_field_start,
+)
 from E2E.phase0_parsing.code_units import CodeUnit, mask_noncode
 
 
@@ -65,7 +72,7 @@ def apply_unit_patches(code: str, units: Iterable[CodeUnit], patches: Iterable[d
         if not replacement:
             outcomes.append({"unit_id": unit_id, "status": "rejected", "reason": "empty replacement"})
             continue
-        if re.sub(r"\s+", "", replacement) == re.sub(r"\s+", "", unit.code):
+        if RE_WHITESPACE.sub("", replacement) == RE_WHITESPACE.sub("", unit.code):
             outcomes.append({"unit_id": unit_id, "status": "rejected", "reason": "replacement is identical to original (no changes)"})
             continue
         seen.add(unit_id)
@@ -99,7 +106,7 @@ def lenient_json_string_field(text: str, field: str) -> str | None:
 
     The value ends at the first quote that is followed by `,` or `}` (end of the field).
     """
-    match = re.search(rf'"{re.escape(field)}"\s*:\s*"', text)
+    match = re_json_string_field_start(field).search(text)
     if not match:
         return None
     chars: list[str] = []
@@ -138,7 +145,7 @@ def extract_declaration_body(text: str, target_name: str | None = None) -> str:
     if '"replacement"' in raw_text:
         replacement = None
         try:
-            json_match = re.search(r"\{[\s\S]*\"replacement\"[\s\S]*\}", raw_text)
+            json_match = RE_JSON_WITH_REPLACEMENT.search(raw_text)
             if json_match:
                 data = json.loads(json_match.group(0))
                 if isinstance(data, dict) and data.get("replacement"):
@@ -150,7 +157,7 @@ def extract_declaration_body(text: str, target_name: str | None = None) -> str:
             return extract_declaration_body(replacement, target_name=target_name)
 
     # 2. Tìm khối code fence ```solidity ... ```
-    fence_matches = list(re.finditer(r"```(?:solidity)?\s*([\s\S]*?)```", raw_text))
+    fence_matches = list(RE_SOLIDITY_FENCE.finditer(raw_text))
     search_space = raw_text
     if fence_matches:
         # Nếu có fence, dùng nội dung fence đầu tiên có chứa target_name
@@ -160,15 +167,8 @@ def extract_declaration_body(text: str, target_name: str | None = None) -> str:
                 search_space = f_code
                 break
 
-    # 3. Xây dựng pattern tìm vị trí bắt đầu khai báo
-    if target_name in ("fallback", "receive"):
-        pattern = rf"\b((?:function\s+{re.escape(target_name)}\s*\(|function\s*\(|(?:constructor|receive|fallback)\s*\())"
-    elif target_name:
-        pattern = rf"\b(function\s+{re.escape(target_name)}\s*\(|(?:constructor|receive|fallback)\s*\()"
-    else:
-        pattern = r"\b(function\s+[A-Za-z_$][\w$]*\s*\(|function\s*\(|(?:constructor|receive|fallback)\s*\()"
-
-    match = re.search(pattern, search_space)
+    # 3. Tìm vị trí bắt đầu khai báo của hàm cần lấy (regex tuỳ theo target_name)
+    match = re_declaration_start(target_name).search(search_space)
     if not match:
         if target_name:
             return ""
@@ -197,7 +197,7 @@ def extract_declaration_body(text: str, target_name: str | None = None) -> str:
 
     # Kiểm tra đảm bảo extracted chỉ chứa MỘT khai báo hàm duy nhất
     masked_extracted = mask_noncode(extracted)
-    inner_declarations = list(re.finditer(r"\bfunction\s+[A-Za-z_$][\w$]*\s*\(", masked_extracted[10:]))
+    inner_declarations = list(RE_NAMED_FUNCTION_START.finditer(masked_extracted[10:]))
     if inner_declarations:
         first_inner = inner_declarations[0].start() + 10
         last_close = masked_extracted.rfind("}", 0, first_inner)

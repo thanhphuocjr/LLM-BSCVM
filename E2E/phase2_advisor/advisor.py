@@ -26,13 +26,13 @@ consume it directly.
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List
 
 from E2E.common.gpu_client import ServerGPUClient
+from E2E.common.regex_patterns import RE_PRAGMA_SPEC
 from E2E.config import KNOWLEDGE_BASE_DIR
 from E2E.phase0_parsing.contract_context import build_contract_context
 from E2E.phase1b_rag.swc_agents import normalize_swc_id
@@ -361,7 +361,7 @@ class AdvisorAgent:
             target_code = code[:2000]
             start_line, end_line = 1, 1 + target_code.count("\n")
 
-        sol_match = re.search(r"pragma\s+solidity\s+([^;]+);", code)
+        sol_match = RE_PRAGMA_SPEC.search(code)
         compiler_note = sol_match.group(1).strip() if sol_match else "0.4.x"
 
         # unit_id = "<Contract>.<function>[#n]": the context comes from the enclosing contract. A contract-level

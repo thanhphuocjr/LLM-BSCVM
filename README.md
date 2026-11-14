@@ -33,7 +33,7 @@ RAG/
 │   ├── phase4_fixer/      fixer.py (prompt + vá), patching.py, behavior_guard.py
 │   ├── phase5_verifier/   candidate_check.py (trong vòng sửa), final_verification.py, tool_matrix.py, behavior_verifier.py
 │   ├── phase6_reporter/   report.py (MD/HTML/PDF), vulnerability_reference.py
-│   └── common/            gpu_client.py, security_tools.py (Slither), solc.py, io_utils.py, ...
+│   └── common/            gpu_client.py, security_tools.py (Slither), solc.py, io_utils.py, regex_patterns.py (mọi regex), ...
 │
 ├── gpu_server/            code chạy TRÊN GPU server (scripts/gpu_server.sh deploy đẩy lên ~/server_train)
 │   ├── train_qwen25_v13.py, run_train.sh, setup.sh    huấn luyện detector v13

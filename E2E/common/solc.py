@@ -13,7 +13,6 @@ Quy tắc:
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -22,11 +21,16 @@ from typing import Any, List, Optional, Tuple
 
 import semantic_version
 
+from E2E.common.regex_patterns import (
+    RE_MINOR_VERSION,
+    RE_PRAGMA_SPEC,
+    RE_SOLC_BINARY_VERSION,
+    RE_SOLC_ERROR_LOCATION,
+    RE_WHITESPACE,
+)
+
 
 SOLC_SELECT_ARTIFACTS = Path.home() / ".solc-select" / "artifacts"
-
-# Vị trí lỗi trong output của solc: `--> file.sol:12:5:` (>= 0.5) hoặc `file.sol:12:5:` (0.4).
-_ERROR_LOCATION_RE = re.compile(r"(-->\s*\S+:\d+:\d+:?|\S+\.sol:\d+:\d+:?)")
 
 
 # Liệt kê các bản solc đã cài qua solc-select (~/.solc-select/artifacts), sắp xếp tăng dần theo phiên bản.
@@ -39,7 +43,7 @@ def get_installed_solc_versions() -> List[Tuple[semantic_version.Version, Path]]
     for path in SOLC_SELECT_ARTIFACTS.glob("solc-*/solc-*"):
         if not (path.is_file() and os.access(path, os.X_OK)):
             continue
-        m = re.search(r"solc-(\d+\.\d+\.\d+)$", path.name)
+        m = RE_SOLC_BINARY_VERSION.search(path.name)
         if m:
             try:
                 ver = semantic_version.Version(m.group(1))
@@ -55,12 +59,12 @@ def get_installed_solc_versions() -> List[Tuple[semantic_version.Version, Path]]
 # Đọc dòng "pragma solidity ...;" và chuyển thành NpmSpec (vd "^0.4.24") để so khớp phiên bản.
 def parse_pragma_spec(code: str) -> Tuple[Optional[str], Optional[semantic_version.NpmSpec]]:
     """Trích xuất chuỗi pragma và tạo NpmSpec từ code Solidity."""
-    match = re.search(r"pragma\s+solidity\s+([^;]+);", code)
+    match = RE_PRAGMA_SPEC.search(code)
     if not match:
         return None, None
     raw_spec = match.group(1).strip()
     # Chuẩn hóa khoảng trắng
-    clean_spec = re.sub(r"\s+", " ", raw_spec)
+    clean_spec = RE_WHITESPACE.sub(" ", raw_spec)
     try:
         npm_spec = semantic_version.NpmSpec(clean_spec)
         return raw_spec, npm_spec
@@ -104,7 +108,7 @@ def select_best_solc(code: str) -> Tuple[Optional[Path], str, Optional[str]]:
 
     # Nếu không match chính xác, thử match theo minor version (0.4, 0.5, 0.6, 0.7, 0.8)
     if raw_pragma:
-        minor_match = re.search(r"0\.(\d+)", raw_pragma)
+        minor_match = RE_MINOR_VERSION.search(raw_pragma)
         if minor_match:
             target_minor = int(minor_match.group(1))
             same_minor = [item for item in installed if item[0].major == 0 and item[0].minor == target_minor]
@@ -164,7 +168,7 @@ def extract_solc_errors(stderr_or_output: str) -> str:
 # dùng chung cho vòng sửa (candidate_check) và kiểm chứng cuối (tool_matrix).
 def compiler_error_signatures(text: str) -> set[str]:
     return {
-        _ERROR_LOCATION_RE.sub("", line).strip()
+        RE_SOLC_ERROR_LOCATION.sub("", line).strip()
         for line in (text or "").splitlines()
         if "Error" in line
     }

@@ -9,30 +9,34 @@ Phase 5 (behavior_verifier) for patched units the AST comparison could not cover
 
 from __future__ import annotations
 
-import re
-
+from E2E.common.regex_patterns import (
+    RE_EMIT_EVENT,
+    RE_ETH_VALUE_CALL,
+    RE_LEGACY_EVENT_STATEMENT,
+    RE_RETURN_KEYWORD,
+    RE_SAFE_TRANSFER_CALL,
+    RE_SAFE_TRANSFER_ETH_CALL,
+    RE_SEND_CALL,
+    RE_SEND_VALUE_CALL,
+    RE_STATE_WRITE,
+    RE_TRANSFER_CALL,
+)
 from E2E.phase0_parsing.code_units import mask_noncode
 from E2E.phase0_parsing.contract_context import local_variable_names
 
 
-_VALUE_CALL = r"(?:\.call\s*\{\s*value\s*:|\.call\.value\s*\()"
-
-
 _TRANSFER_EQUIVALENTS = {
     # kind: (pattern that detects the original call, patterns accepted as preserving it)
-    "ETH value call": (_VALUE_CALL, (_VALUE_CALL, r"\bsendValue\s*\(", r"\bsafeTransferETH\s*\(")),
+    "ETH value call": (RE_ETH_VALUE_CALL, (RE_ETH_VALUE_CALL, RE_SEND_VALUE_CALL, RE_SAFE_TRANSFER_ETH_CALL)),
     "ETH transfer": (
-        r"\.transfer\s*\(",
-        (r"\.transfer\s*\(", r"\.safeTransfer\s*\(", _VALUE_CALL, r"\bsendValue\s*\(", r"\bsafeTransferETH\s*\("),
+        RE_TRANSFER_CALL,
+        (RE_TRANSFER_CALL, RE_SAFE_TRANSFER_CALL, RE_ETH_VALUE_CALL, RE_SEND_VALUE_CALL, RE_SAFE_TRANSFER_ETH_CALL),
     ),
     "ETH send": (
-        r"\.send\s*\(",
-        (r"\.send\s*\(", r"\.transfer\s*\(", _VALUE_CALL, r"\bsendValue\s*\("),
+        RE_SEND_CALL,
+        (RE_SEND_CALL, RE_TRANSFER_CALL, RE_ETH_VALUE_CALL, RE_SEND_VALUE_CALL),
     ),
 }
-
-
-_STATE_WRITE_RE = re.compile(r"([A-Za-z_$][\w$]*)(?:\s*\[[^\]]+\])*\s*(\+=|-=|\*=|/=|%=|=)(?!=)")
 
 
 # Tập tên biến state bị ghi trong hàm (=, +=, -=, ...), đã loại tham số / biến cục bộ (local_variable_names).
@@ -40,7 +44,7 @@ def _state_writes(code: str) -> set[str]:
     local = local_variable_names(code)
     return {
         match.group(1)
-        for match in _STATE_WRITE_RE.finditer(code)
+        for match in RE_STATE_WRITE.finditer(code)
         if match.group(1) not in local
     }
 
@@ -51,8 +55,8 @@ def _emitted_events(code: str) -> set[str]:
 
     Type conversions such as `IERC20(token).transfer(...)` are not events.
     """
-    events = set(re.findall(r"\bemit\s+([A-Za-z_$][\w$]*)\s*\(", code))
-    for match in re.finditer(r"(?:^|[;{}])\s*([A-Z][\w$]*)\s*\(", code):
+    events = set(RE_EMIT_EVENT.findall(code))
+    for match in RE_LEGACY_EVENT_STATEMENT.finditer(code):
         depth = 0
         cursor = match.end() - 1
         while cursor < len(code):
@@ -88,12 +92,12 @@ def validate_observable_behavior(original: str, replacement: str) -> None:
     replacement_code = mask_noncode(replacement, mask_strings=False)
 
     for label, (detect, preserved_by) in _TRANSFER_EQUIVALENTS.items():
-        if re.search(detect, original_code) and not any(
-            re.search(pattern, replacement_code) for pattern in preserved_by
+        if detect.search(original_code) and not any(
+            pattern.search(replacement_code) for pattern in preserved_by
         ):
             raise ValueError(f"Generated patch removed observable behavior: {label}")
 
-    if re.search(r"\breturn\b", original_code) and not re.search(r"\breturn\b", replacement_code):
+    if RE_RETURN_KEYWORD.search(original_code) and not RE_RETURN_KEYWORD.search(replacement_code):
         raise ValueError("Generated patch removed observable behavior: return statement")
 
     missing_events = _emitted_events(original_code) - _emitted_events(replacement_code)

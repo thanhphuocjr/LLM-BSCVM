@@ -12,11 +12,16 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import urllib.request
 from pathlib import Path
 from typing import Any
 
+from E2E.common.regex_patterns import (
+    RE_JSON_FENCE,
+    RE_UNESCAPED_NEWLINE,
+    re_json_scalar_value,
+    re_json_string_value,
+)
 from E2E.config import DEFAULT_DETECTOR_THRESHOLD, PROJECT_ROOT
 
 DEFAULT_SERVER_GPU_URL = "http://100.122.153.35:6868"
@@ -142,7 +147,7 @@ def extract_json(text: str) -> Any:
     """
     text = text.strip()
     # Strip ```json ... ``` fences if present.
-    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    fenced = RE_JSON_FENCE.search(text)
     if fenced:
         text = fenced.group(1).strip()
 
@@ -164,18 +169,18 @@ def extract_json(text: str) -> Any:
 
         # 3. Raw newlines inside string values -> \n
         try:
-            return json.loads(re.sub(r"(?<!\\)\n", r"\\n", sliced), strict=False)
+            return json.loads(RE_UNESCAPED_NEWLINE.sub(r"\\n", sliced), strict=False)
         except Exception:
             pass
 
     # 4. Regex salvage of the keys the agents read (string, number or boolean values)
     salvaged: dict[str, Any] = {}
     for key in _SALVAGE_KEYS:
-        string_match = re.search(rf'"{key}"\s*:\s*"((?:\\.|[^"\\])*)"', text)
+        string_match = re_json_string_value(key).search(text)
         if string_match:
             salvaged[key] = string_match.group(1).replace(r'\"', '"').replace(r'\n', '\n')
             continue
-        scalar_match = re.search(rf'"{key}"\s*:\s*([0-9.]+|true|false)', text, re.IGNORECASE)
+        scalar_match = re_json_scalar_value(key).search(text)
         if scalar_match:
             raw_value = scalar_match.group(1).lower()
             if raw_value in {"true", "false"}:

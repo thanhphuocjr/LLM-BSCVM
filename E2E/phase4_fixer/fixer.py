@@ -12,10 +12,10 @@ failing stage); there is no fallback patch source.
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from E2E.common.gpu_client import generate_via_server
+from E2E.common.regex_patterns import RE_FULL_VERSION, RE_PRAGMA_SPEC
 from E2E.phase0_parsing.code_units import CodeUnit, parse_code_units
 from E2E.phase0_parsing.contract_context import build_contract_context
 from E2E.phase4_fixer.behavior_guard import validate_observable_behavior
@@ -110,12 +110,12 @@ def _splice_unit(code: str, target: CodeUnit, replacement: str, summary: str) ->
 # Phiên bản solc thấp nhất mà pragma cho phép (bản vá phải compile được với bản này).
 def _min_pragma_version(source_code: str) -> tuple[int, int, int] | None:
     """Lowest compiler version allowed by the pragma (the patch must compile with it)."""
-    match = re.search(r"pragma\s+solidity\s+([^;]+);", source_code)
+    match = RE_PRAGMA_SPEC.search(source_code)
     if not match:
         return None
     versions = [
         tuple(int(part) for part in found)
-        for found in re.findall(r"(\d+)\.(\d+)\.(\d+)", match.group(1))
+        for found in RE_FULL_VERSION.findall(match.group(1))
     ]
     return min(versions) if versions else None
 
@@ -127,7 +127,7 @@ def _version_rules(source_code: str) -> str:
     version = _min_pragma_version(source_code)
     if version is None or version >= (0, 6, 0):
         return ""
-    spec = re.search(r"pragma\s+solidity\s+([^;]+);", source_code).group(1).strip()
+    spec = RE_PRAGMA_SPEC.search(source_code).group(1).strip()
     rules = [f"   - TARGET SOLIDITY COMPILER: pragma solidity {spec} (legacy {version[0]}.{version[1]}.{version[2]})."]
     if version < (0, 4, 22):
         rules.append("     * DO NOT pass a message string to require(); only `require(condition);` is valid.")

@@ -26,12 +26,12 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
-import re
 import time
 from pathlib import Path
 from typing import Any
 
 from E2E.common.io_utils import read_json, sha256_text, utc_now, write_json, write_text
+from E2E.common.regex_patterns import RE_RUN_ID, RE_UNSAFE_NAME_CHARS
 from E2E.common.safe_run import safe_run
 from E2E.config import (
     DEFAULT_DETECTOR_THRESHOLD,
@@ -76,7 +76,7 @@ def resolve_detector_threshold(configured: float | None = None) -> float:
 # Mục đích: mỗi lần audit có một thư mục riêng data/results/audit_runs/<run_id>/, nhìn tên là biết
 # chạy lúc nào, file nào, nội dung nào.
 def make_run_id(file_name: str, code: str) -> str:
-    stem = re.sub(r"[^a-zA-Z0-9_-]+", "-", Path(file_name).stem).strip("-") or "contract"
+    stem = RE_UNSAFE_NAME_CHARS.sub("-", Path(file_name).stem).strip("-") or "contract"
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     return f"{timestamp}-{stem}-{sha256_text(code)[:8]}"
 
@@ -84,7 +84,7 @@ def make_run_id(file_name: str, code: str) -> str:
 # Nhiệm vụ: kiểm tra run_id chỉ gồm chữ/số/._- và tối đa 128 ký tự, sai thì raise ValueError.
 # Mục đích: run_id được dùng làm tên thư mục -> chặn path traversal (vd "../../etc") từ CLI/web app.
 def validated_run_id(value: str) -> str:
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
+    if not RE_RUN_ID.fullmatch(value):
         raise ValueError(
             "run_id must contain only letters, digits, dot, underscore, or hyphen "
             "and must not exceed 128 characters"

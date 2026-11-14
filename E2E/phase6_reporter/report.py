@@ -6,7 +6,6 @@ verdict from apply_verification_to_report) rendered as Markdown, HTML and PDF (r
 from __future__ import annotations
 
 import html
-import re
 import textwrap
 from collections import Counter
 from datetime import datetime
@@ -15,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from E2E.common.io_utils import write_text
+from E2E.common.regex_patterns import RE_CALL_OPTIONS_PREFIX
 from E2E.config import RISK_ORDER
 from E2E.phase6_reporter.vulnerability_reference import VULNERABILITY_REFERENCE
 
@@ -156,7 +156,7 @@ def format_solidity_for_comparison(code: str) -> list[str]:
             is_call_options = bool(
                 paren_depth
                 or bracket_depth
-                or re.search(r"(?:\.(?:call|delegatecall|staticcall)|\bnew\s+[A-Za-z_]\w*)$", prefix)
+                or RE_CALL_OPTIONS_PREFIX.search(prefix)
             )
             if expression_brace_depth or is_call_options:
                 append(char)

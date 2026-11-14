@@ -10,14 +10,20 @@ from __future__ import annotations
 
 import re
 
-from E2E.phase0_parsing.code_units import CodeUnit, mask_noncode
-
-
-# Khai báo tham số / biến cục bộ: "<kiểu>[[]] [memory|storage|calldata] <tên>" đứng trước "=", ";", "," hoặc ")".
-_LOCAL_DECL_RE = re.compile(
-    r"\b(?:u?int\d*|address(?:\s+payable)?|bool|bytes\d*|string|var|[A-Z][\w$]*)"
-    r"(?:\s*\[[^\]]*\])*\s+(?:(memory|storage|calldata)\s+)?([A-Za-z_$][\w$]*)\s*(?=[=;,)])"
+from E2E.common.regex_patterns import (
+    RE_BOOL_TUPLE_LOCAL,
+    RE_INVARIANT_EVENT,
+    RE_INVARIANT_EXTERNAL_CALL,
+    RE_INVARIANT_RETURN,
+    RE_INVARIANT_STATE_WRITE,
+    RE_LEADING_NAME,
+    RE_LOCAL_DECLARATION,
+    RE_MODIFIER_OPENING,
+    RE_WHITESPACE,
+    re_contract_opening,
+    re_word,
 )
+from E2E.phase0_parsing.code_units import CodeUnit, mask_noncode
 
 # Câu lệnh cấp contract KHÔNG phải biến trạng thái (khai báo hàm không thân, event, using, ...).
 _NOT_STATE_VARIABLE = (
@@ -33,10 +39,10 @@ _NOT_STATE_VARIABLE = (
 def local_variable_names(code: str) -> set[str]:
     """Parameters and non-storage local variables: rewriting them is not a state change."""
     names = set()
-    for match in _LOCAL_DECL_RE.finditer(code):
+    for match in RE_LOCAL_DECLARATION.finditer(code):
         if match.group(1) != "storage":
             names.add(match.group(2))
-    for match in re.finditer(r"\(\s*bool\s+([A-Za-z_$][\w$]*)", code):
+    for match in RE_BOOL_TUPLE_LOCAL.finditer(code):
         names.add(match.group(1))
     return names
 
@@ -72,29 +78,25 @@ def extract_function_invariants(func_code: str) -> dict[str, list[str]]:
 
     # 1. State writes: biến bị ghi với =, +=, -=, *=, /=, %= (bỏ tham số và biến cục bộ như `uint x = 0`)
     local_names = local_variable_names(clean)
-    write_re = re.compile(r"\b([a-zA-Z0-9_]+(?:\s*\[[^\]]+\])*(?:\.[a-zA-Z0-9_]+)*)\s*(\+=|-=|\*=|\/=|%=|=)(?!=)")
-    for match in write_re.finditer(clean):
+    for match in RE_INVARIANT_STATE_WRITE.finditer(clean):
         lhs = text_of(match)
-        if re.match(r"[A-Za-z0-9_]+", lhs).group() in local_names:
+        if RE_LEADING_NAME.match(lhs).group() in local_names:
             continue
         invariants["state_writes"].append(f"{lhs} {match.group(2).strip()}")
 
     # 2. Events: emit Event(...) hoặc Event(...) trong 0.4
-    event_re = re.compile(r"(?:emit\s+([A-Za-z_$][\w$]*)|(?<!function\s)(?<!return\s)(?<!require\()(?<!assert\()(?<!revert\()([A-Z][A-Za-z0-9_$]*))\s*\(")
-    for match in event_re.finditer(clean):
+    for match in RE_INVARIANT_EVENT.finditer(clean):
         ev_name = match.group(1) or match.group(2)
         if ev_name and ev_name not in {"SafeMath", "ERC20", "StandardToken", "Token"}:
             invariants["events"].append(ev_name)
 
     # 3. External calls / ETH transfers
-    ext_re = re.compile(r"\b([a-zA-Z0-9_\[\]\.]+\s*\.\s*(?:transfer|send|call\.value|call\{value:[^}]+\}|call))\s*\(")
-    for match in ext_re.finditer(clean):
+    for match in RE_INVARIANT_EXTERNAL_CALL.finditer(clean):
         invariants["external_calls"].append(text_of(match))
 
     # 4. Returns
-    # Group lấy cả khoảng trắng sau `return`: chuỗi đã bị che thành dấu cách, `\s+` sẽ nuốt mất nó.
-    ret_re = re.compile(r"\breturn(?=\s)([^;]+);")
-    for match in ret_re.finditer(clean):
+    # RE_INVARIANT_RETURN lấy cả khoảng trắng sau `return`: chuỗi đã bị che thành dấu cách, `\s+` sẽ nuốt mất nó.
+    for match in RE_INVARIANT_RETURN.finditer(clean):
         expression = text_of(match)
         if expression:
             invariants["returns"].append(expression)
@@ -169,16 +171,13 @@ def build_contract_context(
 
     # 1. Hợp đồng bao quanh: khai báo cấp contract nằm ở độ sâu 0 bên trong thân của nó.
     #    Không tìm thấy (finding cấp contract) -> xét mọi contract trong file (độ sâu 1 tính từ đầu file).
-    contract_match = re.search(
-        rf"\b(?:contract|library|interface)\s+{re.escape(contract_name)}\b[^{{]*\{{",
-        masked,
-    )
+    contract_match = re_contract_opening(contract_name).search(masked)
     if contract_match:
         body_start, body_end, depth = contract_match.end(), _matching_brace(masked, contract_match.end() - 1), 0
     else:
         body_start, body_end, depth = 0, len(masked), 1
     declarations = [
-        re.sub(r"\s+", " ", readable[start:end]).strip()
+        RE_WHITESPACE.sub(" ", readable[start:end]).strip()
         for start, end in _statements_at_depth(masked, body_start, body_end, depth)
     ]
 
@@ -191,9 +190,9 @@ def build_contract_context(
     #    contract bao quanh + modifier mà hàm đích dùng trong header dù khai báo ở contract cha (vd Ownable).
     unit_header = mask_noncode(unit_code).split("{", 1)[0]
     modifiers: list[str] = []
-    for match in re.finditer(r"\bmodifier\s+([A-Za-z_$][\w$]*)\s*(?:\([^)]*\))?[^{;]*\{", masked):
+    for match in RE_MODIFIER_OPENING.finditer(masked):
         in_contract = body_start <= match.start() < body_end
-        if not in_contract and not re.search(rf"\b{re.escape(match.group(1))}\b", unit_header):
+        if not in_contract and not re_word(match.group(1)).search(unit_header):
             continue
         close = _matching_brace(masked, match.end() - 1)
         modifiers.append(readable[match.start() : close + 1].strip())

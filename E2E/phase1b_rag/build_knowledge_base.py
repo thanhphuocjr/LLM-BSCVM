@@ -21,7 +21,6 @@ import argparse
 from collections import Counter, defaultdict
 import json
 from pathlib import Path
-import re
 from typing import Any
 
 import joblib
@@ -29,6 +28,14 @@ from scipy.sparse import save_npz
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from E2E.common.io_utils import utc_now, write_json
+from E2E.common.regex_patterns import (
+    RE_BULLET_PREFIX,
+    RE_MARKDOWN_CODE_BLOCK,
+    RE_MARKDOWN_LINK,
+    RE_MARKDOWN_SYMBOLS,
+    RE_SENTENCE_BREAK,
+    RE_WHITESPACE,
+)
 from E2E.config import (
     BASELINE_TAXONOMY_PATH,
     KNOWLEDGE_BASE_DIR,
@@ -43,17 +50,17 @@ from E2E.phase1b_rag.swc_agents import (
 
 # Bỏ code block, link, ký hiệu Markdown -> văn bản thuần.
 def clean_markdown(value: str) -> str:
-    value = re.sub(r"```[\s\S]*?```", " ", value)
-    value = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", value)
-    value = re.sub(r"[`*_>#-]+", " ", value)
-    return re.sub(r"\s+", " ", value).strip()
+    value = RE_MARKDOWN_CODE_BLOCK.sub(" ", value)
+    value = RE_MARKDOWN_LINK.sub(r"\1", value)
+    value = RE_MARKDOWN_SYMBOLS.sub(" ", value)
+    return RE_WHITESPACE.sub(" ", value).strip()
 
 
 # Tách phần hướng dẫn sửa lỗi thành danh sách gạch đầu dòng (tối đa 4 câu nếu không có bullet).
 def checklist(remediation: str) -> list[str]:
     items = []
     for line in remediation.splitlines():
-        item = re.sub(r"^\s*[-*]\s*", "", line).strip()
+        item = RE_BULLET_PREFIX.sub("", line).strip()
         if item and item != line.strip():
             items.append(clean_markdown(item))
     if items:
@@ -61,7 +68,7 @@ def checklist(remediation: str) -> list[str]:
     text = clean_markdown(remediation)
     if not text:
         return []
-    sentences = [s.strip() for s in re.split(r"[.;]\s+", text) if len(s.strip()) > 10]
+    sentences = [s.strip() for s in RE_SENTENCE_BREAK.split(text) if len(s.strip()) > 10]
     return sentences[:4] if len(sentences) > 1 else [text]
 
 

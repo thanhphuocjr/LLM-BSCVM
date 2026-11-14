@@ -12,9 +12,9 @@ A failing candidate produces feedback text for the next Fixer attempt.
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
+from E2E.common.regex_patterns import RE_SOL_FILE_PATH, RE_SOLC_ERROR_LINE
 from E2E.common.solc import check_compilation_with_baseline, compiler_error_signatures
 from E2E.config import RISK_ORDER
 from E2E.phase0_parsing.code_units import parse_code_units
@@ -58,13 +58,10 @@ def evaluate_compilation(original_code: str, fixed_code: str) -> dict[str, Any]:
     }
 
 
-_ERROR_LINE_RE = re.compile(r"\S+?\.sol:(\d+):\d+")  # `--> a.sol:12:5` (>=0.5) and `a.sol:12:5: Error` (0.4)
-
-
 # Ánh xạ vị trí lỗi solc ("--> file:DÒNG:CỘT") sang các unit chứa dòng đó -> biết hàm vá nào làm hỏng compile.
 def units_with_compiler_errors(candidate_code: str, error_text: str) -> set[str]:
     """Map solc error locations (`--> file:LINE:COL`) to the units that contain them."""
-    lines = {int(value) for value in _ERROR_LINE_RE.findall(error_text or "")}
+    lines = {int(value) for value in RE_SOLC_ERROR_LINE.findall(error_text or "")}
     return {
         unit.unit_id
         for unit in parse_code_units(candidate_code)
@@ -175,15 +172,12 @@ def verify_candidate(
     }
 
 
-_SOURCE_PATH_RE = re.compile(r"(?:/[^\s:]+)+\.sol")
-
-
 # Lỗi compile đưa vào feedback: tối đa 3 khối lỗi của solc (extract_solc_errors), mỗi khối giữ dòng "Error",
 # vị trí, dòng mã và dấu ^ chỉ chỗ sai (tối đa 6 dòng); đường dẫn file tạm được thay bằng Contract.sol.
 # Mục đích: Fixer biết chính xác định danh / dòng nào làm hỏng compile (chỉ dòng "Error" thì không đủ để sửa).
 def _compiler_feedback(error_text: str) -> str:
     blocks = [block.splitlines()[:6] for block in (error_text or "").split("\n\n") if block.strip()][:3]
-    return _SOURCE_PATH_RE.sub("Contract.sol", "\n".join(line for block in blocks for line in block))
+    return RE_SOL_FILE_PATH.sub("Contract.sol", "\n".join(line for block in blocks for line in block))
 
 
 # Viết feedback cho lần Fixer tiếp theo: lỗi compile (kèm dòng mã bị lỗi), hàm detector vẫn báo Vulnerable,

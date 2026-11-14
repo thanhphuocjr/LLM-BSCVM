@@ -6,6 +6,8 @@ Phát hiện các lỗ hổng phổ biến trong Solidity bằng cách kết h�
      mẫu âm (dấu hiệu phòng vệ) và guard modifier trừ điểm; luật "confirmed" khi raw_score - trừ > 0.25.
   2. 25 kiểm tra ngữ nghĩa (_run_semantic_checks), cài lại logic tương tự các detector của Slither.
 Kết quả: {"findings": {vuln_type: VulnerabilityFinding}}; static_runner.py chuẩn hoá thành finding của pipeline.
+Regex dùng trong các hàm của file này (RE_XXX, re_xxx(name)) nằm ở E2E/common/regex_patterns.py;
+bảng luật VULNERABILITY_REGISTRY vẫn ở đây vì mỗi regex đi kèm trọng số và mô tả.
 
 Mức rủi ro của 27 luật:
   Critical : Reentrancy, Access Control (gồm tx.origin, selfdestruct, rút ETH), Unchecked Calls, Storage Collision
@@ -22,6 +24,80 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Tuple
 
+from E2E.common.regex_patterns import (
+    RE_ABI_ENCODE_CALL,
+    RE_ABSTRACT_AT_END,
+    RE_ARRAY_LENGTH_ASSIGNMENT,
+    RE_ARRAY_SUFFIX,
+    RE_ASSEMBLY_BLOCK,
+    RE_BALANCE_ASSIGNMENT,
+    RE_BALANCE_SOURCE,
+    RE_BOOLEAN_CONSTANT_OPERAND,
+    RE_CAST_PREFIX,
+    RE_CONTRACT_WITH_BODY,
+    RE_DECIMAL_NUMBER,
+    RE_DELEGATECALL,
+    RE_DELETE_STATEMENT,
+    RE_ENCODE_PACKED_CALL,
+    RE_ENUM_OPENING,
+    RE_ERC20_TRANSFER_CALL,
+    RE_FUNCTION_HEADER_PREFIX,
+    RE_FUNCTION_WITH_BODY,
+    RE_GUARD_MODIFIER_NAME,
+    RE_IDENTIFIER,
+    RE_IF_CONSTANT_CONDITION,
+    RE_INHERITANCE_LIST,
+    RE_INTEGER_LITERAL,
+    RE_INTEGER_TYPE,
+    RE_INTERNAL_OR_PRIVATE,
+    RE_IS_KEYWORD,
+    RE_LEADING_IDENTIFIER,
+    RE_LOOP_OPENING,
+    RE_MAPPING_KEYWORD,
+    RE_MAPPING_VALUE_TYPE,
+    RE_MODIFIER_NAME,
+    RE_MODIFIER_WITH_BODY,
+    RE_MSG_VALUE,
+    RE_MSG_VALUE_ZERO_CHECK,
+    RE_ORDER_COMPARISON,
+    RE_OUTGOING_ETHER,
+    RE_PARAMETER,
+    RE_PAYABLE,
+    RE_PINNED_PRAGMA_0_4_OR_0_5,
+    RE_PRAGMA_0_4,
+    RE_PRAGMA_0_4_0_TO_0_4_4,
+    RE_PRAGMA_ABIENCODERV2,
+    RE_PRAGMA_STATEMENT,
+    RE_PUBLIC_MAPPING_VALUE_TYPE,
+    RE_PUBLIC_OR_EXTERNAL,
+    RE_RETURNS_CLAUSE,
+    RE_SENDER_CHECKS,
+    RE_SIGNED_INT_ARRAY_TYPE,
+    RE_SPECIAL_FUNCTION_WITH_BODY,
+    RE_STATE_DECLARATION,
+    RE_STATE_MAPPING,
+    RE_STATE_TYPE_AND_NAME,
+    RE_STORAGE_ARRAY_LOCAL,
+    RE_STRICT_EQUALITY,
+    RE_STRUCT_OPENING,
+    RE_SYMBOL_DECLARATION,
+    RE_WHITESPACE,
+    RE_WORD_TOKEN,
+    RE_XOR_EXPRESSION,
+    RE_YUL_RETURN_CALL,
+    RE_YUL_SHIFT_WITH_CONSTANT_VALUE,
+    re_assignment_from,
+    re_assignment_to,
+    re_call,
+    re_call_target,
+    re_enum_conversion,
+    re_ether_destination,
+    re_indexed_write,
+    re_state_write,
+    re_word,
+    re_zero_address_require,
+    re_zero_address_revert_if,
+)
 from E2E.phase0_parsing.code_units import mask_noncode
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -808,20 +884,8 @@ def _balanced_end(
 def _iter_functions(code: str) -> Iterator[SolidityFunction]:
     """Yield implemented functions without requiring a Solidity compiler."""
     clean = _clean_code(code)
-    patterns = (
-        re.compile(
-            r'\bfunction\s+(?P<name>[A-Za-z_]\w*)\s*'
-            r'\((?P<params>[^)]*)\)(?P<header>[^;{}]*)\{',
-            re.DOTALL,
-        ),
-        re.compile(
-            r'\b(?P<name>constructor|receive|fallback)\s*'
-            r'\((?P<params>[^)]*)\)(?P<header>[^;{}]*)\{',
-            re.DOTALL,
-        ),
-    )
     functions: List[SolidityFunction] = []
-    for pattern in patterns:
+    for pattern in (RE_FUNCTION_WITH_BODY, RE_SPECIAL_FUNCTION_WITH_BODY):
         for match in pattern.finditer(clean):
             open_pos = match.end() - 1
             close_pos = _balanced_end(clean, open_pos)
@@ -842,12 +906,7 @@ def _iter_functions(code: str) -> Iterator[SolidityFunction]:
 def _iter_contracts(code: str) -> Iterator[SolidityContract]:
     """Yield concrete contract boundaries for contract-level checks."""
     clean = _clean_code(code)
-    pattern = re.compile(
-        r'\bcontract\s+(?P<name>[A-Za-z_]\w*)'
-        r'(?P<header>[^;{}]*)\{',
-        re.DOTALL,
-    )
-    for match in pattern.finditer(clean):
+    for match in RE_CONTRACT_WITH_BODY.finditer(clean):
         open_pos = match.end() - 1
         close_pos = _balanced_end(clean, open_pos)
         if close_pos is None:
@@ -865,11 +924,7 @@ def _iter_contracts(code: str) -> Iterator[SolidityContract]:
 def _iter_modifiers(code: str) -> Iterator[SolidityModifier]:
     """Yield modifier boundaries without requiring a Solidity compiler."""
     clean = _clean_code(code)
-    pattern = re.compile(
-        r'\bmodifier\s+(?P<name>[A-Za-z_]\w*)\s*(?:\((?P<params>[^)]*)\))?(?P<header>[^;{}]*)\{',
-        re.DOTALL,
-    )
-    for match in pattern.finditer(clean):
+    for match in RE_MODIFIER_WITH_BODY.finditer(clean):
         open_pos = match.end() - 1
         close_pos = _balanced_end(clean, open_pos)
         if close_pos is None:
@@ -885,22 +940,12 @@ def _iter_modifiers(code: str) -> Iterator[SolidityModifier]:
         )
 
 
-# Kiểm tra phân quyền theo người gọi trong một thân hàm/modifier: require(msg.sender == ...), require(... == msg.sender),
-# if (msg.sender != ...) revert/throw, require(owners[msg.sender]...), require(isOwner(...)/hasRole(...)/authorized(...)).
+# Thân hàm/modifier có ít nhất một kiểm tra người gọi trong RE_SENDER_CHECKS không: require(msg.sender == ...),
+# require(... == msg.sender), if (msg.sender != ...) revert/throw, require(owners[msg.sender]...),
+# require(isOwner(...)/hasRole(...)/authorized(...)).
 # Dùng chung cho extract_guard_modifiers (thân modifier) và is_function_guarded (thân hàm).
-_SENDER_CHECKS = (
-    re.compile(r'require\s*\([^;]*msg\.sender\s*=='),
-    re.compile(r'require\s*\([^;]*==\s*msg\.sender'),
-    re.compile(r'if\s*\([^)]*msg\.sender\s*!=[^)]*\)\s*(?:revert\b|throw\b)'),
-    re.compile(r'if\s*\([^)]*!=\s*msg\.sender[^)]*\)\s*(?:revert\b|throw\b)'),
-    re.compile(r'require\s*\([^;]*\[msg\.sender\]'),
-    re.compile(r'require\s*\([^;]*(?:isOwner|hasRole|authorized)\s*\('),
-)
-
-
-# Thân hàm/modifier có ít nhất một kiểm tra người gọi trong _SENDER_CHECKS không.
 def _has_sender_check(body: str) -> bool:
-    return any(pattern.search(body) for pattern in _SENDER_CHECKS)
+    return any(pattern.search(body) for pattern in RE_SENDER_CHECKS)
 
 
 # Nhiệm vụ: tìm tên các modifier có chức năng phân quyền: tên kiểu onlyXxx/auth/restricted, HOẶC thân modifier
@@ -920,9 +965,9 @@ def extract_guard_modifiers(code: str) -> set[str]:
     """
     clean = _clean_code(code)
     guards: set[str] = set()
-    for m in re.finditer(r'\bmodifier\s+([A-Za-z0-9_]+)', clean):
+    for m in RE_MODIFIER_NAME.finditer(clean):
         name = m.group(1)
-        if re.match(r'^(?:only[A-Z]\w*|auth|authorized|restricted)$', name):
+        if RE_GUARD_MODIFIER_NAME.match(name):
             guards.add(name)
     for mod in _iter_modifiers(code):
         if _has_sender_check(mod.body):
@@ -946,16 +991,16 @@ def is_function_guarded(
         require(msg.sender == ...)
         if (msg.sender != ...) revert/throw
     """
-    if re.search(r'\b(?:private|internal)\b', header):
+    if RE_INTERNAL_OR_PRIVATE.search(header):
         return True
     active_guards = (guard_modifiers or set()) | {
         "onlyOwner", "onlyAdmin", "onlyRole", "onlyMinter",
         "onlyFounder", "authorized", "auth", "restricted"
     }
     for mod in active_guards:
-        if re.search(rf'\b{re.escape(mod)}\b', header):
+        if re_word(mod).search(header):
             return True
-    for token in re.findall(r'\b([A-Za-z0-9_]+)\b', header):
+    for token in RE_WORD_TOKEN.findall(header):
         if token.startswith("only") and len(token) > 4:
             return True
     return _has_sender_check(body)
@@ -999,19 +1044,13 @@ def _split_top_level_arguments(value: str) -> List[str]:
 def _collect_symbol_types(code: str) -> Dict[str, str]:
     """Collect simple variable-to-type bindings used by focused checks."""
     clean = _clean_code(code)
-    declaration = re.compile(
-        r'\b(?P<type>[A-Za-z_]\w*(?:\s*\[\s*\d*\s*\])*)\s+'
-        r'(?:(?:public|private|internal|external|constant|immutable|memory|'
-        r'calldata|storage|payable|indexed)\s+)*'
-        r'(?P<name>[A-Za-z_]\w*)\b'
-    )
     ignored_types = {
         "contract", "function", "event", "error", "modifier", "return",
         "returns", "import", "pragma", "using", "struct", "enum",
     }
     bindings: Dict[str, str] = {}
-    for match in declaration.finditer(clean):
-        type_name = re.sub(r'\s+', '', match.group("type"))
+    for match in RE_SYMBOL_DECLARATION.finditer(clean):
+        type_name = RE_WHITESPACE.sub('', match.group("type"))
         if type_name.lower() in ignored_types:
             continue
         bindings[match.group("name")] = type_name
@@ -1027,17 +1066,17 @@ def _is_dynamic_abi_argument(argument: str, symbol_types: Dict[str, str]) -> boo
         value.startswith("'") and value.endswith("'")
     ):
         return True
-    identifier = re.fullmatch(r'([A-Za-z_]\w*)', value)
+    identifier = RE_IDENTIFIER.fullmatch(value)
     if not identifier:
         return False
-    type_name = symbol_types.get(identifier.group(1), "").replace(" ", "")
+    type_name = symbol_types.get(identifier.group(), "").replace(" ", "")
     return type_name in {"string", "bytes"} or "[]" in type_name
 
 
 # Đối tượng nhận lời gọi có vẻ là token ERC20 không (ép kiểu IERC20(...) hoặc biến kiểu ERC20).
 def _looks_like_erc20(receiver: str, symbol_types: Dict[str, str]) -> bool:
-    compact = re.sub(r'\s+', '', receiver)
-    cast = re.match(r'(?P<type>[A-Za-z_]\w*)\(', compact)
+    compact = RE_WHITESPACE.sub('', receiver)
+    cast = RE_CAST_PREFIX.match(compact)
     if cast:
         return "erc20" in cast.group("type").lower()
     type_name = symbol_types.get(compact, "").lower()
@@ -1048,17 +1087,12 @@ def _looks_like_erc20(receiver: str, symbol_types: Dict[str, str]) -> bool:
 def _parse_parameter_details(params: str) -> Dict[str, Tuple[str, str]]:
     """Return parameter name -> (type, data location)."""
     details: Dict[str, Tuple[str, str]] = {}
-    pattern = re.compile(
-        r'^\s*(?P<type>[A-Za-z_]\w*(?:\s*\[\s*\d*\s*\])*)\s*'
-        r'(?P<location>memory|storage|calldata|payable)?\s*'
-        r'(?P<name>[A-Za-z_]\w*)\s*$'
-    )
     for parameter in _split_top_level_arguments(params):
-        match = pattern.match(parameter)
+        match = RE_PARAMETER.match(parameter)
         if not match:
             continue
         details[match.group("name")] = (
-            re.sub(r'\s+', '', match.group("type")),
+            RE_WHITESPACE.sub('', match.group("type")),
             match.group("location") or "",
         )
     return details
@@ -1098,27 +1132,18 @@ def _collect_contract_state_declarations(
 ) -> Dict[str, Tuple[str, int, bool]]:
     """Return state name -> (type, source position, has initializer)."""
     result: Dict[str, Tuple[str, int, bool]] = {}
-    standard = re.compile(
-        r'^\s*(?P<type>[A-Za-z_]\w*(?:\s*\[\s*\d*\s*\])*)\s+'
-        r'(?:(?:public|private|internal|constant|immutable|payable)\s+)*'
-        r'(?P<name>[A-Za-z_]\w*)\b(?P<tail>[^;]*);'
-    )
-    mapping = re.compile(
-        r'^\s*mapping\s*\([^;]+\)\s*'
-        r'(?:(?:public|private|internal)\s+)*(?P<name>[A-Za-z_]\w*)\b'
-    )
     for position, statement in _contract_top_level_statements(code, contract):
         clean_statement = _clean_code(statement)
-        match = standard.match(clean_statement)
+        match = RE_STATE_DECLARATION.match(clean_statement)
         if match:
             leading = len(clean_statement) - len(clean_statement.lstrip())
             result[match.group("name")] = (
-                re.sub(r'\s+', '', match.group("type")),
+                RE_WHITESPACE.sub('', match.group("type")),
                 position + leading,
                 "=" in match.group("tail"),
             )
             continue
-        mapping_match = mapping.match(clean_statement)
+        mapping_match = RE_STATE_MAPPING.match(clean_statement)
         if mapping_match:
             leading = len(clean_statement) - len(clean_statement.lstrip())
             result[mapping_match.group("name")] = (
@@ -1133,15 +1158,10 @@ def _collect_contract_state_declarations(
 def _collect_state_symbol_types(code: str) -> Dict[str, str]:
     """Collect simple top-level state variable declarations."""
     result: Dict[str, str] = {}
-    declaration = re.compile(
-        r'^\s*(?P<type>[A-Za-z_]\w*(?:\s*\[\s*\d*\s*\])*)\s+'
-        r'(?:(?:public|private|internal|constant|immutable|payable)\s+)*'
-        r'(?P<name>[A-Za-z_]\w*)\b'
-    )
     for _, statement in _top_level_contract_statements(code):
-        match = declaration.match(_clean_code(statement))
+        match = RE_STATE_TYPE_AND_NAME.match(_clean_code(statement))
         if match:
-            result[match.group("name")] = re.sub(r'\s+', '', match.group("type"))
+            result[match.group("name")] = RE_WHITESPACE.sub('', match.group("type"))
     return result
 
 
@@ -1149,12 +1169,8 @@ def _collect_state_symbol_types(code: str) -> Dict[str, str]:
 def _collect_mapping_value_types(code: str) -> Dict[str, str]:
     """Collect top-level mapping name -> direct value type."""
     result: Dict[str, str] = {}
-    pattern = re.compile(
-        r'^\s*mapping\s*\([^=;]+=>\s*(?P<value>[A-Za-z_]\w*)\s*\)\s*'
-        r'(?:(?:public|private|internal)\s+)*(?P<name>[A-Za-z_]\w*)\b'
-    )
     for _, statement in _top_level_contract_statements(code):
-        match = pattern.match(_clean_code(statement))
+        match = RE_MAPPING_VALUE_TYPE.match(_clean_code(statement))
         if match:
             result[match.group("name")] = match.group("value")
     return result
@@ -1165,7 +1181,7 @@ def _collect_struct_members(code: str) -> Dict[str, Tuple[set[str], bool]]:
     """Return struct member types and whether each struct directly has a mapping."""
     clean = _clean_code(code)
     structs: Dict[str, Tuple[set[str], bool]] = {}
-    for match in re.finditer(r'\bstruct\s+(?P<name>[A-Za-z_]\w*)\s*\{', clean):
+    for match in RE_STRUCT_OPENING.finditer(clean):
         open_pos = match.end() - 1
         close_pos = _balanced_end(clean, open_pos)
         if close_pos is None:
@@ -1174,7 +1190,7 @@ def _collect_struct_members(code: str) -> Dict[str, Tuple[set[str], bool]]:
         member_types = set(_collect_symbol_types(body).values())
         structs[match.group("name")] = (
             member_types,
-            bool(re.search(r'\bmapping\s*\(', _clean_code(body))),
+            bool(RE_MAPPING_KEYWORD.search(_clean_code(body))),
         )
     return structs
 
@@ -1196,7 +1212,7 @@ def _struct_contains_mapping(
     if direct_mapping:
         return True
     return any(
-        _struct_contains_mapping(re.sub(r'\[.*$', '', type_name), structs, seen)
+        _struct_contains_mapping(RE_ARRAY_SUFFIX.sub('', type_name), structs, seen)
         for type_name in member_types
     )
 
@@ -1205,8 +1221,7 @@ def _struct_contains_mapping(
 def _iter_loop_ranges(code: str, start: int, end: int) -> Iterator[Tuple[int, int]]:
     """Yield for/while ranges inside a source interval."""
     clean = _clean_code(code)
-    loop_pattern = re.compile(r'\b(?:for|while)\s*\(')
-    for match in loop_pattern.finditer(clean, start, end):
+    for match in RE_LOOP_OPENING.finditer(clean, start, end):
         open_paren = clean.find("(", match.start(), match.end())
         close_paren = _balanced_end(clean, open_paren, "(", ")")
         if close_paren is None or close_paren >= end:
@@ -1278,15 +1293,11 @@ def _detect_bidirectional_controls(code: str) -> Optional[VulnerabilityFinding]:
 def _detect_incorrect_exponentiation(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     # Mask pragma statements to avoid false positives on caret version specifiers (e.g. pragma solidity ^0.4.25;)
-    clean = re.sub(r'pragma\s+solidity\s+[^;]+;', lambda m: ' ' * len(m.group(0)), clean)
-    operand = r'(?:0x[0-9A-Fa-f]+|\d+|[A-Za-z_]\w*)'
-    pattern = re.compile(
-        rf'(?P<left>{operand})\s*\^(?!=)\s*(?P<right>{operand})'
-    )
+    clean = RE_PRAGMA_STATEMENT.sub(lambda m: ' ' * len(m.group(0)), clean)
     hits: List[Tuple[int, str, float, str]] = []
-    for match in pattern.finditer(clean):
+    for match in RE_XOR_EXPRESSION.finditer(clean):
         operands = (match.group("left"), match.group("right"))
-        if not any(re.fullmatch(r'\d+', value) for value in operands):
+        if not any(RE_DECIMAL_NUMBER.fullmatch(value) for value in operands):
             continue
         hits.append((
             match.start(),
@@ -1308,7 +1319,7 @@ def _detect_encode_packed_collision(code: str) -> Optional[VulnerabilityFinding]
     clean = _clean_code(code)
     symbol_types = _collect_symbol_types(code)
     hits: List[Tuple[int, str, float, str]] = []
-    for match in re.finditer(r'\babi\.encodePacked\s*\(', clean):
+    for match in RE_ENCODE_PACKED_CALL.finditer(clean):
         open_pos = clean.find("(", match.start(), match.end())
         close_pos = _balanced_end(clean, open_pos, "(", ")")
         if close_pos is None:
@@ -1345,13 +1356,8 @@ def _iter_erc20_calls(
 ) -> Iterator[Tuple[SolidityFunction, re.Match, str, List[str], int]]:
     clean = _clean_code(code)
     symbol_types = _collect_symbol_types(code)
-    call_pattern = re.compile(
-        r'(?P<receiver>(?:[A-Za-z_]\w*|'
-        r'[A-Za-z_]\w*\s*\([^()]*\)))\s*\.\s*'
-        r'(?P<method>transferFrom|transfer)\s*\('
-    )
     for function in _iter_functions(code):
-        for match in call_pattern.finditer(clean, function.body_start, function.end):
+        for match in RE_ERC20_TRANSFER_CALL.finditer(clean, function.body_start, function.end):
             receiver = match.group("receiver")
             if not _looks_like_erc20(receiver, symbol_types):
                 continue
@@ -1430,17 +1436,9 @@ def _detect_locked_ether(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     functions = list(_iter_functions(code))
     hits: List[Tuple[int, str, float, str]] = []
-    outgoing_ether = re.compile(
-        r'\.call\s*\{[^}]*\bvalue\s*:'
-        r'|\.send\s*\('
-        r'|\.transfer\s*\('
-        r'|\b(?:selfdestruct|suicide)\s*\('
-        r'|\bassembly\s*\{[^}]*\bcall\s*\(',
-        re.DOTALL,
-    )
     for contract in _iter_contracts(code):
         prefix = clean[max(0, contract.start - 16):contract.start]
-        if re.search(r'\babstract\s*$', prefix) or re.search(r'\bis\b', contract.header):
+        if RE_ABSTRACT_AT_END.search(prefix) or RE_IS_KEYWORD.search(contract.header):
             continue
         contract_functions = [
             function for function in functions
@@ -1448,16 +1446,16 @@ def _detect_locked_ether(code: str) -> Optional[VulnerabilityFinding]:
         ]
         payable_entries = [
             function for function in contract_functions
-            if re.search(r'\bpayable\b', function.header)
+            if RE_PAYABLE.search(function.header)
             and (
                 function.name in {"constructor", "receive", "fallback"}
-                or re.search(r'\b(?:public|external)\b', function.header)
+                or RE_PUBLIC_OR_EXTERNAL.search(function.header)
             )
         ]
         if not payable_entries:
             continue
         body = clean[contract.body_start:contract.end]
-        if outgoing_ether.search(body):
+        if RE_OUTGOING_ETHER.search(body):
             continue
         entry = payable_entries[0]
         hits.append((
@@ -1475,18 +1473,15 @@ def _detect_locked_ether(code: str) -> Optional[VulnerabilityFinding]:
 def _detect_msg_value_in_loop(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     hits: List[Tuple[int, str, float, str]] = []
-    zero_comparison = re.compile(
-        r'msg\.value\s*(?:==|!=)\s*0|0\s*(?:==|!=)\s*msg\.value'
-    )
     for function in _iter_functions(code):
-        if not re.search(r'\bpayable\b', function.header):
+        if not RE_PAYABLE.search(function.header):
             continue
         for loop_start, loop_end in _iter_loop_ranges(
             code, function.body_start, function.end
         ):
             loop = clean[loop_start:loop_end]
-            residual = zero_comparison.sub("", loop)
-            value_match = re.search(r'\bmsg\.value\b', residual)
+            residual = RE_MSG_VALUE_ZERO_CHECK.sub("", loop)
+            value_match = RE_MSG_VALUE.search(residual)
             if not value_match:
                 continue
             pos = loop_start + value_match.start()
@@ -1511,14 +1506,14 @@ def _detect_delegatecall_in_loop(code: str) -> Optional[VulnerabilityFinding]:
     hits: List[Tuple[int, str, float, str]] = []
     for function in _iter_functions(code):
         if not (
-            re.search(r'\bpayable\b', function.header)
-            and re.search(r'\b(?:public|external)\b', function.header)
+            RE_PAYABLE.search(function.header)
+            and RE_PUBLIC_OR_EXTERNAL.search(function.header)
         ):
             continue
         for loop_start, loop_end in _iter_loop_ranges(
             code, function.body_start, function.end
         ):
-            call = re.search(r'\.delegatecall\s*\(', clean[loop_start:loop_end])
+            call = RE_DELEGATECALL.search(clean[loop_start:loop_end])
             if not call:
                 continue
             pos = loop_start + call.start()
@@ -1544,7 +1539,6 @@ def _missing_zero_address_hits(
 ) -> List[Tuple[int, str, float, str]]:
     clean = _clean_code(code)
     hits: List[Tuple[int, str, float, str]] = []
-    zero = r'address\s*\(\s*(?:0|0x0+)\s*\)'
     for function in _iter_functions(code):
         parameter_types = _collect_symbol_types(function.params)
         address_parameters = [
@@ -1556,40 +1550,20 @@ def _missing_zero_address_hits(
         body = clean[function.body_start:function.end]
         local_names = set(_collect_symbol_types(body))
         for parameter in address_parameters:
-            escaped = re.escape(parameter)
-            require_check = re.search(
-                rf'\b(?:require|assert)\s*\([^;]*'
-                rf'(?:\b{escaped}\b\s*!=\s*{zero}|{zero}\s*!=\s*\b{escaped}\b)',
-                body,
-            )
-            reverting_if = re.search(
-                rf'\bif\s*\([^;{{}}]*'
-                rf'(?:\b{escaped}\b\s*==\s*{zero}|{zero}\s*==\s*\b{escaped}\b)'
-                rf'[^;{{}}]*\)\s*(?:\{{\s*)?(?:revert|return)\b',
-                body,
-                re.DOTALL,
-            )
+            require_check = re_zero_address_require(parameter).search(body)
+            reverting_if = re_zero_address_revert_if(parameter).search(body)
             if require_check or reverting_if:
                 continue
 
             sensitive_pos: Optional[int] = None
-            assignment = re.search(
-                rf'(?P<lhs>\b[A-Za-z_]\w*(?:\s*\[[^\]]+\]|\.[A-Za-z_]\w*)?)'
-                rf'\s*=\s*\b{escaped}\b\s*;',
-                body,
-            )
+            assignment = re_assignment_from(parameter).search(body)
             if assignment:
-                lhs = re.match(r'[A-Za-z_]\w*', assignment.group("lhs"))
+                lhs = RE_IDENTIFIER.match(assignment.group("lhs"))
                 lhs_name = lhs.group() if lhs else ""
                 if lhs_name not in local_names and lhs_name not in parameter_types:
                     sensitive_pos = assignment.start()
 
-            destination = re.search(
-                rf'(?:\b{escaped}\b\s*\.\s*(?:call|send|transfer)\b'
-                rf'|payable\s*\(\s*\b{escaped}\b\s*\)\s*\.'
-                rf'|[A-Za-z_]\w*\s*\(\s*\b{escaped}\b\s*\)\s*\.)',
-                body,
-            )
+            destination = re_call_target(parameter).search(body)
             if sensitive_pos is None and destination:
                 sensitive_pos = destination.start()
             if sensitive_pos is None:
@@ -1619,18 +1593,12 @@ def _detect_missing_zero_address(code: str) -> Optional[VulnerabilityFinding]:
 def _detect_incorrect_shift_in_assembly(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
     hits: List[Tuple[int, str, float, str]] = []
-    assembly_pattern = re.compile(r'\bassembly(?:\s*\([^)]*\))?\s*\{')
-    shift_pattern = re.compile(
-        r'\b(?:shl|shr|sar)\s*\(\s*'
-        r'(?P<shift>[A-Za-z_]\w*)\s*,\s*'
-        r'(?P<value>0x[0-9A-Fa-f]+|\d+)\s*\)'
-    )
-    for assembly in assembly_pattern.finditer(clean):
+    for assembly in RE_ASSEMBLY_BLOCK.finditer(clean):
         open_pos = assembly.end() - 1
         close_pos = _balanced_end(clean, open_pos)
         if close_pos is None:
             continue
-        for shift in shift_pattern.finditer(clean, open_pos + 1, close_pos):
+        for shift in RE_YUL_SHIFT_WITH_CONSTANT_VALUE.finditer(clean, open_pos + 1, close_pos):
             hits.append((
                 shift.start(),
                 code[shift.start():shift.end()],
@@ -1656,16 +1624,13 @@ def _detect_controlled_array_length(code: str) -> Optional[VulnerabilityFinding]
     hits: List[Tuple[int, str, float, str]] = []
     if not state_arrays:
         return None
-    assignment_pattern = re.compile(
-        r'\b(?P<array>[A-Za-z_]\w*)\.length\s*=\s*(?P<rhs>[^;]+);'
-    )
     for function in _iter_functions(code):
-        if not re.search(r'\b(?:public|external)\b', function.header):
+        if not RE_PUBLIC_OR_EXTERNAL.search(function.header):
             continue
         parameters = set(_parse_parameter_details(function.params))
         if not parameters:
             continue
-        for assignment in assignment_pattern.finditer(
+        for assignment in RE_ARRAY_LENGTH_ASSIGNMENT.finditer(
             clean, function.body_start, function.end
         ):
             if assignment.group("array") not in state_arrays:
@@ -1674,7 +1639,7 @@ def _detect_controlled_array_length(code: str) -> Optional[VulnerabilityFinding]
             tainted_by_parameter = next(
                 (
                     parameter for parameter in parameters
-                    if re.search(rf'\b{re.escape(parameter)}\b', rhs)
+                    if re_word(parameter).search(rhs)
                 ),
                 None,
             )
@@ -1706,11 +1671,7 @@ def _detect_array_by_reference(code: str) -> Optional[VulnerabilityFinding]:
             if "[" not in type_name or location == "storage":
                 continue
             body = clean[function.body_start:function.end]
-            if re.search(
-                rf'\b{re.escape(name)}\s*\[[^\]]+\]\s*'
-                rf'(?:=|\+=|-=|\*=|/=|%=|\+\+|--)',
-                body,
-            ):
+            if re_indexed_write(name).search(body):
                 modifying_parameters.append((function, len(details), index, name))
 
     state_arrays = {
@@ -1727,15 +1688,10 @@ def _detect_array_by_reference(code: str) -> Optional[VulnerabilityFinding]:
         storage_arrays = set(state_arrays)
         storage_arrays.update(
             match.group("name")
-            for match in re.finditer(
-                r'\b[A-Za-z_]\w*(?:\s*\[\s*\d*\s*\])+\s+storage\s+'
-                r'(?P<name>[A-Za-z_]\w*)\b',
-                caller_body,
-            )
+            for match in RE_STORAGE_ARRAY_LOCAL.finditer(caller_body)
         )
         for callee, arity, parameter_index, parameter_name in modifying_parameters:
-            call_pattern = re.compile(rf'\b{re.escape(callee.name)}\s*\(')
-            for call in call_pattern.finditer(clean, caller.body_start, caller.end):
+            for call in re_call(callee.name).finditer(clean, caller.body_start, caller.end):
                 open_pos = clean.find("(", call.start(), call.end())
                 close_pos = _balanced_end(clean, open_pos, "(", ")")
                 if close_pos is None or close_pos > caller.end:
@@ -1794,22 +1750,18 @@ def _detect_multiple_constructors(code: str) -> Optional[VulnerabilityFinding]:
 # [Kiểm tra ngữ nghĩa] Mapping public trỏ tới struct chứa mảng/struct lồng (getter tự sinh lỗi với solc cũ).
 def _detect_public_mapping_nested(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
-    if not re.search(r'\bpragma\s+solidity\s+[^;]*\b0\.4\.', clean):
+    if not RE_PRAGMA_0_4.search(clean):
         return None
     structs = _collect_struct_members(code)
     if not structs:
         return None
     hits: List[Tuple[int, str, float, str]] = []
-    pattern = re.compile(
-        r'\bmapping\s*\([^=;]+=>\s*(?P<value>[A-Za-z_]\w*)\s*\)\s*'
-        r'public\s+(?P<name>[A-Za-z_]\w*)\b'
-    )
-    for match in pattern.finditer(clean):
+    for match in RE_PUBLIC_MAPPING_VALUE_TYPE.finditer(clean):
         value_type = match.group("value")
         if value_type not in structs:
             continue
         member_types, _ = structs[value_type]
-        if not any(re.sub(r'\[.*$', '', item) in structs for item in member_types):
+        if not any(RE_ARRAY_SUFFIX.sub('', item) in structs for item in member_types):
             continue
         hits.append((
             match.start(),
@@ -1835,14 +1787,10 @@ def _detect_mapping_deletion(code: str) -> Optional[VulnerabilityFinding]:
     symbol_types = _collect_symbol_types(code)
     mapping_values = _collect_mapping_value_types(code)
     hits: List[Tuple[int, str, float, str]] = []
-    pattern = re.compile(
-        r'\bdelete\s+(?P<target>(?P<base>[A-Za-z_]\w*)'
-        r'(?:\s*\[[^\]]+\])?)\s*;'
-    )
-    for match in pattern.finditer(clean):
+    for match in RE_DELETE_STATEMENT.finditer(clean):
         base = match.group("base")
         type_name = mapping_values.get(base) or symbol_types.get(base, "")
-        struct_name = re.sub(r'\[.*$', '', type_name)
+        struct_name = RE_ARRAY_SUFFIX.sub('', type_name)
         if not _struct_contains_mapping(struct_name, structs):
             continue
         hits.append((
@@ -1862,7 +1810,7 @@ def _detect_mapping_deletion(code: str) -> Optional[VulnerabilityFinding]:
 
 # Khoảng giá trị [min, max] của kiểu uintN/intN.
 def _integer_type_range(type_name: str) -> Optional[Tuple[int, int]]:
-    match = re.fullmatch(r'(?P<unsigned>u?)int(?P<bits>\d*)', type_name)
+    match = RE_INTEGER_TYPE.fullmatch(type_name)
     if not match:
         return None
     bits = int(match.group("bits") or "256")
@@ -1891,10 +1839,6 @@ def _range_makes_comparison_constant(
 # [Kiểm tra ngữ nghĩa] So sánh luôn đúng/luôn sai do kiểu (vd uint >= 0, uint8 < 300).
 def _detect_type_based_tautology(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
-    token = r'(?:[A-Za-z_]\w*|-?(?:0x[0-9A-Fa-f]+|\d+))'
-    pattern = re.compile(
-        rf'(?P<left>{token})\s*(?P<operator><=|>=|<|>)\s*(?P<right>{token})'
-    )
     flip = {"<": ">", ">": "<", "<=": ">=", ">=": "<="}
     hits: List[Tuple[int, str, float, str]] = []
     state_types = _collect_state_symbol_types(code)
@@ -1907,14 +1851,14 @@ def _detect_type_based_tautology(code: str) -> Optional[VulnerabilityFinding]:
         symbol_types.update(
             _collect_symbol_types(code[function.body_start:function.end])
         )
-        for match in pattern.finditer(clean, function.body_start, function.end):
+        for match in RE_ORDER_COMPARISON.finditer(clean, function.body_start, function.end):
             left, right = match.group("left"), match.group("right")
             variable: Optional[str] = None
             constant_text: Optional[str] = None
             operator = match.group("operator")
-            if left in symbol_types and re.fullmatch(r'-?(?:0x[0-9A-Fa-f]+|\d+)', right):
+            if left in symbol_types and RE_INTEGER_LITERAL.fullmatch(right):
                 variable, constant_text = left, right
-            elif right in symbol_types and re.fullmatch(r'-?(?:0x[0-9A-Fa-f]+|\d+)', left):
+            elif right in symbol_types and RE_INTEGER_LITERAL.fullmatch(left):
                 variable, constant_text = right, left
                 operator = flip[operator]
             if variable is None or constant_text is None:
@@ -1945,14 +1889,7 @@ def _detect_boolean_constant_misuse(code: str) -> Optional[VulnerabilityFinding]
     clean = _clean_code(code)
     hits: List[Tuple[int, str, float, str]] = []
     seen: set[int] = set()
-    patterns = (
-        re.compile(r'\bif\s*\(\s*(?:true|false)\s*\)'),
-        re.compile(
-            r'(?:\b(?:true|false)\b\s*(?:&&|\|\|)'
-            r'|(?:&&|\|\|)\s*\b(?:true|false)\b)'
-        ),
-    )
-    for pattern in patterns:
+    for pattern in (RE_IF_CONSTANT_CONDITION, RE_BOOLEAN_CONSTANT_OPERAND):
         for match in pattern.finditer(clean):
             if match.start() in seen:
                 continue
@@ -1975,19 +1912,14 @@ def _detect_boolean_constant_misuse(code: str) -> Optional[VulnerabilityFinding]
 # [Kiểm tra ngữ nghĩa] So sánh bằng chặt (==) với this.balance / balanceOf -> kẻ tấn công gửi ETH để phá điều kiện.
 def _detect_dangerous_balance_equality(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
-    balance_source = re.compile(r'\.balance\b|\.balanceOf\s*\(')
     hits: List[Tuple[int, str, float, str]] = []
     for function in _iter_functions(code):
         body = clean[function.body_start:function.end]
         tainted_names = {
             match.group("name")
-            for match in re.finditer(
-                r'\b(?:u?int\d*\s+)?(?P<name>[A-Za-z_]\w*)\s*=\s*'
-                r'[^;]*(?:\.balance\b|\.balanceOf\s*\()[^;]*;',
-                body,
-            )
+            for match in RE_BALANCE_ASSIGNMENT.finditer(body)
         }
-        for equality in re.finditer(r'==', body):
+        for equality in RE_STRICT_EQUALITY.finditer(body):
             absolute = function.body_start + equality.start()
             left_boundaries = [
                 clean.rfind(delimiter, function.body_start, absolute)
@@ -2004,8 +1936,8 @@ def _detect_dangerous_balance_equality(code: str) -> Optional[VulnerabilityFindi
             ]
             end = min(right_positions) if right_positions else function.end
             expression = clean[start:end]
-            if not balance_source.search(expression) and not any(
-                re.search(rf'\b{re.escape(name)}\b', expression)
+            if not RE_BALANCE_SOURCE.search(expression) and not any(
+                re_word(name).search(expression)
                 for name in tainted_names
             ):
                 continue
@@ -2027,17 +1959,18 @@ def _detect_dangerous_balance_equality(code: str) -> Optional[VulnerabilityFindi
 # [Kiểm tra ngữ nghĩa] Ép số nguyên sang enum không kiểm tra phạm vi (solc < 0.4.5 không revert).
 def _detect_dangerous_enum_conversion(code: str) -> Optional[VulnerabilityFinding]:
     clean = _clean_code(code)
-    if not re.search(r'\bpragma\s+solidity\s+(?:=\s*)?0\.4\.[0-4]\s*;', clean):
+    if not RE_PRAGMA_0_4_0_TO_0_4_4.search(clean):
         return None
     enum_names = {
         match.group("name")
-        for match in re.finditer(r'\benum\s+(?P<name>[A-Za-z_]\w*)\s*\{', clean)
+        for match in RE_ENUM_OPENING.finditer(clean)
     }
     hits: List[Tuple[int, str, float, str]] = []
     for function in _iter_functions(code):
         for enum_name in enum_names:
-            pattern = re.compile(rf'\b{re.escape(enum_name)}\s*\([^)]*\)')
-            for conversion in pattern.finditer(clean, function.body_start, function.end):
+            for conversion in re_enum_conversion(enum_name).finditer(
+                clean, function.body_start, function.end
+            ):
                 hits.append((
                     conversion.start(),
                     code[conversion.start():conversion.end()],
@@ -2060,16 +1993,14 @@ def _assembly_return_positions(
     """Return Yul return(offset, size) ranges inside one function."""
     clean = _clean_code(code)
     results: List[Tuple[int, int]] = []
-    assembly_pattern = re.compile(r'\bassembly(?:\s*\([^)]*\))?\s*\{')
-    for assembly in assembly_pattern.finditer(
+    for assembly in RE_ASSEMBLY_BLOCK.finditer(
         clean, function.body_start, function.end
     ):
         open_pos = assembly.end() - 1
         close_pos = _balanced_end(clean, open_pos)
         if close_pos is None or close_pos > function.end:
             continue
-        return_pattern = re.compile(r'\breturn\s*\([^,]+,[^)]+\)')
-        for call in return_pattern.finditer(clean, open_pos, close_pos):
+        for call in RE_YUL_RETURN_CALL.finditer(clean, open_pos, close_pos):
             results.append((call.start(), call.end()))
     return results
 
@@ -2078,9 +2009,9 @@ def _assembly_return_positions(
 def _detect_return_instead_of_leave(code: str) -> Optional[VulnerabilityFinding]:
     hits: List[Tuple[int, str, float, str]] = []
     for function in _iter_functions(code):
-        if not re.search(r'\b(?:internal|private)\b', function.header):
+        if not RE_INTERNAL_OR_PRIVATE.search(function.header):
             continue
-        returns = re.search(r'\breturns\s*\((?P<values>[^)]*)\)', function.header)
+        returns = RE_RETURNS_CLAUSE.search(function.header)
         if not returns or len(_split_top_level_arguments(returns.group("values"))) != 2:
             continue
         for start, end in _assembly_return_positions(code, function):
@@ -2118,7 +2049,7 @@ def _detect_incorrect_assembly_return(code: str) -> Optional[VulnerabilityFindin
             if function.name in halting_names:
                 continue
             if any(
-                re.search(rf'\b{re.escape(name)}\s*\(', body)
+                re_call(name).search(body)
                 for name in halting_names
             ):
                 halting_names.add(function.name)
@@ -2128,8 +2059,7 @@ def _detect_incorrect_assembly_return(code: str) -> Optional[VulnerabilityFindin
     seen: set[int] = set()
     for function in functions:
         for target in halting_names:
-            call_pattern = re.compile(rf'\b{re.escape(target)}\s*\(')
-            for call in call_pattern.finditer(clean, function.body_start, function.end):
+            for call in re_call(target).finditer(clean, function.body_start, function.end):
                 open_pos = clean.find("(", call.start(), call.end())
                 close_pos = _balanced_end(clean, open_pos, "(", ")")
                 if close_pos is None or close_pos > function.end:
@@ -2159,11 +2089,7 @@ def _uses_exact_vulnerable_storage_array_compiler(code: str) -> bool:
     clean = _clean_code(code)
     versions = [
         (int(match.group("minor")), int(match.group("patch")))
-        for match in re.finditer(
-            r'\bpragma\s+solidity\s+(?:=\s*)?0\.(?P<minor>[45])\.'
-            r'(?P<patch>\d+)\s*;',
-            clean,
-        )
+        for match in RE_PINNED_PRAGMA_0_4_OR_0_5.finditer(clean)
     ]
     return any(
         (minor == 4 and 7 <= patch <= 25)
@@ -2177,7 +2103,7 @@ def _detect_storage_abiencoderv2_array(code: str) -> Optional[VulnerabilityFindi
     clean = _clean_code(code)
     if not (
         _uses_exact_vulnerable_storage_array_compiler(code)
-        and re.search(r'\bpragma\s+experimental\s+ABIEncoderV2\s*;', clean)
+        and RE_PRAGMA_ABIENCODERV2.search(clean)
     ):
         return None
     structs = _collect_struct_members(code)
@@ -2185,10 +2111,10 @@ def _detect_storage_abiencoderv2_array(code: str) -> Optional[VulnerabilityFindi
     vulnerable_arrays = {
         name for name, type_name in state_types.items()
         if type_name.count("[") >= 2
-        or ("[" in type_name and re.sub(r'\[.*$', '', type_name) in structs)
+        or ("[" in type_name and RE_ARRAY_SUFFIX.sub('', type_name) in structs)
     }
     hits: List[Tuple[int, str, float, str]] = []
-    for call in re.finditer(r'\babi\.encode\s*\(', clean):
+    for call in RE_ABI_ENCODE_CALL.finditer(clean):
         open_pos = clean.find("(", call.start(), call.end())
         close_pos = _balanced_end(clean, open_pos, "(", ")")
         if close_pos is None:
@@ -2217,7 +2143,7 @@ def _detect_storage_abiencoderv2_array(code: str) -> Optional[VulnerabilityFindi
 
 # Lấy kiểu gốc intN của một kiểu mảng số nguyên có dấu.
 def _signed_integer_base(type_name: str) -> Optional[str]:
-    match = re.match(r'(?P<base>int\d*)\[', type_name)
+    match = RE_SIGNED_INT_ARRAY_TYPE.match(type_name)
     return match.group("base") if match else None
 
 
@@ -2234,11 +2160,10 @@ def _detect_storage_signed_integer_array(code: str) -> Optional[VulnerabilityFin
     }
     hits: List[Tuple[int, str, float, str]] = []
     for name, target_type in vulnerable_arrays.items():
-        pattern = re.compile(rf'\b{re.escape(name)}\s*=\s*(?P<rhs>[^;]+);')
-        for assignment in pattern.finditer(clean):
+        for assignment in re_assignment_to(name).finditer(clean):
             rhs = assignment.group("rhs").strip()
             vulnerable = rhs.startswith("[")
-            if not vulnerable and re.fullmatch(r'[A-Za-z_]\w*', rhs):
+            if not vulnerable and RE_IDENTIFIER.fullmatch(rhs):
                 source_type = symbol_types.get(rhs, "")
                 source_base = _signed_integer_base(source_type)
                 vulnerable = bool(
@@ -2263,12 +2188,12 @@ def _detect_storage_signed_integer_array(code: str) -> Optional[VulnerabilityFin
 
 # Lấy danh sách contract cha trực tiếp từ header "contract A is B, C".
 def _direct_base_names(header: str) -> List[str]:
-    inheritance = re.search(r'\bis\s+(?P<bases>[\s\S]+)$', header)
+    inheritance = RE_INHERITANCE_LIST.search(header)
     if not inheritance:
         return []
     names = []
     for base in _split_top_level_arguments(inheritance.group("bases")):
-        match = re.match(r'\s*([A-Za-z_]\w*)', base)
+        match = RE_LEADING_IDENTIFIER.match(base)
         if match:
             names.append(match.group(1))
     return names
@@ -2334,18 +2259,10 @@ def _detect_uninitialized_state_address(code: str) -> Optional[VulnerabilityFind
         ):
             if type_name != "address" or initialized:
                 continue
-            escaped = re.escape(name)
-            write = re.search(
-                rf'\b{escaped}\b\s*(?:=(?!=)|\+=|-=|\+\+|--)', body
-            )
+            write = re_state_write(name).search(body)
             if write:
                 continue
-            dangerous_read = re.search(
-                rf'(?:\b{escaped}\b\s*\.\s*(?:transfer|send|call)\b'
-                rf'|payable\s*\(\s*\b{escaped}\b\s*\)\s*\.'
-                rf'|(?:selfdestruct|suicide)\s*\(\s*\b{escaped}\b)',
-                body,
-            )
+            dangerous_read = re_ether_destination(name).search(body)
             if not dangerous_read:
                 continue
             hits.append((
@@ -2520,7 +2437,7 @@ class StaticAnalyzer:
                         ):
                             continue
                     elif not functions and clean_code.strip().startswith("function"):
-                        hdr_m = re.search(r'function\s+[^{]*\{', clean_code)
+                        hdr_m = RE_FUNCTION_HEADER_PREFIX.search(clean_code)
                         if hdr_m:
                             hdr = clean_code[:hdr_m.end()]
                             bdy = clean_code[hdr_m.end():]
@@ -2564,7 +2481,7 @@ class StaticAnalyzer:
 
         if guard_modifiers and entry.get("vuln_id") in {"SWC-101", "SWC-105", "SWC-106"}:
             for mod in guard_modifiers:
-                if re.search(rf'\b{re.escape(mod)}\b', clean_code):
+                if re_word(mod).search(clean_code):
                     reduction += 0.45
                     break
 

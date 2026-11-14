@@ -12,6 +12,40 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence
 
+from E2E.common.regex_patterns import (
+    RE_ACCESS_CONTROL_GUARD,
+    RE_ADMIN_WITHDRAW_FUNCTION,
+    RE_ANY_CODE_FENCE,
+    RE_ARITHMETIC_OPERATION,
+    RE_BOOL_ASSIGNED_CALL_RESULT,
+    RE_BOOL_TUPLE_RESULT,
+    RE_CALL_INSIDE_REQUIRE,
+    RE_CAPITALIZED_FUNCTION,
+    RE_CONTRACT_BALANCE,
+    RE_DELEGATECALL_OR_CALLCODE,
+    RE_ETHER_TRANSFER,
+    RE_EXTERNAL_CALL,
+    RE_FLOATING_PRAGMA,
+    RE_FUNCTION_WITHOUT_VISIBILITY,
+    RE_LOOP_BODY,
+    RE_LOW_LEVEL_CALL,
+    RE_NARROW_INT_CAST,
+    RE_PRAGMA_SPEC_ANY_CASE,
+    RE_REENTRANCY_GUARD,
+    RE_SAFEMATH,
+    RE_SELFDESTRUCT_CALL,
+    RE_SENSITIVE_STATE_VALUE,
+    RE_SINGLE_EQUALS,
+    RE_STATE_UPDATE,
+    RE_SWC_ID,
+    RE_UNCHECKED_BLOCK,
+    RE_USER_BALANCE_GUARD,
+    RE_VALUE_CALL_OR_SEND,
+    RE_VERSION_NUMBER,
+    RE_WHITESPACE,
+    re_condition_opening,
+    re_result_check,
+)
 from E2E.config import KNOWLEDGE_BASE_DIR
 
 DEFAULT_SWC_REGISTRY = KNOWLEDGE_BASE_DIR / "swc_registry.json"
@@ -160,7 +194,7 @@ SIGNAL_PATTERNS_BY_SWC: Dict[str, Sequence[str]] = {
 
 # Chuẩn hoá chuỗi bất kỳ về dạng "SWC-xxx" (vd "swc-107: Reentrancy" -> "SWC-107").
 def normalize_swc_id(value: object) -> str:
-    match = re.search(r"SWC-\d{3}", str(value or "").upper())
+    match = RE_SWC_ID.search(str(value or "").upper())
     return match.group(0) if match else str(value or "").strip().upper()
 
 
@@ -201,7 +235,7 @@ def build_agents(registry: List[Dict]) -> List[AgentConfig]:
 # Lọc lấy phần thực sự là mã Solidity (khối ```code``` và các dòng có từ khoá Solidity) trước khi dò tín hiệu.
 # Retriever gọi một lần cho mỗi unit rồi đưa kết quả cho find_signal_hits của cả 37 agent.
 def extract_signal_code(code: str) -> str:
-    fenced_blocks = re.findall(r"```(?:\w+)?\s*(.*?)```", code, re.IGNORECASE | re.DOTALL)
+    fenced_blocks = RE_ANY_CODE_FENCE.findall(code)
     code_lines = []
     solidity_tokens = (
         "pragma ",
@@ -245,10 +279,10 @@ def extract_signal_code(code: str) -> str:
 
 # Lấy phiên bản (major, minor, patch) từ dòng pragma solidity.
 def pragma_version(code: str) -> tuple[int, int, int] | None:
-    match = re.search(r"pragma\s+solidity\s+([^;]+);", code, re.IGNORECASE)
+    match = RE_PRAGMA_SPEC_ANY_CASE.search(code)
     if not match:
         return None
-    version = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", match.group(1))
+    version = RE_VERSION_NUMBER.search(match.group(1))
     if not version:
         return None
     return (
@@ -266,47 +300,31 @@ def pragma_before(code: str, major: int, minor: int, patch: int = 0) -> bool:
 
 # Mã có phép toán số học (++, --, +=, a + b, add/sub/mul) không.
 def has_arithmetic_operation(code: str) -> bool:
-    return bool(
-        re.search(
-            r"(?:\+\+|--|[+\-*]=|=\s*[^;]*(?:\+|-|\*)[^;]*;|\b(?:add|sub|mul)\s*\()",
-            code,
-            re.IGNORECASE | re.DOTALL,
-        )
-    )
+    return bool(RE_ARITHMETIC_OPERATION.search(code))
 
 
 # Liệt kê các câu lệnh có lời gọi cấp thấp .call/.delegatecall/.staticcall/.send.
 def low_level_call_statements(code: str) -> List[str]:
     return [
         statement.strip()
-        for statement in re.split(r";", code)
-        if re.search(r"\.(?:call|delegatecall|staticcall|send)\s*[\(\{]", statement, re.IGNORECASE | re.DOTALL)
+        for statement in code.split(";")
+        if RE_LOW_LEVEL_CALL.search(statement)
     ]
 
 
 # Lấy tên biến bool nhận kết quả của lời gọi cấp thấp (vd "(bool ok, ) = x.call(...)" -> ["ok"]).
 def statement_result_names(statement: str) -> List[str]:
-    names = re.findall(r"\(\s*bool\s+(\w+)\s*,?", statement, re.IGNORECASE)
-    names.extend(
-        re.findall(
-            r"\bbool\s+(\w+)\s*=\s*[^;]*\.(?:call|delegatecall|staticcall|send)\s*[\(\{]",
-            statement,
-            re.IGNORECASE | re.DOTALL,
-        )
-    )
+    names = RE_BOOL_TUPLE_RESULT.findall(statement)
+    names.extend(RE_BOOL_ASSIGNED_CALL_RESULT.findall(statement))
     return names
 
 
 # Kết quả lời gọi cấp thấp có được kiểm tra không (require(...)/assert/if(!ok)).
 def is_result_checked(full_code: str, statement: str) -> bool:
-    if re.search(r"\b(?:require|assert)\s*\([^;]*\.(?:send|call|delegatecall|staticcall)\s*[\(\{]", statement, re.IGNORECASE | re.DOTALL):
+    if RE_CALL_INSIDE_REQUIRE.search(statement):
         return True
     for name in statement_result_names(statement):
-        if re.search(
-            rf"(?:require\s*\(\s*{re.escape(name)}\b|assert\s*\(\s*{re.escape(name)}\b|if\s*\(\s*!\s*{re.escape(name)}\b|if\s*\(\s*{re.escape(name)}\s*==\s*false)",
-            full_code,
-            re.IGNORECASE,
-        ):
+        if re_result_check(name).search(full_code):
             return True
     return False
 
@@ -314,31 +332,24 @@ def is_result_checked(full_code: str, statement: str) -> bool:
 # Có cập nhật state SAU lời gọi chuyển ETH (.call{value:}/.send) không -> dấu hiệu reentrancy (SWC-107).
 # Có nonReentrant/ReentrancyGuard thì trả False.
 def has_state_update_after_external_value_call(code: str) -> bool:
-    if re.search(r"\bnonReentrant\b|ReentrancyGuard", code, re.IGNORECASE):
+    if RE_REENTRANCY_GUARD.search(code):
         return False
-    call_match = re.search(r"\.(?:call\s*\{[^}]*value\s*:|send\s*\()", code, re.IGNORECASE | re.DOTALL)
+    call_match = RE_VALUE_CALL_OR_SEND.search(code)
     if not call_match:
         return False
     after_call = code[call_match.end() :]
-    return bool(
-        re.search(
-            r"(?:balances?\s*\[[^\]]+\]\s*(?:-=|=|\+=)|\bdelete\s+\w+\s*\[|\b\w+\s*(?:-=|\+=|=)\s*\w+)",
-            after_call,
-            re.IGNORECASE | re.DOTALL,
-        )
-    )
+    return bool(RE_STATE_UPDATE.search(after_call))
 
 
 # Lấy phần thân các vòng lặp for/while.
 def loop_bodies(code: str) -> List[str]:
-    return re.findall(r"\b(?:for|while)\s*\([^)]*\)\s*\{(.*?)\}", code, re.IGNORECASE | re.DOTALL)
+    return RE_LOOP_BODY.findall(code)
 
 
 # Lấy biểu thức điều kiện bên trong if(...) hoặc require(...) (đếm ngoặc lồng nhau).
 def condition_blocks(keyword: str, code: str) -> List[str]:
     blocks = []
-    pattern = re.compile(rf"\b{keyword}\s*\(", re.IGNORECASE)
-    for match in pattern.finditer(code):
+    for match in re_condition_opening(keyword).finditer(code):
         start = match.end() - 1
         depth = 0
         for index in range(start, len(code)):
@@ -356,10 +367,10 @@ def condition_blocks(keyword: str, code: str) -> List[str]:
 # Có phép gán "=" (không phải "==") trong điều kiện if/require không -> SWC-129.
 def find_assignment_in_condition(code: str) -> bool:
     for condition in [*condition_blocks("if", code), *condition_blocks("require", code)]:
-        compact = re.sub(r"\s+", "", condition)
+        compact = RE_WHITESPACE.sub("", condition)
         if any(operator in compact for operator in ("==", "!=", ">=", "<=")):
             continue
-        if re.search(r"(?<![=!<>])=(?![=>])", condition):
+        if RE_SINGLE_EQUALS.search(condition):
             return True
     return False
 
@@ -371,21 +382,17 @@ def find_assignment_in_condition(code: str) -> bool:
 # Mục đích: dùng chung cho RAG (retriever) và static (static_runner gác cổng finding).
 def find_custom_signal_hits(swc_id: str, code: str) -> List[str] | None:
     if swc_id == "SWC-100":
-        if pragma_before(code, 0, 5) and re.search(
-            r"\bfunction\s+\w+\s*\([^)]*\)\s*(?![^{};]*(?:public|private|internal|external))",
-            code,
-            re.IGNORECASE | re.DOTALL,
-        ):
+        if pragma_before(code, 0, 5) and RE_FUNCTION_WITHOUT_VISIBILITY.search(code):
             return ["function without explicit visibility on pre-0.5 Solidity"]
         return []
 
     if swc_id == "SWC-101":
         hits = []
-        if re.search(r"\bunchecked\s*\{", code):
+        if RE_UNCHECKED_BLOCK.search(code):
             hits.append("unchecked arithmetic block")
-        if pragma_before(code, 0, 8) and has_arithmetic_operation(code) and not re.search(r"\bSafeMath\b", code):
+        if pragma_before(code, 0, 8) and has_arithmetic_operation(code) and not RE_SAFEMATH.search(code):
             hits.append("arithmetic on Solidity version without built-in overflow checks")
-        if re.search(r"\b(?:u?int)(?:8|16|32|64|128)\s*\(", code):
+        if RE_NARROW_INT_CAST.search(code):
             hits.append("narrow integer cast can truncate values")
         return hits
 
@@ -393,7 +400,7 @@ def find_custom_signal_hits(swc_id: str, code: str) -> List[str] | None:
         return ["outdated Solidity compiler version"] if pragma_before(code, 0, 8) else []
 
     if swc_id == "SWC-103":
-        return ["floating pragma version"] if re.search(r"pragma\s+solidity\s+[^;]*(?:\^|>=|>|\*)", code, re.IGNORECASE) else []
+        return ["floating pragma version"] if RE_FLOATING_PRAGMA.search(code) else []
 
     if swc_id == "SWC-104":
         unchecked = [
@@ -406,16 +413,16 @@ def find_custom_signal_hits(swc_id: str, code: str) -> List[str] | None:
     if swc_id == "SWC-105":
         if has_access_control_guard(code):
             return []
-        has_ether_transfer = re.search(r"\.(?:call\s*\{[^}]*value\s*:|send\s*\(|transfer\s*\()", code, re.IGNORECASE | re.DOTALL)
-        has_admin_like_withdraw = re.search(r"\bfunction\s+(?:drain|sweep|rescue|withdrawAll|emergencyWithdraw)\b", code, re.IGNORECASE)
-        drains_contract_balance = re.search(r"address\s*\(\s*this\s*\)\.balance|\bthis\.balance\b", code, re.IGNORECASE)
-        has_user_balance_guard = re.search(r"balances?\s*\[\s*msg\.sender\s*\].{0,80}(?:>=|>)", code, re.IGNORECASE | re.DOTALL)
+        has_ether_transfer = RE_ETHER_TRANSFER.search(code)
+        has_admin_like_withdraw = RE_ADMIN_WITHDRAW_FUNCTION.search(code)
+        drains_contract_balance = RE_CONTRACT_BALANCE.search(code)
+        has_user_balance_guard = RE_USER_BALANCE_GUARD.search(code)
         if has_ether_transfer and (has_admin_like_withdraw or drains_contract_balance) and not has_user_balance_guard:
             return ["ether withdrawal path without access control"]
         return []
 
     if swc_id == "SWC-106":
-        if re.search(r"\b(?:selfdestruct|suicide)\s*\(", code, re.IGNORECASE) and not has_access_control_guard(code):
+        if RE_SELFDESTRUCT_CALL.search(code) and not has_access_control_guard(code):
             return ["selfdestruct without access control"]
         return []
 
@@ -423,18 +430,18 @@ def find_custom_signal_hits(swc_id: str, code: str) -> List[str] | None:
         return ["external value call before state update"] if has_state_update_after_external_value_call(code) else []
 
     if swc_id == "SWC-112":
-        if re.search(r"\.\s*(?:delegatecall|callcode)\s*\(", code, re.IGNORECASE) and not has_access_control_guard(code):
+        if RE_DELEGATECALL_OR_CALLCODE.search(code) and not has_access_control_guard(code):
             return ["delegatecall/callcode target is externally controllable or unguarded"]
         return []
 
     if swc_id == "SWC-113":
         for body in loop_bodies(code):
-            if re.search(r"\.(?:transfer|send|call)\s*[\(\{]", body, re.IGNORECASE | re.DOTALL):
+            if RE_EXTERNAL_CALL.search(body):
                 return ["external call inside loop can block progress"]
         return []
 
     if swc_id == "SWC-118":
-        if pragma_before(code, 0, 4, 22) and re.search(r"\bfunction\s+[A-Z]\w+\s*\(", code):
+        if pragma_before(code, 0, 4, 22) and RE_CAPITALIZED_FUNCTION.search(code):
             return ["old-style constructor-like function on pre-0.4.22 Solidity"]
         return []
 
@@ -442,7 +449,7 @@ def find_custom_signal_hits(swc_id: str, code: str) -> List[str] | None:
         return ["assignment used as condition"] if find_assignment_in_condition(code) else []
 
     if swc_id == "SWC-136":
-        if re.search(r"\b(?:string|bytes\d*|uint\d*|address)\s+(?:private\s+)?\w*(?:password|secret|privateKey|apiKey|seed)\w*", code, re.IGNORECASE):
+        if RE_SENSITIVE_STATE_VALUE.search(code):
             return ["sensitive value stored in contract state"]
         return []
 
@@ -464,10 +471,4 @@ def find_signal_hits(signal_code: str, patterns: Sequence[str], swc_id: str | No
 
 # Mã có cơ chế phân quyền không (onlyOwner, onlyRole, Ownable, require(msg.sender == ...)).
 def has_access_control_guard(code: str) -> bool:
-    return bool(
-        re.search(
-            r"\bonlyOwner\b|onlyRole|onlyAdmin|AccessControl|Ownable|require\s*\(\s*msg\.sender\s*==",
-            code,
-            re.IGNORECASE,
-        )
-    )
+    return bool(RE_ACCESS_CONTROL_GUARD.search(code))

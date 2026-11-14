@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from functools import lru_cache
-import re
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +18,7 @@ from sklearn.preprocessing import normalize
 from sklearn.utils.extmath import safe_sparse_dot
 
 from E2E.common.io_utils import read_json
+from E2E.common.regex_patterns import RE_WHITESPACE
 from E2E.config import KNOWLEDGE_BASE_DIR, RISK_ORDER
 from E2E.phase1b_rag.swc_agents import (
     build_agents,
@@ -44,8 +44,8 @@ MAX_FINDINGS_PER_UNIT = 10
 # Kiểm tra đoạn mã cần xét gần như TRÙNG KHỚP một hàm lỗi đã biết trong KB: cả hai >= 80 ký tự, cái này chứa cái kia
 # và độ dài chênh lệch không quá 20%. Mục đích: tránh hàm getter ngắn "khớp" với rất nhiều ca trong KB.
 def _is_exact_code_match(known_code: str, query_code: str) -> bool:
-    known = re.sub(r"\s+", " ", known_code).strip()
-    query = re.sub(r"\s+", " ", query_code).strip()
+    known = RE_WHITESPACE.sub(" ", known_code).strip()
+    query = RE_WHITESPACE.sub(" ", query_code).strip()
     if len(known) < MIN_EXACT_MATCH_CHARS or len(query) < MIN_EXACT_MATCH_CHARS:
         return False
     if known not in query and query not in known:

@@ -11,7 +11,6 @@ from __future__ import annotations
 import difflib
 import json
 import os
-import re
 import subprocess
 import sys
 import threading
@@ -25,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from E2E.common.gpu_client import check_server_health
+from E2E.common.regex_patterns import RE_RUN_ID, RE_UNSAFE_NAME_CHARS
 from E2E.config import DEMO_CONTRACTS_DIR, PROJECT_ROOT, RUNS_DIR
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -51,13 +51,10 @@ ACTIVE_TASKS: Dict[str, Dict[str, Any]] = {}
 TASK_LOCK = threading.Lock()
 
 
-RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
-
-
 # Trả thư mục data/results/audit_runs/<run_id>; từ chối run_id có ".." hoặc ký tự lạ (chống path traversal) -> HTTP 400.
 def run_dir_for(run_id: str) -> Path:
     """Resolve a run directory, rejecting ids that could escape RUNS_DIR (e.g. '..')."""
-    if not RUN_ID_RE.fullmatch(run_id) or ".." in run_id:
+    if not RE_RUN_ID.fullmatch(run_id) or ".." in run_id:
         raise HTTPException(status_code=400, detail="Invalid run_id.")
     return RUNS_DIR / run_id
 
@@ -65,7 +62,7 @@ def run_dir_for(run_id: str) -> Path:
 # Làm sạch tên file người dùng gửi lên thành "<tên>.sol" đơn giản (không thư mục, không traversal, tối đa 64 ký tự).
 def safe_contract_file_name(file_name: str) -> str:
     """Keep only a plain `<stem>.sol` name: no directories, no traversal."""
-    stem = re.sub(r"[^A-Za-z0-9_-]+", "-", Path(file_name or "").stem).strip("-") or "Contract"
+    stem = RE_UNSAFE_NAME_CHARS.sub("-", Path(file_name or "").stem).strip("-") or "Contract"
     return f"{stem[:64]}.sol"
 
 

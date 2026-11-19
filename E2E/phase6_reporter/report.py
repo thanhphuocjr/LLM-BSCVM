@@ -462,6 +462,18 @@ def _cvss_text(finding: dict[str, Any]) -> str:
     return text
 
 
+# Dòng kết luận Advisor (Phase 2) của một finding (giống nhau ở MD/HTML/PDF): confirmed / uncertain / disputed
+# (+ lý do giữ lại). Rỗng khi không có kết luận của LLM (suggestion từ KB) hoặc bản xem trước.
+def _advisor_verdict_text(finding: dict[str, Any]) -> str:
+    verdict = finding.get("advisor_verdict") or ""
+    if verdict == "disputed":
+        return f"Disputed - judged a false positive, kept because {finding.get('advisor_kept_because') or 'the dismissal did not pass the check'}"
+    return {
+        "confirmed": "Confirmed",
+        "uncertain": "Uncertain - depends on code that is not shown; kept for manual review",
+    }.get(verdict, "")
+
+
 # Dòng kết quả kiểm chứng của một finding (giống nhau ở MD/HTML/PDF): trạng thái + rủi ro còn lại.
 def _verification_text(finding: dict[str, Any]) -> str:
     text = str(finding.get("verification_status") or "Not verified")
@@ -543,6 +555,8 @@ def build_report_data(
                 "repair_priority": assessment.get("repair_priority"),
                 "repair_steps": advice.get("repair_steps")
                 or ([finding["remediation"]] if finding.get("remediation") else []),
+                "advisor_verdict": advice.get("advisor_verdict") or "",
+                "advisor_kept_because": advice.get("kept_because") or "",
                 "self_check_status": self_check or None,
                 "verification_status": status_text,
                 "residual_risk": verification.get("residual_risk") or "",
@@ -886,6 +900,8 @@ def render_markdown(data: dict[str, Any]) -> str:
                 f"- **Impact:** {finding.get('impact') or 'Requires manual impact analysis'}",
             ]
         )
+        if _advisor_verdict_text(finding):
+            lines.append(f"- **Advisor verdict:** {_advisor_verdict_text(finding)}")
         if _cvss_text(finding):
             lines.append(f"- **CVSS:** {_cvss_text(finding)}")
         lines.append("- **Repair steps:**")
@@ -1034,6 +1050,8 @@ def render_html(data: dict[str, Any]) -> str:
     for index, item in enumerate(data["findings"], 1):
         steps = "".join(f"<li>{html.escape(str(step))}</li>" for step in item.get("repair_steps", []))
         cvss_line = f"<p><b>CVSS:</b> {html.escape(_cvss_text(item))}</p>" if _cvss_text(item) else ""
+        if _advisor_verdict_text(item):
+            cvss_line = f"<p><b>Advisor verdict:</b> {html.escape(_advisor_verdict_text(item))}</p>" + cvss_line
         details += (
             f"<section><h4>{index}. {html.escape(item['title'])} ({item['swc']})</h4>"
             f"<p><b>Severity:</b> {item['severity']} &nbsp; <b>Unit:</b> "
@@ -1316,6 +1334,8 @@ def render_pdf(data: dict[str, Any], output_path: Path) -> tuple[bool, str]:
         heading(f"{index}. {item['title']} ({item['swc']}) - {item['severity']}", 3)
         paragraph(f"Root cause: {item.get('root_cause') or 'Not provided'}")
         paragraph(f"Impact: {item.get('impact') or 'Requires manual analysis'}")
+        if _advisor_verdict_text(item):
+            paragraph(f"Advisor verdict: {_advisor_verdict_text(item)}")
         if _cvss_text(item):
             paragraph(f"CVSS: {_cvss_text(item)}")
         for step_index, step in enumerate(item.get("repair_steps", []), 1):

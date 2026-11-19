@@ -3,8 +3,9 @@ Phase 1 fusion - combine static (1A), RAG (1B) and the neural detector (1C).
 
 * fuse_findings (used by the GPU pipeline): one score per (SWC, unit) finding,
   p_final = logistic(intercept + w_det*p_detector + w_static*conf + w_rag*conf
-  + corroboration + severity) with the weights of fusion_calibration.json (set by hand,
-  not fitted). Findings with p_final >= tau_agent (0.45) go to the agents (confirmed);
+  + corroboration + severity) with the weights of fusion_calibration.json (fitted by
+  logistic regression on the real functions of the v12 val+test split). Findings with
+  p_final >= tau_agent (0.1333, chosen by F2: recall-first) go to the agents (confirmed);
   the rest stay as candidates. A unit flagged only by the detector becomes an UNMAPPED
   finding so it can still be repaired.
 * fuse_detection (contract verdict for the report): weighted sum of the three channels
@@ -151,7 +152,8 @@ def _apply_detector_lines(finding: dict[str, Any], unit_result: dict[str, Any], 
         finding["line"] = start_line
 
 
-# Trọng số logistic + ngưỡng tau_agent, đặt tay trong fusion_calibration.json (chưa fit trên tập hiệu chuẩn).
+# Trọng số logistic + ngưỡng tau_agent trong fusion_calibration.json: fit bằng hồi quy logistic trên 1,110 hàm thật
+# của v12 val+test, tau_agent chọn theo F2 (ưu tiên recall). Cách làm + kết quả: data/results/heuristics_tuning/.
 def _load_calibration() -> dict[str, Any]:
     return json.loads(FUSION_CALIBRATION_PATH.read_text(encoding="utf-8"))
 
@@ -159,8 +161,10 @@ def _load_calibration() -> dict[str, Any]:
 # [FUSION THEO TỪNG FINDING - dùng trong gpu_pipeline trước Phase 2]
 # Với mỗi finding (SWC, unit) đã gộp: lấy p_detector của chính unit đó (lỗi -> 0.5, không chạy -> 0.05), rồi
 #   p_final = logistic(intercept + w_det*p_detector + w_static*static_conf + w_rag*rag_conf + corroborated + severity)
-# với trọng số trong fusion_calibration.json (đặt tay). p_final >= tau_agent (0.45) -> confirmed (đi tiếp tới
+# với trọng số trong fusion_calibration.json (đã fit). p_final >= tau_agent (0.1333) -> confirmed (đi tiếp tới
 # Advisor/Assessor/Fixer); còn lại -> candidates. Dùng line_scores của detector để chỉ ra dòng nghi ngờ nhất.
+# Ràng buộc khi chọn tau_agent: finding yếu nhất trên unit có p_detector >= 0.70 vẫn phải qua (p_final >= 0.588),
+# vì unit đã có finding local thì KHÔNG sinh finding UNMAPPED - nếu không, tín hiệu detector sẽ bị chặn mất.
 # Unit chỉ detector báo lỗi (static/RAG không thấy) vẫn thành finding "UNMAPPED" để có thể được sửa.
 # Trả về (confirmed, candidates).
 def fuse_findings(
@@ -194,7 +198,8 @@ def fuse_findings(
         for item in unit_results
     )
     # A unit whose detector call failed gets a neutral 0.5 (unknown), never an implicit
-    # "safe" score. Without any detector run, only strong local evidence passes (0.05 prior).
+    # "safe" score: with the fitted weights every local finding on it passes tau_agent.
+    # A unit the detector did not score (no body) gets a 0.05 prior; it is never a repair target.
     contract_max_prob = max(valid_probs) if valid_probs else (0.5 if errored_units else 0.0)
 
     confirmed: list[dict[str, Any]] = []

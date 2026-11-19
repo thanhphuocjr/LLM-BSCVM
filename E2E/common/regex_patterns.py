@@ -549,7 +549,7 @@ def re_enum_conversion(enum_name: str) -> re.Pattern[str]:
 # Các regex của swc_agents bỏ qua hoa/thường (IGNORECASE) như bản gốc, trừ khi ghi khác.
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Mã SWC "SWC-xxx" trong một chuỗi bất kỳ. Dùng ở: swc_agents.normalize_swc_id.
+# Mã SWC "SWC-xxx" trong một chuỗi bất kỳ. Dùng ở: swc_agents.normalize_swc_id, advisor.AdvisorAgent.advise_one (vulnerability_class).
 RE_SWC_ID = re.compile(r"SWC-\d{3}")
 
 # Nội dung các khối ```...``` (có hoặc không tên ngôn ngữ), group(1) = phần mã.
@@ -690,8 +690,14 @@ RE_SENTENCE_BREAK = re.compile(r"[.;]\s+")                      # chỗ ngắt c
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PHASE 2 ADVISOR / PHASE 3 ASSESSOR
-# Advisor chỉ dùng RE_PRAGMA_SPEC (mục dùng chung); Assessor không dùng regex.
+# Advisor còn dùng RE_PRAGMA_SPEC, RE_WHITESPACE (mục dùng chung) và RE_SWC_ID (mục Phase 1B);
+# Assessor không dùng regex.
 # ══════════════════════════════════════════════════════════════════════════════
+
+# Dấu lược "..." hoặc "…" trong đoạn guard LLM trích (guard_quote); tách thành từng mảnh để so với mã.
+# Vd "require(msg.sender == owner ... );" -> ["require(msg.sender == owner ", " );"].
+# Dùng ở: advisor_phase._quote_in_code.
+RE_QUOTE_ELLIPSIS = re.compile(r"\.\.\.|…")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -129,7 +129,7 @@ Tham số: `--run-id`, `--detector-threshold`, `--max-fix-attempts 1..3`, `--sol
 ## 6. Đánh giá và kiểm thử
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest discover -s tests -t .   # 89 test
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest discover -s tests -t .   # 103 test
 ```
 
 Kết quả các lần chạy thực nghiệm (vòng 1, vòng 2, benchmark 9 công cụ) đã lưu trong `data/results/` (xem `data/README.md`).
@@ -151,7 +151,12 @@ Kết quả detector v13 trên test split (`data/results/detector_v13_training/t
 - Con số tổng 0.893 bị kéo lên bởi `kaggle_ds2`: dữ liệu tổng hợp từ ít template, test và train
   chung template. Con số trung thực để báo cáo là **real-world F1 0.786**; DAppSCAN (DeFi thật) chỉ 0.62.
 - Detector là phân loại nhị phân, không tự gán SWC; nhãn SWC đến từ static/RAG.
-- Trọng số fusion (`phase1_fusion/fusion_calibration.json`) đặt tay, chưa fit trên tập hiệu chuẩn.
+- Trọng số fusion (`phase1_fusion/fusion_calibration.json`) được fit bằng hồi quy logistic trên 1,110 hàm thật
+  của v12 val+test, ngưỡng `tau_agent` = 0.1333 chọn theo F2 (ưu tiên recall). Khi đã biết điểm detector, confidence
+  của static/RAG gần như không thêm thông tin. Các tham số tay còn lại đã được kiểm chứng và giữ nguyên
+  (`E2E/tunable_heuristics.json`, cách làm ở `data/results/heuristics_tuning/`).
+- Unit đã có finding static/RAG thì không sinh finding UNMAPPED, nên tín hiệu detector có thể đi kèm một finding
+  sai loại (126/432 lỗi thật ở v12 val+test; 110 trong đó detector >= 0.70).
 - Thứ tự các finding Slither trả về không cố định giữa các lần chạy (nội dung giống nhau).
 - SWC Registry không còn được cập nhật và không phủ lỗi business-logic/oracle/cross-chain.
 - Bản vá do model sinh luôn cần review thủ công và test suite của dự án trước khi deploy.

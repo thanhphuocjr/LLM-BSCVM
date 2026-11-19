@@ -278,7 +278,7 @@ def skipped_verification() -> tuple[dict[str, Any], dict[str, Any]]:
 # [KẾT LUẬN DUY NHẤT của phase5_verification.json] Xét các luật theo thứ tự, luật khớp đầu tiên thắng:
 # chưa có kết quả GPU -> Inconclusive; gốc Safe & không vá -> No patch required;
 # Advisor loại hết finding -> No patch required; còn finding nhưng không có hàm nào để vá (chỉ finding cấp contract
-# hoặc hàm view/pure, vòng sửa 0 attempt) -> Inconclusive; hồi quy hành vi -> rejected;
+# hoặc hàm view/pure detector không gắn cờ, vòng sửa 0 attempt) -> Inconclusive; hồi quy hành vi -> rejected;
 # không compile -> rejected; không có bản vá hiệu lực -> rejected; Slither FAIL -> rejected;
 # static/RAG vẫn thấy lỗi mục tiêu -> rejected; không compile riêng được -> Inconclusive;
 # Slither passed -> "Patch accepted by Slither"; còn lại -> Inconclusive.

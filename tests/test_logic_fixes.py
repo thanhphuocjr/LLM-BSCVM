@@ -70,6 +70,33 @@ UNFIXED_WITHDRAW_ALL = """function withdrawAll() external {
         balances[msg.sender] = 0;
     }"""
 
+# Hai hàm view: price() (detector gắn cờ) và isOpen() (finding static SWC-116, detector chấm thấp).
+ORACLE = """pragma solidity ^0.8.0;
+contract Oracle {
+    uint256 public reserveA;
+    uint256 public reserveB;
+    uint256 public openUntil;
+
+    function price() external view returns (uint256) {
+        return reserveB * 1e18 / reserveA;
+    }
+
+    function isOpen() external view returns (bool) {
+        return block.timestamp <= openUntil;
+    }
+
+    function setReserves(uint256 a, uint256 b) external {
+        reserveA = a;
+        reserveB = b;
+    }
+}
+"""
+
+FIXED_PRICE = """function price() external view returns (uint256) {
+        require(reserveA > 0, "empty reserve");
+        return reserveB * 1e18 / reserveA;
+    }"""
+
 
 # Detector giả lập: trả 0.95 (lỗi) nếu lời gọi chuyển ETH đứng trước lệnh cập nhật số dư, ngược lại 0.05.
 def _reentrancy_probability(code: str) -> float:
@@ -148,6 +175,15 @@ class FuseFindingsTests(unittest.TestCase):
         confirmed, _ = fuse_findings(units, {"findings": []}, {"findings": []})
         self.assertEqual([item["unit_id"] for item in confirmed], ["A.f"])
         self.assertEqual(confirmed[0]["swc"], "UNMAPPED")
+
+    # tau_agent của fusion_calibration.json phải cho finding YẾU NHẤT (Low, không corroborated) trên unit có detector
+    # >= 0.70 đi qua: unit đã có finding local thì không sinh UNMAPPED, nên bị chặn ở đây là mất luôn tín hiệu detector.
+    def test_detector_flagged_unit_passes_with_its_weakest_finding(self) -> None:
+        units = [{"unit_id": "A.f", "status": "ok", "label": "Vulnerable", "vulnerability_probability": 0.70}]
+        static = {"findings": [{"source": "static", "swc": "SWC-103", "unit_id": "A.f", "severity": "Low", "confidence": 0.05}]}
+        confirmed, candidates = fuse_findings(units, static, {"findings": []})
+        self.assertEqual([(item["swc"], item["unit_id"]) for item in confirmed], [("SWC-103", "A.f")])
+        self.assertEqual(candidates, [])
 
     # Hàm detector lỗi nhận p_detector = 0.5 (trung lập), không bị coi là an toàn.
     def test_errored_unit_is_neutral_not_safe(self) -> None:
@@ -240,25 +276,23 @@ class CvssAndAgentsTests(unittest.TestCase):
         order = [(item["swc"], item["repair_priority"]) for item in result["assessments"]]
         self.assertEqual(order, [("SWC-107", 1), ("SWC-116", 2), ("SWC-102", 3)])
 
-    # Advisor kết luận false positive -> finding nằm trong false_positives và không có suggestion.
+    # Advisor kết luận false positive (trích được guard có thật) -> finding nằm trong false_positives, không có suggestion.
     def test_advisor_false_positive_is_reported_to_caller(self) -> None:
-        # Kết quả Advisor giả (is_true_positive=False).
-        class FakeSuggestion:
-            error = None
-            is_true_positive = False
-            root_cause = "setOwner is guarded by onlyOwner."
+        from E2E.phase2_advisor.advisor import RepairSuggestion
 
-        # AdvisorAgent giả, luôn trả FakeSuggestion.
+        # AdvisorAgent giả, luôn kết luận false positive và trích guard onlyOwner.
         class FakeAgent:
             # Bỏ qua tham số khởi tạo.
             def __init__(self, *args, **kwargs) -> None:
                 pass
 
-            # Trả FakeSuggestion cho mọi finding.
-            def advise_one(self, code, finding):
-                return FakeSuggestion()
+            # Trả kết luận false positive cho mọi finding.
+            def advise_one(self, code, finding, rag_context=None):
+                return RepairSuggestion(verdict="false_positive", guard_quote="onlyOwner",
+                                        root_cause="setOwner is guarded by onlyOwner.")
 
-        findings = [{"finding_id": "SWC-105:A.setOwner", "swc": "SWC-105", "unit_id": "A.setOwner"}]
+        findings = [{"finding_id": "SWC-105:A.setOwner", "swc": "SWC-105", "unit_id": "A.setOwner",
+                     "unit_code": "function setOwner(address o) external onlyOwner { owner = o; }"}]
         with patch("E2E.phase2_advisor.advisor_phase.AdvisorAgent", FakeAgent):
             advisor = _generate_advisor_section(findings, "", use_llm=True)
         self.assertEqual(advisor["false_positives"], ["SWC-105:A.setOwner"])
@@ -449,9 +483,9 @@ class LlmOutputTests(unittest.TestCase):
     def test_broken_json_salvages_the_keys_the_agents_read(self) -> None:
         from E2E.common.gpu_client import extract_json
 
-        advisor = extract_json('{"is_true_positive": false, "root_cause": "guarded by "onlyOwner"", '
+        advisor = extract_json('{"verdict": "false_positive", "root_cause": "guarded by "onlyOwner"", '
                                '"fix_strategy": "Apply CEI", "evidence_lines": [3,')
-        self.assertIs(advisor["is_true_positive"], False)
+        self.assertEqual(advisor["verdict"], "false_positive")
         self.assertEqual(advisor["fix_strategy"], "Apply CEI")
         assessor = extract_json('{"attack_vector": "N", "privileges_required": "H", "integrity": "H", '
                                 '"justification": "owner only" "scope": "U"}')
@@ -516,21 +550,21 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
     # The RAG channel is stubbed out so these tests exercise the repair loop itself.
     EMPTY_RAG = {"status": "ok", "findings": [], "retrieved_context": []}
 
-    # Dựng request.json cho contract Bank (RAG để trống).
-    def _request(self) -> dict:
+    # Dựng request.json cho một contract (mặc định Bank; RAG để trống).
+    def _request(self, code: str = BANK) -> dict:
         from E2E.phase1a_static.static_runner import run_static
 
-        units = parse_code_units(BANK)
+        units = parse_code_units(code)
         return {
             "run_id": "fake-gpu",
-            "source": {"code": BANK, "sha256": "x", "file_name": "Bank.sol"},
+            "source": {"code": code, "sha256": "x", "file_name": "Contract.sol"},
             "code_units": [unit.to_dict() for unit in units],
-            "local_phase1": {"static": run_static(BANK, units), "rag": dict(self.EMPTY_RAG)},
+            "local_phase1": {"static": run_static(code, units), "rag": dict(self.EMPTY_RAG)},
             "execution": {"detector_threshold": 0.7, "repair": {"max_attempts": 3}},
         }
 
     # Chạy run_server_gpu_pipeline với các phụ thuộc được patch (health, detect, generate, Advisor, Assessor...).
-    def _run(self, generate, detect=None) -> dict:
+    def _run(self, generate, detect=None, code: str = BANK) -> dict:
         # Detector giả dùng _reentrancy_probability.
         def fake_detect(code, threshold=0.7, server_url=None, timeout=60):
             return {"vulnerable_probability": _reentrancy_probability(code)}
@@ -550,8 +584,30 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
                 patch.object(gpu_pipeline, "_generate_assessor_section", side_effect=deterministic_assessor), \
                 patch.object(candidate_check, "run_rag", return_value=dict(self.EMPTY_RAG)), \
                 patch("builtins.print"):
-            request = self._request()
+            request = self._request(code)
             return gpu_pipeline.run_server_gpu_pipeline(request)
+
+    # Hàm view/pure chỉ được vá khi detector gắn cờ (label Vulnerable): price() (detector 0.95) là mục tiêu sửa;
+    # isOpen() có finding SWC-116 confirmed nhưng detector chấm thấp -> vẫn báo cáo, không vá.
+    def test_view_function_is_repaired_only_when_the_detector_flags_it(self) -> None:
+        # Detector giả: price() bản gốc bị gắn cờ, bản đã vá (có require) thì không.
+        def detect(code, threshold=0.7, server_url=None, timeout=60):
+            flagged = "function price" in code and "require(reserveA > 0" not in code
+            return {"vulnerable_probability": 0.95 if flagged else 0.05}
+
+        prompts = []
+
+        # Fixer giả: ghi lại hàm được yêu cầu vá, trả bản vá cho price().
+        def generate(prompt, **kwargs):
+            prompts.append(re.search(r"Target vulnerable function: `(\w+)`", prompt).group(1))
+            return json.dumps({"replacement": FIXED_PRICE})
+
+        result = self._run(generate, detect=detect, code=ORACLE)
+        confirmed = {item["unit_id"] for item in result["phases"]["detector"]["confirmed_findings"]}
+        self.assertIn("Oracle.isOpen", confirmed)
+        self.assertEqual(set(prompts), {"price"})
+        applied = {item["unit_id"] for item in result["phases"]["fixer"]["patch_outcomes"] if item["status"] == "applied"}
+        self.assertEqual(applied, {"Oracle.price"})
 
     # Vòng sửa: lần 2 giữ bản vá đã đạt của lần 1, chỉ vá lại hàm còn lỗi.
     def test_second_attempt_keeps_first_attempt_patch(self) -> None:

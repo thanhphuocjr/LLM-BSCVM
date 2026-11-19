@@ -126,10 +126,11 @@ def generate_via_server(
 
 
 # Các khoá mà agent thực sự đọc từ JSON của model (dùng khi phải "vớt" JSON hỏng bằng regex).
-#   Advisor (advisor.advise_one):  is_true_positive, root_cause, attack_scenario, impact, fix_strategy
+#   Advisor (advisor.advise_one):  verdict, guard_quote, vulnerability_class, root_cause, attack_scenario, impact,
+#                                  fix_strategy
 #   Assessor (assessor.assess_one): 8 metric CVSS + justification
 _SALVAGE_KEYS = (
-    "is_true_positive", "root_cause", "attack_scenario", "impact", "fix_strategy",
+    "verdict", "guard_quote", "vulnerability_class", "root_cause", "attack_scenario", "impact", "fix_strategy",
     "attack_vector", "attack_complexity", "privileges_required", "user_interaction",
     "scope", "confidentiality", "integrity", "availability", "justification",
 )

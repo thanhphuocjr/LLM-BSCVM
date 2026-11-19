@@ -146,8 +146,8 @@ def _version_rules(source_code: str) -> str:
     return "\n".join(rules) + "\n"
 
 
-# Dựng prompt Fixer cho MỘT hàm: tên hàm, danh sách lỗi + fix_strategy của Advisor (chỉ lấy suggestion đã được
-# Advisor xác nhận là true positive), mã gốc, ngữ cảnh contract + bất biến, tri thức RAG, feedback lần trước,
+# Dựng prompt Fixer cho MỘT hàm: tên hàm, danh sách lỗi + fix_strategy của Advisor (chỉ lấy suggestion do LLM phân
+# tích chính hàm này: advisor_verdict confirmed / uncertain), mã gốc, ngữ cảnh contract + bất biến, tri thức RAG, feedback lần trước,
 # luật phiên bản, yêu cầu "MINIMAL DIFF", giữ mọi lệnh ghi state/event, chỉ dùng modifier/hàm/biến đã có (bản vá
 # chỉ thay một hàm nên không thể khai báo modifier mới), trả JSON {replacement, changed_lines, why}.
 def _build_fixer_prompt(
@@ -160,9 +160,9 @@ def _build_fixer_prompt(
 ) -> str:
     finding_lines = [f"  * [{item.get('swc', '')}] {item.get('title', '')}" for item in unit_findings]
     for suggestion in unit_suggestions:
-        # Suggestions without `is_true_positive` come from the knowledge-base fallback and describe
-        # a different contract's case; feeding them as this function's diagnosis misleads the fixer.
-        if not suggestion.get("is_true_positive"):
+        # Only the Advisor's own analysis of THIS function (verdict confirmed / uncertain) is a diagnosis.
+        # Knowledge-base suggestions (incl. "disputed") describe a different contract's case and mislead the fixer.
+        if suggestion.get("advisor_verdict") not in {"confirmed", "uncertain"}:
             continue
         if suggestion.get("fix_strategy"):
             finding_lines.append(f"  * Fix Strategy: {suggestion['fix_strategy']}")

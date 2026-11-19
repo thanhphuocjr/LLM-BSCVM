@@ -22,6 +22,7 @@ The final verification (Slither, AST) and the report (Phase 6) run afterwards in
 from __future__ import annotations
 
 import time
+from collections import Counter
 from typing import Any
 
 from E2E.common.findings import finding_key
@@ -30,7 +31,7 @@ from E2E.config import DEFAULT_DETECTOR_THRESHOLD, MAX_FIX_ATTEMPTS, PIPELINE_VE
 from E2E.phase0_parsing.code_units import as_code_unit
 from E2E.phase1_fusion.fusion import fuse_findings
 from E2E.phase1c_detector.detector import score_units_via_server, summarize_detector
-from E2E.phase2_advisor.advisor import RepairKnowledgeBase
+from E2E.phase2_advisor.advisor import UNMAPPED_CLASS_TITLES, RepairKnowledgeBase
 from E2E.phase2_advisor.advisor_phase import _generate_advisor_section
 from E2E.phase3_assessor.assessor_phase import _generate_assessor_section
 from E2E.phase4_fixer.fixer import _build_rag_knowledge_section, _splice_unit, patch_unit
@@ -49,7 +50,8 @@ def _log(message: str) -> None:
 #   1C: kiểm tra server sống (health) -> detector chấm từng unit (score_units_via_server + summarize_detector).
 #   1F: fuse_findings -> finding confirmed / candidate; RepairKnowledgeBase gắn tri thức sửa lỗi theo SWC
 #       (một KB dùng chung cho Phase 1F, Advisor và Assessor).
-#   2 : Advisor -> loại false positive khỏi tập cần sửa, sinh hướng sửa (suggestions).
+#   2 : Advisor -> loại false positive đã kiểm chứng khỏi tập cần sửa (uncertain / disputed vẫn giữ), sinh hướng
+#       sửa (suggestions); finding UNMAPPED nhận tiêu đề theo lớp lỗi Advisor gán.
 #   3 : Assessor -> CVSS v3.1 + repair_priority (điểm CVSS cao sửa trước).
 #   4-5: VÒNG SỬA (tối đa 3 lần): Fixer vá từng hàm mục tiêu theo repair_priority (patch_unit);
 #       rồi verify_candidate kiểm tra compile + detector + static/RAG chạy lại.
@@ -111,18 +113,28 @@ def run_server_gpu_pipeline(
     findings = knowledge_base.enrich_findings(findings, code=source_code, code_units=request.get("code_units", []))
     _log(f"[PHASE 1 FUSED] Completed: {len(findings)} confirmed finding(s), {len(candidate_findings)} candidate(s).")
 
-    # Phase 2: Advisor (triage + remediation). False positives are removed from the repair set.
+    # Phase 2: Advisor (triage + remediation). Validated false positives are removed from the repair set;
+    # uncertain / disputed findings stay. An UNMAPPED finding keeps its id but takes the class the Advisor named.
     _log("[PHASE 2] Running Security Advisor agent (root cause & remediation analysis)...")
-    advisor = _generate_advisor_section(findings, source_code, use_llm=True, knowledge_base=knowledge_base)
-    dismissed_ids = set(advisor.get("false_positives", []))
-    reasons = advisor.get("false_positive_reasons", {})
-    dismissed = [
-        {**item, "dismissal_reason": reasons.get(finding_key(item), "")}
-        for item in findings if finding_key(item) in dismissed_ids
-    ]
-    findings = [item for item in findings if finding_key(item) not in dismissed_ids]
+    advisor = _generate_advisor_section(
+        findings, source_code, use_llm=True, knowledge_base=knowledge_base, rag_context=rag_context
+    )
+    dismissed_ids = set(advisor["false_positives"])
+    advisor_swc = {item["finding_id"]: item["advisor_swc"] for item in advisor["suggestions"] if item.get("advisor_swc")}
+    dismissed, kept = [], []
+    for item in findings:
+        key = finding_key(item)
+        if key in dismissed_ids:
+            dismissed.append({**item, "dismissal_reason": advisor["false_positive_reasons"].get(key, "")})
+        elif key in advisor_swc:
+            swc = advisor_swc[key]
+            kept.append({**item, "advisor_swc": swc, "title": f"{UNMAPPED_CLASS_TITLES[swc]} (classified by the Advisor)"})
+        else:
+            kept.append(item)
+    findings = kept
+    verdicts = Counter(item.get("advisor_verdict", "no LLM verdict") for item in advisor["suggestions"])
     _log(
-        f"[PHASE 2] Completed: {len(advisor.get('suggestions', []))} suggestion(s), "
+        f"[PHASE 2] Completed: {len(advisor['suggestions'])} suggestion(s) {dict(verdicts)}, "
         f"{len(dismissed)} finding(s) dismissed as false positive."
     )
 
@@ -137,11 +149,15 @@ def run_server_gpu_pipeline(
     )
     _log(f"[PHASE 3] Completed: {len(assessor.get('assessments', []))} item(s) assessed.")
 
-    # Phase 4-5: repair loop.
+    # Phase 4-5: repair loop. A view/pure function is repaired only when the detector flags it (label Vulnerable):
+    # it moves no funds itself, but the wrong price / quote / randomness it returns can be the root cause
+    # (46 of the 432 real vulnerable functions of v12 val+test are view/pure with detector >= 0.70).
     finding_units = {item.get("unit_id") for item in findings if item.get("unit_id")}
+    detector_flagged = {item.get("unit_id") for item in unit_results if item.get("label") == "Vulnerable"}
     target_units = [
         unit for unit in unit_objs
-        if unit.unit_id in finding_units and unit.has_body and not unit.is_view_or_pure
+        if unit.unit_id in finding_units and unit.has_body
+        and (not unit.is_view_or_pure or unit.unit_id in detector_flagged)
     ]
     # Phase 3 -> Phase 4: repair the units in the Assessor's repair-priority order (highest CVSS first).
     unit_priority: dict[str, int] = {}

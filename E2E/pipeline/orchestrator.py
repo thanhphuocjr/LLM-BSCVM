@@ -13,6 +13,7 @@ Orchestrator - runs one contract through Phase 0 -> 6 and writes one artifact pe
             model calls go to the GPU server over HTTP (/api/v1/detect, /api/v1/generate).
   Phase 1F  contract-level fusion of static + RAG + detector  phase1_fusion/fusion.py
   Phase 5   final verification of the patch             phase5_verifier/final_verification.py
+            (--no-verify skips Phase 5: one Fixer attempt, patch returned unverified)
   Phase 6   audit report (Markdown / HTML / PDF)         phase6_reporter/report.py
 
 Artifacts in data/results/audit_runs/<run_id>/: phase0_input.json, phase1a_static.json,
@@ -127,6 +128,8 @@ def validate_remote_result(request: dict[str, Any], remote: dict[str, Any]) -> N
 #   - Lượt 2 (có remote_result từ gpu_pipeline): kiểm tra kết quả GPU, fusion đầy đủ (static + RAG +
 #     detector), ghi phase2/3/4, chạy kiểm chứng cuối Phase 5 (verify_final_patch), quyết định
 #     overall_verdict, rồi xuất báo cáo Phase 6 (MD/HTML/PDF) và manifest.json.
+#   verify=False (CLI --no-verify, dùng khi đánh giá bản vá - fix_eval/): ghi execution.verify=false vào request.json
+#   để GPU phases chỉ vá 1 lần và bỏ kiểm chứng; lượt 2 bỏ qua verify_final_patch, verdict "Not verified: ...".
 # Mục đích: là "xương sống" của hệ thống; CLI và web app (gọi lại CLI) đều đi qua hàm này.
 def run_pipeline(
     code: str,
@@ -139,11 +142,13 @@ def run_pipeline(
     source_root: str | Path | None = None,
     max_fix_attempts: int = MAX_FIX_ATTEMPTS,
     local_phase1: dict[str, Any] | None = None,
+    verify: bool = True,
 ) -> dict[str, Any]:
     """Write every phase artifact of one contract to runs_dir/<run_id>/.
 
     Called twice per audit (see main): without `remote_result` it runs Phase 0, 1A, 1B and
     writes request.json; with the GPU-phase result it merges Phases 1C-4 and runs Phase 5 and 6.
+    verify=False skips Phase 5 (one Fixer attempt, the patch is reported as not verified).
     """
     actual_run_id = validated_run_id(run_id or make_run_id(file_name, code))
     run_dir = Path(runs_dir) / actual_run_id
@@ -211,6 +216,7 @@ def run_pipeline(
                 "attempt": 1,
                 "max_attempts": min(max(1, max_fix_attempts), MAX_FIX_ATTEMPTS),
             },
+            "verify": bool(verify),
         },
     }
     request_path = write_json(run_dir / "request.json", request)
@@ -240,7 +246,12 @@ def run_pipeline(
     patch_outcomes = remote.get("phases", {}).get("fixer", {}).get("patch_outcomes", []) if remote else []
     patch_applied = any(item.get("status") == "applied" for item in patch_outcomes)
 
-    if remote and remote.get("status") in {"ok", "partial"} and fixed_code and fixed_code != code:
+    if not verify:
+        if remote:
+            print(f"[{time.strftime('%H:%M:%S')}] [PHASE 5] Skipped: verification disabled for this run (--no-verify).", flush=True)
+        fixed_static = fixed_rag = None
+        tool_result, behavioral_result = skipped_verification("Verification disabled for this run (--no-verify)")
+    elif remote and remote.get("status") in {"ok", "partial"} and fixed_code and fixed_code != code:
         print(f"[{time.strftime('%H:%M:%S')}] [PHASE 5] Verifying patch: compile + Slither, AST behavior check, static/RAG re-run...", flush=True)
         tool_result, behavioral_result, fixed_static, fixed_rag = verify_final_patch(
             code,
@@ -270,12 +281,15 @@ def run_pipeline(
         behavioral_result=behavioral_result,
         fixed_static=fixed_static,
         fixed_rag=fixed_rag,
+        verification_enabled=verify,
     )
 
     v_info = remote.get("phases", {}).get("verifier", {}) if remote else {}
     verification = {
         "status": (
-            "complete"
+            "disabled"
+            if not verify
+            else "complete"
             if slither_verdict in {"passed", "failed"} and tool_result.get("status") in {"ok", "partial"}
             else "inconclusive" if not remote or remote.get("status") != "ok" else "partial"
         ),
@@ -284,12 +298,13 @@ def run_pipeline(
         "fixed_detection": remote_fixed or {},
         "tool_verification": tool_result,
         "behavioral_verification": behavioral_result,
+        # No channel ran when verification is disabled -> empty table in report section 5.5.
         "verification_channels": build_verification_channels(
             tool_result,
             static_result=fixed_static,
             rag_result=fixed_rag,
             detector_fixed=remote_fixed,
-        ),
+        ) if verify else {},
         # Per-attempt details of the repair loop stay in server_result.json (phases.verifier.attempts).
         "attempts_count": v_info.get("attempts_count", 1) if remote else 0,
         "max_attempts": v_info.get("max_attempts", MAX_FIX_ATTEMPTS),
@@ -357,7 +372,7 @@ def run_pipeline(
 
 
 # Nhiệm vụ: khai báo tham số CLI cho `python -m E2E.run <file.sol>` (--run-id, --detector-threshold,
-# --max-fix-attempts, --solidity-root).
+# --max-fix-attempts, --solidity-root, --no-verify).
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Audit one Solidity contract (Phase 0 -> 6) through the GPU server.")
     parser.add_argument("code_file", type=Path)
@@ -380,6 +395,13 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Root containing imported .sol files; defaults to the input file directory.",
     )
+    parser.add_argument(
+        "--no-verify",
+        dest="verify",
+        action="store_false",
+        help="Skip Phase 5 (repair-loop self-check and final verification): "
+             "the Fixer makes one attempt and its patch is reported as not verified.",
+    )
     return parser.parse_args()
 
 
@@ -399,6 +421,7 @@ def main() -> None:
         detector_threshold=args.detector_threshold,
         source_root=args.solidity_root or args.code_file.parent,
         max_fix_attempts=args.max_fix_attempts,
+        verify=args.verify,
     )
     # Pass 1: Phase 0, 1A, 1B on this machine -> request.json.
     manifest = run_pipeline(code, run_id=args.run_id, **common)

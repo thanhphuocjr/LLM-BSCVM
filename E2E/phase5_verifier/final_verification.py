@@ -255,22 +255,24 @@ def verify_final_patch(
     return tool_result, behavioral_result, fixed_static, fixed_rag
 
 
-# Kết quả tool/hành vi "inconclusive" khi không có bản vá nào để kiểm chứng.
-def skipped_verification() -> tuple[dict[str, Any], dict[str, Any]]:
-    """Tool and behaviour results when there is no patch to verify."""
+# Kết quả tool/hành vi "inconclusive" khi không có bản vá nào để kiểm chứng, hoặc khi kiểm chứng bị tắt
+# (reason = lý do tắt, vd CLI --no-verify; mặc định None giữ nguyên các câu của trường hợp không có bản vá).
+def skipped_verification(reason: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Tool and behaviour results when there is no patch to verify (or verification is disabled)."""
     tool_result = {
         "component": "tool_verification",
         "status": "inconclusive",
         "policy_verdict": "inconclusive",
-        "policy_reason": "Patch execution incomplete or remote runner did not finish.",
-        "compile": {"status": "skipped", "reason": "remote runner incomplete"},
+        "policy_reason": reason or "Patch execution incomplete or remote runner did not finish.",
+        "compile": {"status": "skipped", "reason": reason or "remote runner incomplete"},
         "tools": {},
         "slither": {"status": "skipped", "findings": [], "verdict": "Not run"},
     }
     behavioral_result = {
         "status": "inconclusive",
         "findings": [],
-        "checks": ["Patch execution incomplete: behavioral verification skipped."],
+        "checks": [f"{reason}: behavioral verification skipped." if reason
+                   else "Patch execution incomplete: behavioral verification skipped."],
     }
     return tool_result, behavioral_result
 
@@ -279,7 +281,9 @@ def skipped_verification() -> tuple[dict[str, Any], dict[str, Any]]:
 # chưa có kết quả GPU -> Inconclusive; gốc Safe & không vá -> No patch required;
 # Advisor loại hết finding -> No patch required; còn finding nhưng không có hàm nào để vá (chỉ finding cấp contract
 # hoặc hàm view/pure, vòng sửa 0 attempt) -> Inconclusive; hồi quy hành vi -> rejected;
-# không compile -> rejected; không có bản vá hiệu lực -> rejected; Slither FAIL -> rejected;
+# không compile -> rejected; không có bản vá hiệu lực -> rejected;
+# kiểm chứng bị tắt (verification_enabled=False, CLI --no-verify) -> "Not verified" (có bản vá nhưng chưa kiểm chứng);
+# Slither FAIL -> rejected;
 # static/RAG vẫn thấy lỗi mục tiêu -> rejected; không compile riêng được -> Inconclusive;
 # Slither passed -> "Patch accepted by Slither"; còn lại -> Inconclusive.
 # (Detector vẫn báo lỗi KHÔNG chặn chấp nhận - chỉ ghi detector_disagreement, vì detector hay báo nhầm hàm an toàn.)
@@ -294,6 +298,7 @@ def decide_overall_verdict(
     behavioral_result: dict[str, Any],
     fixed_static: dict[str, Any] | None,
     fixed_rag: dict[str, Any] | None,
+    verification_enabled: bool = True,
 ) -> str:
     """Step 4: the single verdict of phase5_verification.json (first matching rule wins)."""
     compile_status = tool_result.get("compile", {}).get("status")
@@ -323,6 +328,8 @@ def decide_overall_verdict(
         return "Patch rejected: fixed code does not compile"
     if not patch_applied or fixed_code == code:
         return "Patch rejected: no effective patch was applied"
+    if not verification_enabled:
+        return "Not verified: a patch was generated but verification was disabled for this run"
     if slither_verdict == "failed":
         return "Patch rejected: Slither found residual or introduced vulnerabilities"
     if local_residual:

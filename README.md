@@ -41,7 +41,8 @@ RAG/
 │
 ├── webapp/                app.py (FastAPI) + static/ (giao diện)
 ├── demo_contracts/        VulnerableBank, SafeBank, AccessControl (web app "Mẫu", CLI, test)
-├── tests/                 89 unit/integration test (gồm hồi quy static + fusion trên 3 contract SmartBugs-Wild)
+├── tests/                 93 unit/integration test (gồm hồi quy static + fusion trên 3 contract SmartBugs-Wild)
+├── fix_eval/              đánh giá bản vá trên tập test của KB (KB không chứa test, --no-verify) — xem fix_eval/README.md
 ├── data/                  (local) MỌI dataset + kết quả chạy — xem data/README.md
 ├── models/                (local) qwen25-v13-14b-detector-final/ — adapter LoRA + threshold_config.json
 └── docs/                  (local) bài báo LLM-BSCVM (PDF)
@@ -122,14 +123,16 @@ SERVER_IP=100.122.153.35 ./scripts/gpu_server.sh status
 .venv/bin/python -m E2E.run demo_contracts/VulnerableBank.sol
 ```
 
-Tham số: `--run-id`, `--detector-threshold`, `--max-fix-attempts 1..3`, `--solidity-root`.
+Tham số: `--run-id`, `--detector-threshold`, `--max-fix-attempts 1..3`, `--solidity-root`,
+`--no-verify` (bỏ Phase 5: Fixer vá 1 lần, bản vá không được kiểm chứng — dùng khi đánh giá bản vá).
+Biến môi trường `RAG_KNOWLEDGE_BASE_DIR` chọn bản KB khác `data/knowledge_base/built/` (vd `built_no_test/`).
 
 ---
 
 ## 6. Đánh giá và kiểm thử
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest discover -s tests -t .   # 89 test
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest discover -s tests -t .   # 93 test
 ```
 
 Kết quả các lần chạy thực nghiệm (vòng 1, vòng 2, benchmark 9 công cụ) đã lưu trong `data/results/` (xem `data/README.md`).

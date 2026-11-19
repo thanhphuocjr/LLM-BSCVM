@@ -9,13 +9,20 @@ data/
 ├── knowledge_base/                 CƠ SỞ TRI THỨC LỖ HỔNG (Phase 1B RAG, Phase 2 Advisor)
 │   ├── source/                     đầu vào của bước xây dựng
 │   │   ├── final-vulnerability-knowledge.json   hàm lỗi + SWC + nguyên nhân + bản vá (DAppSCAN, iAudit, kaggle_ds2)
+│   │   ├── final-vulnerability-knowledge.no_test.json   bản bỏ 2,276 mẫu split=test (train + val) — fix_eval
 │   │   └── baseline_taxonomy.json               mô tả / cách khắc phục chuẩn của 37 SWC (SWC Registry)
-│   └── built/                      đầu ra của E2E.phase1b_rag.build_knowledge_base, pipeline đọc khi chạy
-│       ├── knowledge_items.json    11,869 ca lỗi có thể truy hồi
-│       ├── swc_registry.json       37 SWC kèm bằng chứng từ dataset
-│       ├── swc_vectorizer.joblib   TF-IDF (char 3-5 gram)
-│       ├── swc_matrix.npz          ma trận TF-IDF của các ca
-│       └── knowledge_manifest.json số lượng + nguồn
+│   ├── built/                      đầu ra của E2E.phase1b_rag.build_knowledge_base, pipeline đọc khi chạy
+│   │   ├── knowledge_items.json    11,869 ca lỗi có thể truy hồi
+│   │   ├── swc_registry.json       37 SWC kèm bằng chứng từ dataset
+│   │   ├── swc_vectorizer.joblib   TF-IDF (char 3-5 gram)
+│   │   ├── swc_matrix.npz          ma trận TF-IDF của các ca
+│   │   └── knowledge_manifest.json số lượng + nguồn
+│   └── built_no_test/              KB build từ file .no_test.json (9,933 ca), dùng qua RAG_KNOWLEDGE_BASE_DIR — fix_eval
+│
+├── fix_eval/                       TẬP TEST CỦA KB để đánh giá bản vá (fix_eval/split_test_set.py)
+│   ├── test_set_ground_truth.json  2,276 mẫu test, đủ mọi trường (nhãn, SWC, fixed_code, ...) + detector_v12_split
+│   ├── test_input.json             đầu vào pipeline: chỉ id + source_code
+│   └── split_manifest.json         số lượng, SHA-256, kiểm tra rò rỉ
 │
 ├── detector_dataset/               DATASET HUẤN LUYỆN DETECTOR (Phase 1C)
 │   └── final-dataset-v12-train.json   10,356 hàm, split train/val/test (dappscan, iaudit_trustllm, kaggle_ds2)
@@ -42,6 +49,8 @@ data/
     │   └── ham_sua_lan_2_ket_qua.csv (+ _blind: bỏ cột nhận xét của giám khảo vòng 1)
     ├── round2_regress/             VÒNG 2, nhóm 18 hàm mà bản vá vòng 1 sinh lỗi mới (có self-check)
     ├── solodit_9tools/             kết quả benchmark 9 công cụ (details / summary CSV, report.md)
+    ├── fix_eval/                   chạy tập test qua pipeline (KB không chứa test, --no-verify): fix_eval_results.csv,
+    │                               results.jsonl, summary.json, progress.log, runs/<id>/
     └── audit_runs/<run_id>/        mỗi lần audit từ web app / CLI (web app đọc lịch sử từ đây)
 ```
 

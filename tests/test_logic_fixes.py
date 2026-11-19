@@ -289,6 +289,31 @@ class CvssAndAgentsTests(unittest.TestCase):
                          "Inconclusive: no function-level repair target for the confirmed findings")
         self.assertEqual(verdict([pragma], [], 3), "Patch rejected: no effective patch was applied")
 
+    # Tắt kiểm chứng (--no-verify): có bản vá -> "Not verified"; các luật đứng trước (Safe, không có bản vá) giữ nguyên.
+    def test_verdict_when_verification_is_disabled(self) -> None:
+        from E2E.phase5_verifier.final_verification import decide_overall_verdict, skipped_verification
+
+        tool_result, behaviour = skipped_verification("Verification disabled for this run (--no-verify)")
+        self.assertEqual(tool_result["compile"]["status"], "skipped")
+        self.assertIn("--no-verify", tool_result["policy_reason"])
+        remote = {"status": "ok", "phases": {
+            "detector": {"confirmed_findings": [{"swc": "SWC-107"}], "dismissed_findings": []},
+            "verifier": {"attempts_count": 1},
+        }}
+
+        # Kết luận khi tắt kiểm chứng cho một kết quả fusion / bản vá giả.
+        def verdict(fused_verdict: str, patch_applied: bool, fixed_code: str) -> str:
+            return decide_overall_verdict(
+                remote=remote, fused={"verdict": fused_verdict}, code="c", fixed_code=fixed_code,
+                patch_applied=patch_applied, tool_result=tool_result, behavioral_result=behaviour,
+                fixed_static=None, fixed_rag=None, verification_enabled=False,
+            )
+
+        self.assertEqual(verdict("Vulnerable", True, "c2"),
+                         "Not verified: a patch was generated but verification was disabled for this run")
+        self.assertEqual(verdict("Vulnerable", False, "c"), "Patch rejected: no effective patch was applied")
+        self.assertEqual(verdict("Safe", False, "c"), "No patch required: original detection reported Safe")
+
     # Luật triage của Advisor nói rõ kiểm tra tx.origin không phải guard (SWC-115).
     def test_advisor_rule_does_not_treat_tx_origin_as_a_guard(self) -> None:
         from E2E.phase2_advisor.advisor import AdvisorAgent
@@ -516,8 +541,8 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
     # The RAG channel is stubbed out so these tests exercise the repair loop itself.
     EMPTY_RAG = {"status": "ok", "findings": [], "retrieved_context": []}
 
-    # Dựng request.json cho contract Bank (RAG để trống).
-    def _request(self) -> dict:
+    # Dựng request.json cho contract Bank (RAG để trống); verify=False giống CLI --no-verify.
+    def _request(self, verify: bool = True) -> dict:
         from E2E.phase1a_static.static_runner import run_static
 
         units = parse_code_units(BANK)
@@ -526,11 +551,11 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
             "source": {"code": BANK, "sha256": "x", "file_name": "Bank.sol"},
             "code_units": [unit.to_dict() for unit in units],
             "local_phase1": {"static": run_static(BANK, units), "rag": dict(self.EMPTY_RAG)},
-            "execution": {"detector_threshold": 0.7, "repair": {"max_attempts": 3}},
+            "execution": {"detector_threshold": 0.7, "repair": {"max_attempts": 3}, "verify": verify},
         }
 
     # Chạy run_server_gpu_pipeline với các phụ thuộc được patch (health, detect, generate, Advisor, Assessor...).
-    def _run(self, generate, detect=None) -> dict:
+    def _run(self, generate, detect=None, verify: bool = True) -> dict:
         # Detector giả dùng _reentrancy_probability.
         def fake_detect(code, threshold=0.7, server_url=None, timeout=60):
             return {"vulnerable_probability": _reentrancy_probability(code)}
@@ -550,8 +575,43 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
                 patch.object(gpu_pipeline, "_generate_assessor_section", side_effect=deterministic_assessor), \
                 patch.object(candidate_check, "run_rag", return_value=dict(self.EMPTY_RAG)), \
                 patch("builtins.print"):
-            request = self._request()
+            request = self._request(verify)
             return gpu_pipeline.run_server_gpu_pipeline(request)
+
+    # Tắt kiểm chứng: Fixer vá đúng 1 lần (dù max_attempts = 3), không gọi verify_candidate, detector chỉ chấm
+    # bản gốc; bản vá (kể cả bản còn lỗi) được trả về nguyên trạng với trạng thái UNVERIFIED.
+    def test_no_verify_makes_one_unverified_attempt(self) -> None:
+        detect_calls: list[str] = []
+
+        # Detector giả có đếm số lần gọi.
+        def counting_detect(code, threshold=0.7, server_url=None, timeout=60):
+            detect_calls.append(code)
+            return {"vulnerable_probability": _reentrancy_probability(code)}
+
+        # withdrawAll có sửa (thêm require) nhưng vẫn gọi ETH trước khi cập nhật số dư -> detector vẫn báo lỗi.
+        still_vulnerable = UNFIXED_WITHDRAW_ALL.replace("(bool ok", "require(amount > 0);\n        (bool ok", 1)
+        self.assertEqual(_reentrancy_probability(still_vulnerable), 0.95)
+
+        # Fixer giả: vá đúng withdraw, vá withdrawAll mà vẫn còn lỗi (vòng có kiểm chứng sẽ phải sửa lại).
+        def generate(prompt, **kwargs):
+            body = still_vulnerable if "Target vulnerable function: `withdrawAll`" in prompt else FIXED_WITHDRAW
+            return json.dumps({"replacement": body})
+
+        with patch.object(gpu_pipeline, "verify_candidate", side_effect=AssertionError("must not verify")):
+            result = self._run(generate, detect=counting_detect, verify=False)
+        verifier = result["phases"]["verifier"]
+        self.assertEqual(verifier["status"], "disabled")
+        self.assertEqual(verifier["overall_verdict"], "NOT_VERIFIED")
+        self.assertEqual(verifier["attempts_count"], 1)
+        self.assertEqual(verifier["max_attempts"], 1)
+        unit_status = {item["unit_id"]: item["status"] for item in verifier["verifications"] if item["unit_id"]}
+        self.assertEqual(unit_status, {"Bank.withdraw": "UNVERIFIED", "Bank.withdrawAll": "UNVERIFIED"})
+        self.assertEqual(result["phases"]["detector"]["fixed"]["status"], "not_run")
+        bodies = [unit for unit in parse_code_units(BANK) if unit.has_body]
+        self.assertEqual(len(detect_calls), len(bodies))  # original scoring only, no re-score of the patch
+        fixed_code = result["phases"]["fixer"]["fixed_code"]
+        self.assertIn(FIXED_WITHDRAW, fixed_code)
+        self.assertIn(still_vulnerable, fixed_code)
 
     # Vòng sửa: lần 2 giữ bản vá đã đạt của lần 1, chỉ vá lại hàm còn lỗi.
     def test_second_attempt_keeps_first_attempt_patch(self) -> None:
@@ -591,6 +651,44 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
         self.assertIsNone(original["vulnerability_probability"])
         self.assertEqual(result["status"], "partial")
         self.assertNotEqual(fuse_detection(OK_EMPTY, OK_EMPTY, original)["verdict"], "Safe")
+
+
+# Biến môi trường RAG_KNOWLEDGE_BASE_DIR chọn bản KB khác (fix_eval dùng built_no_test/); không đặt -> built/.
+class KnowledgeBaseDirTests(unittest.TestCase):
+    # Đường dẫn KB mà RAG (retriever), Advisor và SWC agent nhận được trong một tiến trình Python mới.
+    @staticmethod
+    def _paths_in_fresh_process(env_value: str | None) -> list[str]:
+        import os
+        import subprocess
+        import sys
+
+        env = {key: value for key, value in os.environ.items() if key != "RAG_KNOWLEDGE_BASE_DIR"}
+        if env_value is not None:
+            env["RAG_KNOWLEDGE_BASE_DIR"] = env_value
+        script = (
+            "import inspect\n"
+            "from E2E.config import KNOWLEDGE_BASE_DIR\n"
+            "from E2E.phase1b_rag.retriever import LocalRAGRetriever\n"
+            "from E2E.phase1b_rag.swc_agents import DEFAULT_SWC_REGISTRY\n"
+            "from E2E.phase2_advisor.advisor import RepairKnowledgeBase\n"
+            "print(KNOWLEDGE_BASE_DIR)\n"
+            "print(inspect.signature(LocalRAGRetriever.__init__).parameters['store_dir'].default)\n"
+            "print(inspect.signature(RepairKnowledgeBase.__init__).parameters['knowledge_dir'].default)\n"
+            "print(DEFAULT_SWC_REGISTRY.parent)\n"
+        )
+        output = subprocess.run(
+            [sys.executable, "-c", script], env=env, capture_output=True, text=True, check=True,
+        ).stdout
+        return output.split()
+
+    # Đặt biến môi trường -> mọi nơi đọc KB đều trỏ tới thư mục đó; không đặt -> data/knowledge_base/built.
+    def test_env_var_selects_the_knowledge_base_everywhere(self) -> None:
+        from E2E.config import DATA_DIR
+
+        other = str(DATA_DIR / "knowledge_base" / "built_no_test")
+        self.assertEqual(self._paths_in_fresh_process(other), [other] * 4)
+        default = str(DATA_DIR / "knowledge_base" / "built")
+        self.assertEqual(self._paths_in_fresh_process(None), [default] * 4)
 
 
 if __name__ == "__main__":

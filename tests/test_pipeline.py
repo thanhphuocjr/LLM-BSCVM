@@ -628,6 +628,61 @@ class IntegrationTests(unittest.TestCase):
                           report_data["executive_summary"])
             self.assertEqual(report_data["recommendations"], DEFAULT_RECOMMENDATIONS)
 
+    # Tắt kiểm chứng (verify=False, CLI --no-verify): request.json ghi verify=false, lượt 2 KHÔNG gọi
+    # verify_final_patch, verdict "Not verified", không có kênh kiểm chứng nào, báo cáo vẫn xuất đủ.
+    def test_no_verify_skips_final_verification(self) -> None:
+        code = (EXAMPLES / "VulnerableBank.sol").read_text(encoding="utf-8")
+        run_id = "mock-no-verify"
+        withdraw = next(unit for unit in parse_code_units(code) if unit.name == "withdraw")
+        patched = withdraw.code.replace("balances[msg.sender] = 0;", "") + "\n"  # any change counts as a patch
+        finding = {"finding_id": "SWC-107:VulnerableBank.withdraw", "swc": "SWC-107",
+                   "unit_id": "VulnerableBank.withdraw", "title": "Reentrancy", "severity": "High"}
+        remote = {
+            "schema_version": "1.0.0",
+            "run_id": run_id,
+            "source_sha256": sha256_text(code),
+            "status": "ok",
+            "phases": {
+                "detector": {
+                    "status": "ok",
+                    "original": {"status": "ok", "score": 0.95, "threshold": 0.7, "verdict": "Vulnerable"},
+                    "fixed": {"status": "not_run", "verdict": "Not run", "threshold": 0.7},
+                    "confirmed_findings": [finding],
+                    "dismissed_findings": [],
+                },
+                "advisor": {"status": "ok", "suggestions": []},
+                "assessor": {"status": "ok", "assessments": []},
+                "fixer": {
+                    "status": "ok",
+                    "fixed_code": code.replace(withdraw.code, patched),
+                    "patch_outcomes": [{"unit_id": "VulnerableBank.withdraw", "status": "applied"}],
+                },
+                "verifier": {
+                    "status": "disabled",
+                    "overall_verdict": "NOT_VERIFIED",
+                    "attempts_count": 1,
+                    "max_attempts": 1,
+                    "verifications": [{"finding_id": finding["finding_id"], "unit_id": finding["unit_id"],
+                                       "status": "UNVERIFIED", "residual_risk": "Unverified or residual risk remains"}],
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch("E2E.pipeline.orchestrator.verify_final_patch", side_effect=AssertionError("must not verify")):
+            manifest = run_pipeline(code, file_name="VulnerableBank.sol", run_id=run_id, runs_dir=temp_dir,
+                                    remote_result=remote, verify=False)
+            run_dir = Path(temp_dir) / run_id
+            verification = read_json(run_dir / "phase5_verification.json")
+            report_data = read_json(run_dir / "phase6_report_data.json")
+            self.assertFalse(read_json(run_dir / "request.json")["execution"]["verify"])
+            self.assertTrue(Path(manifest["reports"]["markdown"]).exists())
+        verdict = "Not verified: a patch was generated but verification was disabled for this run"
+        self.assertEqual(manifest["verification"]["overall_verdict"], verdict)
+        self.assertEqual(verification["status"], "disabled")
+        self.assertEqual(verification["verification_channels"], {})
+        self.assertEqual(report_data["patch_verdict"], verdict)
+        self.assertEqual(report_data["findings"][0]["self_check_status"], "UNVERIFIED")
+
     # Slither không chạy được -> SKIPPED và kết luận inconclusive; chạy sạch -> passed.
     def test_tool_policy_for_skipped_and_clean_slither(self) -> None:
         from E2E.phase5_verifier.tool_matrix import _evaluate_tool_result, _policy_verdict

@@ -481,6 +481,7 @@ SELF_CHECK_TEXT = {
     "PASS": "Repair-loop self-check passed (compiler, neural detector, static/RAG re-run)",
     "FLAGGED": "Repair-loop self-check: the neural detector still flags the patched unit",
     "NOT_PATCHED": "Not patched",
+    "UNVERIFIED": "Patched; not verified (verification disabled for this run)",
 }
 
 

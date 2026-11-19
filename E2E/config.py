@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -14,7 +15,10 @@ DATA_DIR = PROJECT_ROOT / "data"
 KNOWLEDGE_SOURCE_DIR = DATA_DIR / "knowledge_base" / "source"
 VULNERABILITY_KNOWLEDGE_PATH = KNOWLEDGE_SOURCE_DIR / "final-vulnerability-knowledge.json"
 BASELINE_TAXONOMY_PATH = KNOWLEDGE_SOURCE_DIR / "baseline_taxonomy.json"
-KNOWLEDGE_BASE_DIR = DATA_DIR / "knowledge_base" / "built"      # read by Phase 1B (RAG) and Phase 2 (Advisor)
+# Built knowledge base read by Phase 1B (RAG) and Phase 2 (Advisor). The environment variable
+# RAG_KNOWLEDGE_BASE_DIR selects another build (fix_eval/ uses built_no_test/, the KB without the test split);
+# it is read once, when E2E.config is first imported, so it must be set before that.
+KNOWLEDGE_BASE_DIR = Path(os.environ.get("RAG_KNOWLEDGE_BASE_DIR") or DATA_DIR / "knowledge_base" / "built")
 SMARTBUGS_WILD_DIR = DATA_DIR / "smartbugs_wild"                # 3 reference contracts of tests/test_benchmark_regression.py
 
 # ── Results ──────────────────────────────────────────────────────────────────

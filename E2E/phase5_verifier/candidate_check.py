@@ -8,6 +8,7 @@ Three channels, all on the patched source:
   3. static + RAG: Phase 1A/1B re-run; a targeted finding that is still there, or a
      new High/Critical finding in a patched unit, fails the candidate.
 A failing candidate produces feedback text for the next Fixer attempt.
+With verification disabled (--no-verify) the loop records `unverified_candidate()` instead.
 """
 
 from __future__ import annotations
@@ -169,6 +170,35 @@ def verify_candidate(
         "failing_units": sorted(failing_units),
         "compile_culprit_units": sorted(compile_culprits),
         "max_vulnerability_probability": round(max(scored_targets), 4) if scored_targets else None,
+    }
+
+
+# Nhiệm vụ: kết quả của một candidate KHI TẮT KIỂM CHỨNG (CLI --no-verify -> request.execution.verify = false):
+# cùng các khoá với verify_candidate nhưng passed = None (chưa biết), compiler "skipped", không chấm lại detector,
+# không chạy lại static/RAG.
+# Mục đích: vòng sửa vẫn ghi đủ một attempt cho báo cáo, còn bản vá của Fixer được trả về nguyên trạng.
+# Gọi bởi: gpu_pipeline.run_server_gpu_pipeline (chỉ khi verify = false).
+def unverified_candidate() -> dict[str, Any]:
+    """Candidate record when verification is disabled: same keys as verify_candidate, nothing was checked."""
+    return {
+        "passed": None,
+        "compilation": {
+            "state": "skipped",
+            "failed": False,
+            "compiler": None,
+            "selection_reason": "verification disabled for this run",
+            "baseline_failed": False,
+            "error": "",
+        },
+        "unit_results": [],
+        "detector_failing_units": [],
+        "unverified_units": [],
+        "residual_findings": [],
+        "introduced_findings": [],
+        "channel_errors": {},
+        "failing_units": [],
+        "compile_culprit_units": [],
+        "max_vulnerability_probability": None,
     }
 
 

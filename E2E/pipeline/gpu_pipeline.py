@@ -17,6 +17,8 @@ Input: request.json written by the orchestrator (source, code units, Phase 1A/1B
       problems back to the Fixer, at most MAX_FIX_ATTEMPTS (config.py) attempts
                                                         -> phase5_verifier/candidate_check.py
 The final verification (Slither, AST) and the report (Phase 6) run afterwards in the orchestrator.
+With request.execution.verify = false (CLI --no-verify) step 5 is skipped: the Fixer makes one
+attempt and its patch is returned unverified.
 """
 
 from __future__ import annotations
@@ -34,7 +36,12 @@ from E2E.phase2_advisor.advisor import RepairKnowledgeBase
 from E2E.phase2_advisor.advisor_phase import _generate_advisor_section
 from E2E.phase3_assessor.assessor_phase import _generate_assessor_section
 from E2E.phase4_fixer.fixer import _build_rag_knowledge_section, _splice_unit, patch_unit
-from E2E.phase5_verifier.candidate_check import _finding_pairs, _verification_feedback, verify_candidate
+from E2E.phase5_verifier.candidate_check import (
+    _finding_pairs,
+    _verification_feedback,
+    unverified_candidate,
+    verify_candidate,
+)
 
 
 # In log có kèm giờ (web app đọc dòng "[PHASE x]" này để cập nhật tiến độ).
@@ -55,6 +62,8 @@ def _log(message: str) -> None:
 #       rồi verify_candidate kiểm tra compile + detector + static/RAG chạy lại.
 #       Chưa đạt -> tạo feedback; lần sau giữ lại các bản vá đã đạt, chỉ vá lại các hàm còn lỗi TỪ MÃ GỐC.
 #       Chọn attempt tốt nhất theo (compile được, ít hàm lỗi, nhiều hàm vá, ít thay đổi độ dài).
+#       Tắt kiểm chứng (request.execution.verify = false, CLI --no-verify): Fixer vá đúng 1 lần, không verify_candidate,
+#       verdict vòng sửa NOT_VERIFIED, hàm đã vá có trạng thái UNVERIFIED.
 # Trả về server_result: phases {detector, advisor, assessor, fixer, verifier} (bản vá ở phases.fixer, kết luận vòng sửa
 # PASS/WARN/NOT_APPLICABLE ở phases.verifier.overall_verdict), thời gian từng phần.
 # Gọi bởi: orchestrator.main.
@@ -81,6 +90,10 @@ def run_server_gpu_pipeline(
         max(1, int((execution.get("repair") or {}).get("max_attempts") or MAX_FIX_ATTEMPTS)),
         MAX_FIX_ATTEMPTS,
     )
+    # Phase 5 switched off (fix evaluation): without verification there is no feedback, so one attempt only.
+    verify = bool(execution.get("verify", True))
+    if not verify:
+        max_attempts = 1
     local_phase1 = request.get("local_phase1", {})
     static_p1 = local_phase1.get("static", {})
     rag_p1 = local_phase1.get("rag", {})
@@ -193,23 +206,27 @@ def run_server_gpu_pipeline(
             str(item.get("unit_id")) for item in outcomes
             if item.get("status") == "applied" and item.get("unit_id")
         }
-        _log(f"[PHASE 5] Verifying candidate ({label}): compiler + neural detector + static/RAG re-run...")
-        verification = verify_candidate(
-            source_code,
-            current_code,
-            patched_unit_ids=patched_ids,
-            target_unit_ids=target_unit_ids,
-            original_unit_results=unit_results,
-            target_pairs=target_pairs,
-            known_pairs=known_pairs,
-            threshold=detector_threshold,
-            server_url=server_url,
-        )
+        if verify:
+            _log(f"[PHASE 5] Verifying candidate ({label}): compiler + neural detector + static/RAG re-run...")
+            verification = verify_candidate(
+                source_code,
+                current_code,
+                patched_unit_ids=patched_ids,
+                target_unit_ids=target_unit_ids,
+                original_unit_results=unit_results,
+                target_pairs=target_pairs,
+                known_pairs=known_pairs,
+                threshold=detector_threshold,
+                server_url=server_url,
+            )
+        else:
+            _log(f"[PHASE 5] Skipped ({label}): verification disabled for this run (--no-verify).")
+            verification = unverified_candidate()
         record = {
             "attempt": attempt,
             "max_attempts": max_attempts,
             "threshold": detector_threshold,
-            "verdict": "Safe" if verification["passed"] else "Vulnerable",
+            "verdict": ("Safe" if verification["passed"] else "Vulnerable") if verify else "Not verified",
             "code": current_code,
             "patch_outcomes": outcomes,
             **verification,
@@ -223,10 +240,11 @@ def run_server_gpu_pipeline(
         )
         if best is None or score > best["_score"]:
             best = {**record, "_score": score}
-        _log(
-            f"[PHASE 5] {label}: {'PASSED' if verification['passed'] else 'FAILED'} "
-            f"(compile={verification['compilation']['state']}, failing={verification['failing_units']})."
-        )
+        if verify:
+            _log(
+                f"[PHASE 5] {label}: {'PASSED' if verification['passed'] else 'FAILED'} "
+                f"(compile={verification['compilation']['state']}, failing={verification['failing_units']})."
+            )
         if verification["passed"]:
             break
         if attempt == max_attempts:
@@ -270,10 +288,10 @@ def run_server_gpu_pipeline(
         fixed_code = best["code"]
         patch_outcomes = best["patch_outcomes"]
         final_verification = best
-        overall_verdict = "PASS" if best["passed"] else "WARN"
+        overall_verdict = ("PASS" if best["passed"] else "WARN") if verify else "NOT_VERIFIED"
     _log(f"[PHASE 5] Completed: verdict {overall_verdict} after {len(attempts)} attempt(s).")
 
-    if final_verification is not None:
+    if final_verification is not None and verify:
         fixed_detector = summarize_detector(
             [item for item in final_verification["unit_results"] if item["unit_id"] in target_unit_ids],
             detector_threshold,
@@ -286,7 +304,10 @@ def run_server_gpu_pipeline(
             "vulnerability_probability": None,
             "threshold": detector_threshold,
             "unit_results": [],
-            "reason": "No function-level repair target.",
+            "reason": (
+                "No function-level repair target." if final_verification is None
+                else "Verification disabled for this run (--no-verify)."
+            ),
         }
 
     patched_ids = {
@@ -301,6 +322,8 @@ def run_server_gpu_pipeline(
         # failing_final; it must be reported as NOT_PATCHED, not as a patch that failed.
         if unit_id not in patched_ids:
             status = "NOT_PATCHED"
+        elif not verify:
+            status = "UNVERIFIED"
         elif unit_id in failing_final:
             status = "FLAGGED"
         else:
@@ -331,8 +354,11 @@ def run_server_gpu_pipeline(
             "patch_outcomes": patch_outcomes,
         },
         "verifier": {
-            "status": "ok",
-            "verification_model": "solc baseline + Qwen2.5-Coder-14B v13 detector + static/RAG re-run",
+            "status": "ok" if verify else "disabled",
+            "verification_model": (
+                "solc baseline + Qwen2.5-Coder-14B v13 detector + static/RAG re-run" if verify
+                else "disabled for this run (--no-verify)"
+            ),
             "overall_verdict": overall_verdict,
             "verifications": verifier_items,
             "attempts_count": len(attempts),

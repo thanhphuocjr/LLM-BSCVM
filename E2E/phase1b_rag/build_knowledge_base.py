@@ -1,27 +1,12 @@
-"""
-Offline step - build the vulnerability knowledge base used by Phase 1B (RAG) and Phase 2 (Advisor).
+"""Bước offline - xây cơ sở tri thức cho Phase 1B/2: data/knowledge_base/source -> built (tất định, byte-identical).
 
     .venv/bin/python -m E2E.phase1b_rag.build_knowledge_base
-
-Input  (data/knowledge_base/source/):
-  final-vulnerability-knowledge.json  vulnerable functions with SWC, root cause, fixed code
-  baseline_taxonomy.json              SWC Registry descriptions / remediations (37 SWC)
-Output (data/knowledge_base/built/):
-  knowledge_items.json    one retrievable case per vulnerable function (11,869)
-  swc_registry.json       37 SWC entries enriched with the dataset's evidence
-  swc_vectorizer.joblib   TF-IDF (char 3-5 gram) vectorizer
-  swc_matrix.npz          TF-IDF matrix of the cases
-  knowledge_manifest.json counts + sources
-The build is deterministic: the same inputs give byte-identical artifacts.
 """
 
-from __future__ import annotations
-
 import argparse
-from collections import Counter, defaultdict
 import json
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any
 
 import joblib
 from scipy.sparse import save_npz
@@ -29,317 +14,155 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 from E2E.common.io_utils import utc_now, write_json
 from E2E.common.regex_patterns import (
-    RE_BULLET_PREFIX,
-    RE_MARKDOWN_CODE_BLOCK,
-    RE_MARKDOWN_LINK,
-    RE_MARKDOWN_SYMBOLS,
-    RE_SENTENCE_BREAK,
-    RE_WHITESPACE,
+    RE_BULLET_PREFIX, RE_MARKDOWN_CODE_BLOCK, RE_MARKDOWN_LINK, RE_MARKDOWN_SYMBOLS, RE_SENTENCE_BREAK, RE_WHITESPACE,
 )
-from E2E.config import (
-    BASELINE_TAXONOMY_PATH,
-    KNOWLEDGE_BASE_DIR,
-    VULNERABILITY_KNOWLEDGE_PATH,
-)
-from E2E.phase1b_rag.swc_agents import (
-    SEVERITY_BY_SWC,
-    SIGNAL_PATTERNS_BY_SWC,
-    normalize_swc_id,
-)
+from E2E.config import BASELINE_TAXONOMY_PATH, KNOWLEDGE_BASE_DIR, VULNERABILITY_KNOWLEDGE_PATH
+from E2E.phase1b_rag.swc_agents import SEVERITY_BY_SWC, SIGNAL_PATTERNS_BY_SWC, normalize_swc_id
 
 
 # Bỏ code block, link, ký hiệu Markdown -> văn bản thuần.
 def clean_markdown(value: str) -> str:
-    value = RE_MARKDOWN_CODE_BLOCK.sub(" ", value)
-    value = RE_MARKDOWN_LINK.sub(r"\1", value)
-    value = RE_MARKDOWN_SYMBOLS.sub(" ", value)
+    value = RE_MARKDOWN_SYMBOLS.sub(" ", RE_MARKDOWN_LINK.sub(r"\1", RE_MARKDOWN_CODE_BLOCK.sub(" ", value)))
     return RE_WHITESPACE.sub(" ", value).strip()
 
 
-# Tách phần hướng dẫn sửa lỗi thành danh sách gạch đầu dòng (tối đa 4 câu nếu không có bullet).
+# Tách hướng dẫn sửa lỗi thành danh sách gạch đầu dòng (không có bullet thì tối đa 4 câu).
 def checklist(remediation: str) -> list[str]:
-    items = []
-    for line in remediation.splitlines():
-        item = RE_BULLET_PREFIX.sub("", line).strip()
-        if item and item != line.strip():
-            items.append(clean_markdown(item))
+    items = [clean_markdown(item) for line in remediation.splitlines()
+             if (item := RE_BULLET_PREFIX.sub("", line).strip()) and item != line.strip()]
     if items:
         return items
     text = clean_markdown(remediation)
-    if not text:
-        return []
     sentences = [s.strip() for s in RE_SENTENCE_BREAK.split(text) if len(s.strip()) > 10]
-    return sentences[:4] if len(sentences) > 1 else [text]
+    return [] if not text else sentences[:4] if len(sentences) > 1 else [text]
 
 
-# [BƯỚC OFFLINE] Dựng 2 dạng tri thức đồng bộ từ data/knowledge_base/source/:
-#   1) knowledge_items: mỗi hàm lỗi (is_vulnerable) là một "ca" có SWC, root cause, lập luận audit, cách sửa,
-#      mã lỗi, mã đã sửa và retrieval_text (văn bản để vector hoá TF-IDF);
-#   2) registry_records: 37 mục SWC-100..136, làm giàu bằng dữ liệu (tiêu đề/root cause/cách sửa phổ biến nhất,
-#      tối đa 3 mẫu có bản vá); SWC không có dữ liệu lấy mô tả từ baseline_taxonomy.json và được thêm 1 item
-#      "nền" để vẫn truy hồi được.
-def build_knowledge_items(
-    knowledge_file: Path,
-    baseline_taxonomy_file: Path,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Builds two synchronized knowledge representations:
-    1. knowledge_items: List of granular function-level vulnerability cases for TF-IDF RAG retrieval.
-    2. registry_records: 37 SWC taxonomy entries enriched with dataset empirical evidence.
-    """
-    raw_data: list[dict[str, Any]] = []
-    if knowledge_file.exists():
-        with knowledge_file.open("r", encoding="utf-8") as f:
-            raw_data = json.load(f)
+# Ghép các phần khác rỗng thành văn bản để vector hoá TF-IDF.
+def _retrieval_text(*parts: str) -> str:
+    return "\n".join(filter(None, parts))
 
-    baseline_tax: dict[str, Any] = {}
-    if baseline_taxonomy_file.exists():
-        with baseline_taxonomy_file.open("r", encoding="utf-8") as f:
-            baseline_tax = json.load(f)
 
-    # Filter vulnerable items
-    vuln_items = [x for x in raw_data if x.get("is_vulnerable")]
-    by_swc: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    knowledge_items: list[dict[str, Any]] = []
+# Giá trị phổ biến nhất của một trường trong các ca (bỏ rỗng / bỏ giá trị `skip`); không có -> default.
+def _most_common(items: list[dict], key: str, default: str = "", skip: str | None = None) -> str:
+    counter = Counter(item[key] for item in items if item[key] and item[key] != skip)
+    return counter.most_common(1)[0][0] if counter else default
 
-    for idx, item in enumerate(vuln_items):
-        swc = normalize_swc_id(item.get("swc_id")) or "SWC-100"
-        title = str(item.get("vulnerability_type") or swc).strip()
-        severity = str(item.get("severity") or SEVERITY_BY_SWC.get(swc, "Medium")).strip()
-        root_cause = str(item.get("root_cause") or "").strip()
-        audit_reasoning = str(item.get("audit_reasoning") or "").strip()
-        mitigation = str(item.get("mitigation_guidance") or "").strip()
-        vulnerable_code = str(item.get("vulnerable_code") or "").strip()
-        fixed_code = str(item.get("fixed_code") or "").strip()
-        item_id = str(item.get("id") or f"know_{idx + 1:05d}")
 
-        retrieval_text = "\n".join(
-            filter(
-                None,
-                [
-                    swc,
-                    title,
-                    root_cause,
-                    audit_reasoning,
-                    mitigation,
-                    vulnerable_code,
-                ],
-            )
-        )
+# Một "ca" lỗ hổng từ một hàm lỗi của dataset: SWC, root cause, lập luận audit, cách sửa, mã lỗi / mã đã sửa.
+def _knowledge_item(index: int, item: dict) -> dict:
+    swc = normalize_swc_id(item.get("swc_id")) or "SWC-100"
+    fields = {key: str(item.get(key) or "").strip()
+              for key in ("root_cause", "audit_reasoning", "mitigation_guidance", "vulnerable_code", "fixed_code")}
+    title = str(item.get("vulnerability_type") or swc).strip()
+    return {
+        "id": str(item.get("id") or f"know_{index + 1:05d}"), "swc": swc, "title": title,
+        "severity": str(item.get("severity") or SEVERITY_BY_SWC.get(swc, "Medium")).strip(),
+        "root_cause": fields["root_cause"], "description": fields["audit_reasoning"],
+        "remediation": fields["mitigation_guidance"], "checklist": checklist(fields["mitigation_guidance"]),
+        "vulnerable_code": fields["vulnerable_code"], "fixed_code": fields["fixed_code"],
+        "has_code_patch": bool(item.get("has_code_patch", bool(fields["fixed_code"]))),
+        "cwe_ids": item.get("cwe_ids") or [], "contract_name": str(item.get("contract_name") or ""),
+        "function_name": str(item.get("function_name") or ""),
+        "source": str(item.get("source") or "final_vulnerability_knowledge"),
+        "retrieval_text": _retrieval_text(swc, title, fields["root_cause"], fields["audit_reasoning"],
+                                          fields["mitigation_guidance"], fields["vulnerable_code"]),
+    }
 
-        record = {
-            "id": item_id,
-            "swc": swc,
-            "title": title,
-            "severity": severity,
-            "root_cause": root_cause,
-            "description": audit_reasoning,
-            "remediation": mitigation,
-            "checklist": checklist(mitigation),
-            "vulnerable_code": vulnerable_code,
-            "fixed_code": fixed_code,
-            "has_code_patch": bool(item.get("has_code_patch", bool(fixed_code))),
-            "cwe_ids": item.get("cwe_ids") or [],
-            "contract_name": str(item.get("contract_name") or ""),
-            "function_name": str(item.get("function_name") or ""),
-            "source": str(item.get("source") or "final_vulnerability_knowledge"),
-            "retrieval_text": retrieval_text,
-        }
-        knowledge_items.append(record)
-        by_swc[swc].append(record)
 
-    # Process 37 SWCs to build swc_registry.json
-    all_swc_ids = [f"SWC-{i:03d}" for i in range(100, 137)]
-    registry_records: list[dict[str, Any]] = []
+# Mục registry của một SWC CÓ dữ liệu: tiêu đề / root cause / mô tả / cách sửa phổ biến nhất + tối đa 3 mẫu có bản vá.
+def _registry_record(swc: str, items: list[dict], info: dict, patterns: list[str]) -> dict:
+    title = _most_common(items, "title", info.get("title") or swc, skip=swc)
+    remediation = _most_common(items, "remediation", info.get("remediation") or "")
+    description = _most_common(items, "description", info.get("description") or "")
+    root_cause = _most_common(items, "root_cause")
+    samples = [{"vulnerable": x["vulnerable_code"], "fixed": x["fixed_code"], "function_name": x["function_name"],
+                "root_cause": x["root_cause"]} for x in items if x["vulnerable_code"] and x["fixed_code"]][:3]
+    return {
+        "id": swc, "title": title, "description": description, "root_cause": root_cause, "remediation": remediation,
+        "checklist": checklist(remediation), "severity": SEVERITY_BY_SWC.get(swc, "Medium"),
+        "signal_patterns": patterns,
+        "sample_count": len(items), "samples": samples, "source": "final_vulnerability_knowledge",
+        "retrieval_text": _retrieval_text(swc, title, root_cause, description, remediation, " ".join(patterns),
+                                          "\n".join(x["vulnerable"] for x in samples)),
+    }
 
-    for swc in all_swc_ids:
+
+# SWC KHÔNG có dữ liệu: mục registry + một ca "nền" lấy từ baseline_taxonomy.json (để vẫn truy hồi được).
+def _baseline_records(swc: str, info: dict, patterns: list[str]) -> tuple[dict, dict]:
+    title = info.get("title") or swc
+    description, remediation = info.get("description") or "", info.get("remediation") or ""
+    samples = [s["vulnerable"] for s in info.get("samples", []) if s.get("vulnerable")]
+    items = info.get("checklist") or (checklist(remediation) if remediation else [])
+    text = _retrieval_text(swc, title, description, remediation, " ".join(patterns), "\n".join(samples[:4]))
+    severity = SEVERITY_BY_SWC.get(swc, "Medium")
+    registry = {"id": swc, "title": title, "description": description, "root_cause": "", "remediation": remediation,
+                "checklist": items, "severity": severity, "signal_patterns": patterns, "sample_count": len(samples),
+                "samples": [{"vulnerable": s, "fixed": ""} for s in samples[:2]], "source": "swc_baseline_taxonomy",
+                "retrieval_text": text}
+    knowledge = {"id": f"baseline_{swc.lower()}", "swc": swc, "title": title, "severity": severity, "root_cause": "",
+                 "description": description, "remediation": remediation, "checklist": items,
+                 "vulnerable_code": samples[0] if samples else "", "fixed_code": "", "has_code_patch": False,
+                 "cwe_ids": [], "contract_name": "", "function_name": "", "source": "swc_baseline_taxonomy",
+                 "retrieval_text": text}
+    return registry, knowledge
+
+
+# Dựng 2 dạng tri thức đồng bộ: knowledge_items (mỗi hàm lỗi một ca) + registry_records (37 mục SWC-100..136).
+def build_knowledge_items(knowledge_file: Path, baseline_taxonomy_file: Path) -> tuple[list[dict], list[dict]]:
+    raw_data = json.loads(knowledge_file.read_text(encoding="utf-8")) if knowledge_file.exists() else []
+    taxonomy = json.loads(baseline_taxonomy_file.read_text(encoding="utf-8")) if baseline_taxonomy_file.exists() else {}
+    vulnerable = [item for item in raw_data if item.get("is_vulnerable")]
+    knowledge_items = [_knowledge_item(index, item) for index, item in enumerate(vulnerable)]
+    by_swc = defaultdict(list)
+    for record in knowledge_items:
+        by_swc[record["swc"]].append(record)
+    registry_records = []
+    for swc in (f"SWC-{number:03d}" for number in range(100, 137)):
         patterns = list(SIGNAL_PATTERNS_BY_SWC.get(swc, ()))
-
-        # SWC Registry baseline (title / description / remediation / samples), if the taxonomy has this SWC
-        info = baseline_tax.get(swc, {})
-        base_title = info.get("title") or swc
-        base_desc = info.get("description") or ""
-        base_remediation = info.get("remediation") or ""
-        base_checklist_items = info.get("checklist") or []
-        base_code_samples = [s["vulnerable"] for s in info.get("samples", []) if s.get("vulnerable")]
-
         if swc in by_swc:
-            items = by_swc[swc]
-            title_counter = Counter(x["title"] for x in items if x["title"] and x["title"] != swc)
-            title = title_counter.most_common(1)[0][0] if title_counter else base_title or swc
-
-            rc_counter = Counter(x["root_cause"] for x in items if x["root_cause"])
-            top_rc = rc_counter.most_common(1)[0][0] if rc_counter else ""
-
-            rem_counter = Counter(x["remediation"] for x in items if x["remediation"])
-            top_remediation = rem_counter.most_common(1)[0][0] if rem_counter else base_remediation
-
-            desc_counter = Counter(x["description"] for x in items if x["description"])
-            top_desc = desc_counter.most_common(1)[0][0] if desc_counter else base_desc
-
-            samples_with_patch = [
-                {
-                    "vulnerable": x["vulnerable_code"],
-                    "fixed": x["fixed_code"],
-                    "function_name": x["function_name"],
-                    "root_cause": x["root_cause"],
-                }
-                for x in items
-                if x["vulnerable_code"] and x["fixed_code"]
-            ][:3]
-
-            retrieval_text = "\n".join(
-                filter(
-                    None,
-                    [
-                        swc,
-                        title,
-                        top_rc,
-                        top_desc,
-                        top_remediation,
-                        " ".join(patterns),
-                        "\n".join(x["vulnerable"] for x in samples_with_patch),
-                    ],
-                )
-            )
-
-            registry_records.append(
-                {
-                    "id": swc,
-                    "title": title,
-                    "description": top_desc,
-                    "root_cause": top_rc,
-                    "remediation": top_remediation,
-                    "checklist": checklist(top_remediation),
-                    "severity": SEVERITY_BY_SWC.get(swc, "Medium"),
-                    "signal_patterns": patterns,
-                    "sample_count": len(items),
-                    "samples": samples_with_patch,
-                    "source": "final_vulnerability_knowledge",
-                    "retrieval_text": retrieval_text,
-                }
-            )
+            registry_records.append(_registry_record(swc, by_swc[swc], taxonomy.get(swc, {}), patterns))
         else:
-            retrieval_text = "\n".join(
-                filter(
-                    None,
-                    [
-                        swc,
-                        base_title,
-                        base_desc,
-                        base_remediation,
-                        " ".join(patterns),
-                        "\n".join(base_code_samples[:4]),
-                    ],
-                )
-            )
-            reg_item = {
-                "id": swc,
-                "title": base_title,
-                "description": base_desc,
-                "root_cause": "",
-                "remediation": base_remediation,
-                "checklist": base_checklist_items or (checklist(base_remediation) if base_remediation else []),
-                "severity": SEVERITY_BY_SWC.get(swc, "Medium"),
-                "signal_patterns": patterns,
-                "sample_count": len(base_code_samples),
-                "samples": [{"vulnerable": s, "fixed": ""} for s in base_code_samples[:2]],
-                "source": "swc_baseline_taxonomy",
-                "retrieval_text": retrieval_text,
-            }
-            registry_records.append(reg_item)
-
-            knowledge_items.append(
-                {
-                    "id": f"baseline_{swc.lower()}",
-                    "swc": swc,
-                    "title": base_title,
-                    "severity": SEVERITY_BY_SWC.get(swc, "Medium"),
-                    "root_cause": "",
-                    "description": base_desc,
-                    "remediation": base_remediation,
-                    "checklist": base_checklist_items or (checklist(base_remediation) if base_remediation else []),
-                    "vulnerable_code": base_code_samples[0] if base_code_samples else "",
-                    "fixed_code": "",
-                    "has_code_patch": False,
-                    "cwe_ids": [],
-                    "contract_name": "",
-                    "function_name": "",
-                    "source": "swc_baseline_taxonomy",
-                    "retrieval_text": retrieval_text,
-                }
-            )
-
+            registry, knowledge = _baseline_records(swc, taxonomy.get(swc, {}), patterns)
+            registry_records.append(registry)
+            knowledge_items.append(knowledge)
     return knowledge_items, registry_records
 
 
-# Nhiệm vụ: gọi build_knowledge_items rồi fit TfidfVectorizer (char_wb 3-5 gram, tối đa 60k đặc trưng)
-# trên retrieval_text, ghi ra data/knowledge_base/built/: swc_vectorizer.joblib, swc_matrix.npz,
-# knowledge_items.json, swc_registry.json, knowledge_manifest.json.
-# Mục đích: tạo "bộ nhớ" mà Phase 1B (retriever) và Phase 2 (Advisor) đọc khi chạy. Kết quả tất định (byte-identical).
-def build_knowledge_base(
-    knowledge_file: Path,
-    output_dir: Path,
-    baseline_taxonomy_file: Path = BASELINE_TAXONOMY_PATH,
-) -> dict[str, Any]:
+# [BƯỚC OFFLINE] Dựng tri thức -> fit TF-IDF (char_wb 3-5 gram, 60k đặc trưng) -> ghi 5 artifact vào output_dir.
+def build_knowledge_base(knowledge_file: Path, output_dir: Path,
+                         baseline_taxonomy_file: Path = BASELINE_TAXONOMY_PATH) -> dict:
     knowledge_items, registry_records = build_knowledge_items(knowledge_file, baseline_taxonomy_file)
     if not knowledge_items:
         raise RuntimeError("No knowledge items could be constructed.")
-
     output_dir.mkdir(parents=True, exist_ok=True)
-    vectorizer = TfidfVectorizer(
-        analyzer="char_wb",
-        ngram_range=(3, 5),
-        min_df=2,
-        max_features=60000,
-        sublinear_tf=True,
-        lowercase=True,
-        norm="l2",
-    )
+    vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=2, max_features=60000,
+                                 sublinear_tf=True, lowercase=True, norm="l2")
     matrix = vectorizer.fit_transform(record["retrieval_text"] for record in knowledge_items)
-
     joblib.dump(vectorizer, output_dir / "swc_vectorizer.joblib")
     save_npz(output_dir / "swc_matrix.npz", matrix)
     write_json(output_dir / "knowledge_items.json", knowledge_items)
     write_json(output_dir / "swc_registry.json", registry_records)
-
     manifest = {
-        "built_at": utc_now(),
-        "knowledge_items_count": len(knowledge_items),
-        "registry_records_count": len(registry_records),
-        "matrix_shape": list(matrix.shape),
+        "built_at": utc_now(), "knowledge_items_count": len(knowledge_items),
+        "registry_records_count": len(registry_records), "matrix_shape": list(matrix.shape),
         "knowledge_source": str(knowledge_file) if knowledge_file.exists() else "none",
         "baseline_taxonomy_source": str(baseline_taxonomy_file) if baseline_taxonomy_file.exists() else "none",
-        "artifacts": [
-            "knowledge_items.json",
-            "swc_registry.json",
-            "swc_vectorizer.joblib",
-            "swc_matrix.npz",
-        ],
+        "artifacts": ["knowledge_items.json", "swc_registry.json", "swc_vectorizer.joblib", "swc_matrix.npz"],
         "version": "2.0.0",
     }
     write_json(output_dir / "knowledge_manifest.json", manifest)
     return manifest
 
 
-# Tham số CLI: --knowledge-file, --baseline-taxonomy, --output-dir.
-def parse_args() -> argparse.Namespace:
+# Điểm vào CLI: --knowledge-file, --baseline-taxonomy, --output-dir -> build và in manifest.
+def main() -> None:
     parser = argparse.ArgumentParser(description="Build the vulnerability knowledge store and TF-IDF artifacts.")
-    parser.add_argument(
-        "--knowledge-file",
-        type=Path,
-        default=VULNERABILITY_KNOWLEDGE_PATH,
-        help="Path to final-vulnerability-knowledge.json",
-    )
+    parser.add_argument("--knowledge-file", type=Path, default=VULNERABILITY_KNOWLEDGE_PATH,
+                        help="Path to final-vulnerability-knowledge.json")
     parser.add_argument("--baseline-taxonomy", type=Path, default=BASELINE_TAXONOMY_PATH)
     parser.add_argument("--output-dir", type=Path, default=KNOWLEDGE_BASE_DIR)
-    return parser.parse_args()
-
-
-# Điểm vào: `python -m E2E.phase1b_rag.build_knowledge_base` -> build và in manifest.
-def main() -> None:
-    args = parse_args()
-    manifest = build_knowledge_base(args.knowledge_file, args.output_dir, args.baseline_taxonomy)
-    print(json.dumps(manifest, indent=2))
+    args = parser.parse_args()
+    print(json.dumps(build_knowledge_base(args.knowledge_file, args.output_dir, args.baseline_taxonomy), indent=2))
 
 
 if __name__ == "__main__":

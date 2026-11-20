@@ -1,58 +1,90 @@
-"""SWC signal agents shared by the static runner and the local RAG retriever.
-
-One agent per SWC registry entry: regex signal patterns, per-SWC severity and the
-custom context checks (guards, checked low-level calls, pragma) that gate a hit.
-"""
-
-from __future__ import annotations
+"""Phase 1B - 37 SWC agent: regex tín hiệu + luật ngữ cảnh "gác cổng" từng SWC (dùng chung cho RAG và static)."""
 
 import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Sequence
 
 from E2E.common.regex_patterns import (
-    RE_ACCESS_CONTROL_GUARD,
-    RE_ADMIN_WITHDRAW_FUNCTION,
-    RE_ANY_CODE_FENCE,
-    RE_ARITHMETIC_OPERATION,
-    RE_BOOL_ASSIGNED_CALL_RESULT,
-    RE_BOOL_TUPLE_RESULT,
-    RE_CALL_INSIDE_REQUIRE,
-    RE_CAPITALIZED_FUNCTION,
-    RE_CONTRACT_BALANCE,
-    RE_DELEGATECALL_OR_CALLCODE,
-    RE_ETHER_TRANSFER,
-    RE_EXTERNAL_CALL,
-    RE_FLOATING_PRAGMA,
-    RE_FUNCTION_WITHOUT_VISIBILITY,
-    RE_LOOP_BODY,
-    RE_LOW_LEVEL_CALL,
-    RE_NARROW_INT_CAST,
-    RE_PRAGMA_SPEC_ANY_CASE,
-    RE_REENTRANCY_GUARD,
-    RE_SAFEMATH,
-    RE_SELFDESTRUCT_CALL,
-    RE_SENSITIVE_STATE_VALUE,
-    RE_SINGLE_EQUALS,
-    RE_STATE_UPDATE,
-    RE_SWC_ID,
-    RE_UNCHECKED_BLOCK,
-    RE_USER_BALANCE_GUARD,
-    RE_VALUE_CALL_OR_SEND,
-    RE_VERSION_NUMBER,
-    RE_WHITESPACE,
-    re_condition_opening,
-    re_result_check,
+    RE_ACCESS_CONTROL_GUARD, RE_ADMIN_WITHDRAW_FUNCTION, RE_ANY_CODE_FENCE, RE_ARITHMETIC_OPERATION,
+    RE_BOOL_ASSIGNED_CALL_RESULT, RE_BOOL_TUPLE_RESULT, RE_CALL_INSIDE_REQUIRE, RE_CAPITALIZED_FUNCTION,
+    RE_CONTRACT_BALANCE, RE_DELEGATECALL_OR_CALLCODE, RE_ETHER_TRANSFER, RE_EXTERNAL_CALL, RE_FLOATING_PRAGMA,
+    RE_FUNCTION_WITHOUT_VISIBILITY, RE_LOOP_BODY, RE_LOW_LEVEL_CALL, RE_NARROW_INT_CAST, RE_PRAGMA_SPEC_ANY_CASE,
+    RE_REENTRANCY_GUARD, RE_SAFEMATH, RE_SELFDESTRUCT_CALL, RE_SENSITIVE_STATE_VALUE, RE_SINGLE_EQUALS, RE_STATE_UPDATE,
+    RE_SWC_ID, RE_UNCHECKED_BLOCK, RE_USER_BALANCE_GUARD, RE_VALUE_CALL_OR_SEND, RE_VERSION_NUMBER, RE_WHITESPACE,
+    re_condition_opening, re_result_check,
 )
 from E2E.config import KNOWLEDGE_BASE_DIR
+from E2E.phase0_parsing.code_units import matching_close
 
 DEFAULT_SWC_REGISTRY = KNOWLEDGE_BASE_DIR / "swc_registry.json"
+# Mức nghiêm trọng theo SWC (SWC không có trong bảng = Medium).
+SEVERITY_BY_SWC = {
+    "SWC-104": "Critical", "SWC-105": "Critical", "SWC-106": "Critical", "SWC-107": "Critical", "SWC-112": "Critical",
+    "SWC-115": "Critical", "SWC-101": "High", "SWC-113": "High", "SWC-114": "High", "SWC-121": "High",
+    "SWC-122": "High", "SWC-124": "High", "SWC-126": "High", "SWC-128": "High",
+}
+# Số tín hiệu tối thiểu để agent kích hoạt (SWC ngoài bảng: 1 nếu có <= 1 pattern, ngược lại 2).
+MIN_SIGNAL_HITS_BY_SWC = {**{f"SWC-{n}": 1 for n in (100, 101, 102, 103, 104, 105, 106, 107, 112, 113, 115, 118, 123,
+                                                       129, 136)}, "SWC-120": 2, "SWC-121": 2, "SWC-122": 2}
+# Regex tín hiệu chung của từng SWC (ghi nguyên chuỗi vào swc_registry.json khi build KB).
+SIGNAL_PATTERNS_BY_SWC: dict[str, Sequence[str]] = {
+    "SWC-100": (r"function\s+\w+\s*\([^)]*\)\s*(?:returns\s*\([^)]*\)\s*)?\{",),
+    "SWC-101": (r"pragma\s+solidity\s+[^;]*0\.[0-7]\.", r"\bSafeMath\b", r"\bunchecked\s*\{",
+                r"\buint(?:8|16|32|64|128)\s*\(", r"\bint(?:8|16|32|64|128)\s*\(", r"\w+\s*/\s*\w+\s*\*\s*\w+",
+                r"\buint\w*\s+\w+\s*=\s*\w+\s*(?:\+|-|\*)\s*\w+", r"\b1e18\b|\b10\s*\*\*\s*18\b|\bdecimals\s*\("),
+    "SWC-102": (r"pragma\s+solidity\s+[^;]*0\.[0-7]\.",),
+    "SWC-103": (r"pragma\s+solidity\s+\^", r"pragma\s+solidity\s+>="),
+    "SWC-104": (r"\.call\s*[\(\{]", r"\.delegatecall\s*\(", r"\.staticcall\s*\(", r"\.send\s*\("),
+    "SWC-105": (r"function\s+(?:withdraw|drain|rescue|sweep|claim|payout)\b", r"\.call\s*\{[^}]*value\s*:",
+                r"\.transfer\s*\(", r"\.send\s*\("),
+    "SWC-106": (r"\bselfdestruct\s*\(", r"\bsuicide\s*\("),
+    "SWC-107": (r"\.call\s*\{[^}]*value\s*:", r"\.send\s*\(", r"\bbalances?\s*\[.*?\]\s*(?:-=|=|\+=)"),
+    "SWC-108": (r"^\s*(?:uint|int|bool|address|bytes|string|mapping)\s+(?!public|private|internal)\w+\s*(?:=|;)",),
+    "SWC-109": (r"\b\w+\s+storage\s+\w+\s*;",),
+    "SWC-110": (r"\bassert\s*\(",),
+    "SWC-111": (r"\bsuicide\s*\(", r"\bsha3\s*\(", r"\bthrow\b", r"\bcallcode\s*\(", r"\bblock\.blockhash\s*\(",
+                r"\bvar\s+\w+"),
+    "SWC-112": (r"\.delegatecall\s*\(", r"\.callcode\s*\("),
+    "SWC-113": (r"for\s*\([^)]*;\s*\w+\s*<\s*\w+\.length\s*;", r"for[^{]*\{[^}]*(?:\.transfer|\.send|\.call)",
+                r"\.transfer\s*\(", r"\.send\s*\("),
+    "SWC-114": (r"\bapprove\s*\(", r"\ballowance\b", r"\bamountOutMin\s*=\s*0\b|\bminOut\s*=\s*0\b",
+                r"\btx\.gasprice\b", r"\bblock\.number\b", r"function\s+(?:bid|auction|buy|purchase)\b"),
+    "SWC-115": (r"\btx\.origin\b",),
+    "SWC-116": (r"\bblock\.timestamp\b|\bnow\b", r"\bblock\.number\b"),
+    "SWC-117": (r"\becrecover\s*\(", r"\bsignature\b", r"\bv\s*,\s*r\s*,\s*s\b"),
+    "SWC-118": (r"pragma\s+solidity\s+[^;]*0\.[0-4]\.", r"function\s+[A-Z]\w+\s*\("),
+    "SWC-119": (),
+    "SWC-120": (r"\bblockhash\s*\(", r"\bblock\.difficulty\b|\bblock\.prevrandao\b", r"\bkeccak256\s*\([^)]*block\.",
+                r"\brandom\b|rand|entropy"),
+    "SWC-121": (r"\becrecover\s*\(", r"\bnonce\b|\bnonces\b", r"\bchainid\b|\bchainId\b|DOMAIN_SEPARATOR"),
+    "SWC-122": (r"\becrecover\s*\(", r"\bsignature\b", r"\bsigner\b", r"\baddress\s*\(\s*0\s*\)"),
+    "SWC-123": (),
+    "SWC-124": (r"\bassembly\s*\{[^}]*sstore\b", r"\.delegatecall\s*\(", r"\b\w+\s+storage\s+\w+\s*;"),
+    "SWC-125": (r"contract\s+\w+\s+is\s+\w+\s*,\s*\w+",),
+    "SWC-126": (r"\.call\s*\{[^}]*gas\s*:", r"\bgasleft\s*\(", r"\brelayer\b"),
+    "SWC-127": (r"\bfunction\s*\([^)]*\)\s*(?:internal|external)\s+\w+",),
+    "SWC-128": (r"for\s*\([^)]*;\s*\w+\s*<\s*\w+\.length\s*;", r"\bwhile\s*\(", r"\bpush\s*\("),
+    "SWC-129": (r"if\s*\([^)]*[^=!<>]=[^=][^)]*\)", r"require\s*\([^)]*[^=!<>]=[^=][^)]*\)"),
+    "SWC-130": ("‮",),
+    "SWC-131": (),
+    "SWC-132": (r"address\s*\(\s*this\s*\)\.balance", r"\bselfdestruct\s*\("),
+    "SWC-133": (r"abi\.encodePacked\s*\(",),
+    "SWC-134": (r"\.call\s*\{[^}]*gas\s*:\s*\d+",),
+    "SWC-135": (r"\b\w+\s*==\s*\w+\s*;", r"\b\w+\s*!=\s*\w+\s*;"),
+    "SWC-136": (r"\b(?:password|secret|privateKey|apiKey|seed)\b", r"\bprivate\b"),
+}
+# Từ khoá nhận diện một dòng là mã Solidity (extract_signal_code).
+_SOLIDITY_TOKENS = (
+    "pragma ", "contract ", "interface ", "library ", "function ", "modifier ", "constructor", "mapping", "require",
+    "revert", "assert", "if ", "for ", "while ", ".call", ".delegatecall", ".staticcall", ".send", ".transfer",
+    "selfdestruct", "suicide", "assembly", "tx.origin", "block.", "ecrecover", "abi.encodePacked", "approve",
+    "unchecked", "SafeMath",
+)
 
 
-# Cấu hình của MỘT SWC agent (37 agent, SWC-100 -> SWC-136): mã SWC, tiêu đề, mô tả, cách sửa,
-# mức nghiêm trọng, số tín hiệu tối thiểu, danh sách regex tín hiệu.
+# Cấu hình MỘT SWC agent: mã SWC, tiêu đề, mô tả, cách sửa, mức độ, số tín hiệu tối thiểu, regex tín hiệu.
 @dataclass(frozen=True)
 class AgentConfig:
     swc_id: str
@@ -64,232 +96,50 @@ class AgentConfig:
     signal_patterns: Sequence[str]
 
 
-SEVERITY_BY_SWC = {
-    "SWC-104": "Critical",
-    "SWC-105": "Critical",
-    "SWC-106": "Critical",
-    "SWC-107": "Critical",
-    "SWC-112": "Critical",
-    "SWC-115": "Critical",
-    "SWC-101": "High",
-    "SWC-113": "High",
-    "SWC-114": "High",
-    "SWC-121": "High",
-    "SWC-122": "High",
-    "SWC-124": "High",
-    "SWC-126": "High",
-    "SWC-128": "High",
-}
-
-MIN_SIGNAL_HITS_BY_SWC = {
-    "SWC-100": 1,
-    "SWC-101": 1,
-    "SWC-102": 1,
-    "SWC-103": 1,
-    "SWC-104": 1,
-    "SWC-105": 1,
-    "SWC-106": 1,
-    "SWC-107": 1,
-    "SWC-112": 1,
-    "SWC-113": 1,
-    "SWC-115": 1,
-    "SWC-118": 1,
-    "SWC-120": 2,
-    "SWC-121": 2,
-    "SWC-122": 2,
-    "SWC-123": 1,
-    "SWC-129": 1,
-    "SWC-136": 1,
-}
-
-SIGNAL_PATTERNS_BY_SWC: Dict[str, Sequence[str]] = {
-    "SWC-100": (r"function\s+\w+\s*\([^)]*\)\s*(?:returns\s*\([^)]*\)\s*)?\{",),
-    "SWC-101": (
-        r"pragma\s+solidity\s+[^;]*0\.[0-7]\.",
-        r"\bSafeMath\b",
-        r"\bunchecked\s*\{",
-        r"\buint(?:8|16|32|64|128)\s*\(",
-        r"\bint(?:8|16|32|64|128)\s*\(",
-        r"\w+\s*/\s*\w+\s*\*\s*\w+",
-        r"\buint\w*\s+\w+\s*=\s*\w+\s*(?:\+|-|\*)\s*\w+",
-        r"\b1e18\b|\b10\s*\*\*\s*18\b|\bdecimals\s*\(",
-    ),
-    "SWC-102": (r"pragma\s+solidity\s+[^;]*0\.[0-7]\.",),
-    "SWC-103": (r"pragma\s+solidity\s+\^", r"pragma\s+solidity\s+>="),
-    "SWC-104": (
-        r"\.call\s*[\(\{]",
-        r"\.delegatecall\s*\(",
-        r"\.staticcall\s*\(",
-        r"\.send\s*\(",
-    ),
-    "SWC-105": (
-        r"function\s+(?:withdraw|drain|rescue|sweep|claim|payout)\b",
-        r"\.call\s*\{[^}]*value\s*:",
-        r"\.transfer\s*\(",
-        r"\.send\s*\(",
-    ),
-    "SWC-106": (r"\bselfdestruct\s*\(", r"\bsuicide\s*\("),
-    "SWC-107": (
-        r"\.call\s*\{[^}]*value\s*:",
-        r"\.send\s*\(",
-        r"\bbalances?\s*\[.*?\]\s*(?:-=|=|\+=)",
-    ),
-    "SWC-108": (
-        r"^\s*(?:uint|int|bool|address|bytes|string|mapping)\s+(?!public|private|internal)\w+\s*(?:=|;)",
-    ),
-    "SWC-109": (r"\b\w+\s+storage\s+\w+\s*;",),
-    "SWC-110": (r"\bassert\s*\(",),
-    "SWC-111": (
-        r"\bsuicide\s*\(",
-        r"\bsha3\s*\(",
-        r"\bthrow\b",
-        r"\bcallcode\s*\(",
-        r"\bblock\.blockhash\s*\(",
-        r"\bvar\s+\w+",
-    ),
-    "SWC-112": (r"\.delegatecall\s*\(", r"\.callcode\s*\("),
-    "SWC-113": (
-        r"for\s*\([^)]*;\s*\w+\s*<\s*\w+\.length\s*;",
-        r"for[^{]*\{[^}]*(?:\.transfer|\.send|\.call)",
-        r"\.transfer\s*\(",
-        r"\.send\s*\(",
-    ),
-    "SWC-114": (
-        r"\bapprove\s*\(",
-        r"\ballowance\b",
-        r"\bamountOutMin\s*=\s*0\b|\bminOut\s*=\s*0\b",
-        r"\btx\.gasprice\b",
-        r"\bblock\.number\b",
-        r"function\s+(?:bid|auction|buy|purchase)\b",
-    ),
-    "SWC-115": (r"\btx\.origin\b",),
-    "SWC-116": (r"\bblock\.timestamp\b|\bnow\b", r"\bblock\.number\b"),
-    "SWC-117": (r"\becrecover\s*\(", r"\bsignature\b", r"\bv\s*,\s*r\s*,\s*s\b"),
-    "SWC-118": (r"pragma\s+solidity\s+[^;]*0\.[0-4]\.", r"function\s+[A-Z]\w+\s*\("),
-    "SWC-119": (),
-    "SWC-120": (
-        r"\bblockhash\s*\(",
-        r"\bblock\.difficulty\b|\bblock\.prevrandao\b",
-        r"\bkeccak256\s*\([^)]*block\.",
-        r"\brandom\b|rand|entropy",
-    ),
-    "SWC-121": (r"\becrecover\s*\(", r"\bnonce\b|\bnonces\b", r"\bchainid\b|\bchainId\b|DOMAIN_SEPARATOR"),
-    "SWC-122": (r"\becrecover\s*\(", r"\bsignature\b", r"\bsigner\b", r"\baddress\s*\(\s*0\s*\)"),
-    "SWC-123": (),
-    "SWC-124": (r"\bassembly\s*\{[^}]*sstore\b", r"\.delegatecall\s*\(", r"\b\w+\s+storage\s+\w+\s*;"),
-    "SWC-125": (r"contract\s+\w+\s+is\s+\w+\s*,\s*\w+",),
-    "SWC-126": (r"\.call\s*\{[^}]*gas\s*:", r"\bgasleft\s*\(", r"\brelayer\b"),
-    "SWC-127": (r"\bfunction\s*\([^)]*\)\s*(?:internal|external)\s+\w+",),
-    "SWC-128": (r"for\s*\([^)]*;\s*\w+\s*<\s*\w+\.length\s*;", r"\bwhile\s*\(", r"\bpush\s*\("),
-    "SWC-129": (r"if\s*\([^)]*[^=!<>]=[^=][^)]*\)", r"require\s*\([^)]*[^=!<>]=[^=][^)]*\)"),
-    "SWC-130": ("\u202e",),
-    "SWC-131": (),
-    "SWC-132": (r"address\s*\(\s*this\s*\)\.balance", r"\bselfdestruct\s*\("),
-    "SWC-133": (r"abi\.encodePacked\s*\(",),
-    "SWC-134": (r"\.call\s*\{[^}]*gas\s*:\s*\d+",),
-    "SWC-135": (r"\b\w+\s*==\s*\w+\s*;", r"\b\w+\s*!=\s*\w+\s*;"),
-    "SWC-136": (r"\b(?:password|secret|privateKey|apiKey|seed)\b", r"\bprivate\b"),
-}
-
-
-# Chuẩn hoá chuỗi bất kỳ về dạng "SWC-xxx" (vd "swc-107: Reentrancy" -> "SWC-107").
+# Chuẩn hoá chuỗi bất kỳ về "SWC-xxx" ("swc-107: Reentrancy" -> "SWC-107").
 def normalize_swc_id(value: object) -> str:
     match = RE_SWC_ID.search(str(value or "").upper())
     return match.group(0) if match else str(value or "").strip().upper()
 
 
-# Đọc swc_registry.json (37 mục SWC đã được làm giàu bằng dữ liệu) và lọc mục hợp lệ.
-def load_swc_registry(path: str | Path = DEFAULT_SWC_REGISTRY) -> List[Dict]:
-    registry_path = Path(path)
-    with registry_path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
+# Đọc swc_registry.json (37 mục SWC đã làm giàu bằng dữ liệu), chỉ giữ mục hợp lệ.
+def load_swc_registry(path: str | Path = DEFAULT_SWC_REGISTRY) -> list[dict]:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(data, list):
-        raise ValueError(f"SWC registry must be a JSON list: {registry_path}")
+        raise ValueError(f"SWC registry must be a JSON list: {path}")
     return [item for item in data if isinstance(item, dict) and normalize_swc_id(item.get("id"))]
 
 
-# Nhiệm vụ: dựng danh sách 37 AgentConfig từ các mục registry (load_swc_registry) + bảng SIGNAL_PATTERNS_BY_SWC /
-# SEVERITY_BY_SWC / MIN_SIGNAL_HITS_BY_SWC. Mục đích: LocalRAGRetriever dùng các agent này để "gác cổng" từng SWC.
-def build_agents(registry: List[Dict]) -> List[AgentConfig]:
+# Dựng 37 AgentConfig từ registry + các bảng SIGNAL_PATTERNS_BY_SWC / SEVERITY_BY_SWC / MIN_SIGNAL_HITS_BY_SWC.
+def build_agents(registry: list[dict]) -> list[AgentConfig]:
     agents = []
     for item in registry:
         swc_id = normalize_swc_id(item.get("id"))
-        title = str(item.get("title") or swc_id).strip()
-        description = str(item.get("description") or "").strip()
-        remediation = str(item.get("remediation") or "").strip()
         patterns = SIGNAL_PATTERNS_BY_SWC.get(swc_id, ())
-        agents.append(
-            AgentConfig(
-                swc_id=swc_id,
-                title=title,
-                description=description,
-                remediation=remediation,
-                severity=SEVERITY_BY_SWC.get(swc_id, "Medium"),
-                min_signal_hits=MIN_SIGNAL_HITS_BY_SWC.get(swc_id, 1 if len(patterns) <= 1 else 2),
-                signal_patterns=patterns,
-            )
-        )
+        agents.append(AgentConfig(
+            swc_id=swc_id, title=str(item.get("title") or swc_id).strip(),
+            description=str(item.get("description") or "").strip(),
+            remediation=str(item.get("remediation") or "").strip(),
+            severity=SEVERITY_BY_SWC.get(swc_id, "Medium"),
+            min_signal_hits=MIN_SIGNAL_HITS_BY_SWC.get(swc_id, 1 if len(patterns) <= 1 else 2),
+            signal_patterns=patterns,
+        ))
     return agents
 
 
-# Lọc lấy phần thực sự là mã Solidity (khối ```code``` và các dòng có từ khoá Solidity) trước khi dò tín hiệu.
-# Retriever gọi một lần cho mỗi unit rồi đưa kết quả cho find_signal_hits của cả 37 agent.
+# Chỉ giữ phần thực sự là mã Solidity (khối ```code``` + dòng có từ khoá Solidity) trước khi dò tín hiệu.
 def extract_signal_code(code: str) -> str:
-    fenced_blocks = RE_ANY_CODE_FENCE.findall(code)
-    code_lines = []
-    solidity_tokens = (
-        "pragma ",
-        "contract ",
-        "interface ",
-        "library ",
-        "function ",
-        "modifier ",
-        "constructor",
-        "mapping",
-        "require",
-        "revert",
-        "assert",
-        "if ",
-        "for ",
-        "while ",
-        ".call",
-        ".delegatecall",
-        ".staticcall",
-        ".send",
-        ".transfer",
-        "selfdestruct",
-        "suicide",
-        "assembly",
-        "tx.origin",
-        "block.",
-        "ecrecover",
-        "abi.encodePacked",
-        "approve",
-        "unchecked",
-        "SafeMath",
-    )
-    for line in code.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith(("###", "#", "//")):
-            continue
-        if any(token in stripped for token in solidity_tokens) and any(char in stripped for char in "{}();=<>[]"):
-            code_lines.append(stripped)
-    return "\n".join([*fenced_blocks, *code_lines]).strip() or code
+    lines = [line.strip() for line in code.splitlines()]
+    code_lines = [line for line in lines if line and not line.startswith(("###", "#", "//"))
+                  and any(token in line for token in _SOLIDITY_TOKENS) and any(char in line for char in "{}();=<>[]")]
+    return "\n".join([*RE_ANY_CODE_FENCE.findall(code), *code_lines]).strip() or code
 
 
-# Lấy phiên bản (major, minor, patch) từ dòng pragma solidity.
+# Phiên bản (major, minor, patch) trong dòng pragma solidity (không có -> None).
 def pragma_version(code: str) -> tuple[int, int, int] | None:
-    match = RE_PRAGMA_SPEC_ANY_CASE.search(code)
-    if not match:
-        return None
-    version = RE_VERSION_NUMBER.search(match.group(1))
-    if not version:
-        return None
-    return (
-        int(version.group(1)),
-        int(version.group(2)),
-        int(version.group(3) or 0),
-    )
+    pragma = RE_PRAGMA_SPEC_ANY_CASE.search(code)
+    version = RE_VERSION_NUMBER.search(pragma.group(1)) if pragma else None
+    return (int(version.group(1)), int(version.group(2)), int(version.group(3) or 0)) if version else None
 
 
 # Pragma có cũ hơn phiên bản cho trước không (vd < 0.8.0 -> chưa có kiểm tra tràn số tự động).
@@ -298,177 +148,93 @@ def pragma_before(code: str, major: int, minor: int, patch: int = 0) -> bool:
     return bool(version and version < (major, minor, patch))
 
 
-# Mã có phép toán số học (++, --, +=, a + b, add/sub/mul) không.
-def has_arithmetic_operation(code: str) -> bool:
-    return bool(RE_ARITHMETIC_OPERATION.search(code))
-
-
-# Liệt kê các câu lệnh có lời gọi cấp thấp .call/.delegatecall/.staticcall/.send.
-def low_level_call_statements(code: str) -> List[str]:
-    return [
-        statement.strip()
-        for statement in code.split(";")
-        if RE_LOW_LEVEL_CALL.search(statement)
-    ]
-
-
-# Lấy tên biến bool nhận kết quả của lời gọi cấp thấp (vd "(bool ok, ) = x.call(...)" -> ["ok"]).
-def statement_result_names(statement: str) -> List[str]:
-    names = RE_BOOL_TUPLE_RESULT.findall(statement)
-    names.extend(RE_BOOL_ASSIGNED_CALL_RESULT.findall(statement))
-    return names
-
-
-# Kết quả lời gọi cấp thấp có được kiểm tra không (require(...)/assert/if(!ok)).
+# Kết quả lời gọi cấp thấp trong câu lệnh có được kiểm tra không (require(...) / assert / if (!ok)).
 def is_result_checked(full_code: str, statement: str) -> bool:
-    if RE_CALL_INSIDE_REQUIRE.search(statement):
-        return True
-    for name in statement_result_names(statement):
-        if re_result_check(name).search(full_code):
-            return True
-    return False
+    names = RE_BOOL_TUPLE_RESULT.findall(statement) + RE_BOOL_ASSIGNED_CALL_RESULT.findall(statement)
+    return bool(RE_CALL_INSIDE_REQUIRE.search(statement)) \
+        or any(re_result_check(name).search(full_code) for name in names)
 
 
-# Có cập nhật state SAU lời gọi chuyển ETH (.call{value:}/.send) không -> dấu hiệu reentrancy (SWC-107).
-# Có nonReentrant/ReentrancyGuard thì trả False.
+# Có cập nhật state SAU lời gọi gửi ETH (.call{value:} / .send) không -> dấu hiệu reentrancy; có nonReentrant -> False.
 def has_state_update_after_external_value_call(code: str) -> bool:
-    if RE_REENTRANCY_GUARD.search(code):
-        return False
-    call_match = RE_VALUE_CALL_OR_SEND.search(code)
-    if not call_match:
-        return False
-    after_call = code[call_match.end() :]
-    return bool(RE_STATE_UPDATE.search(after_call))
+    call = None if RE_REENTRANCY_GUARD.search(code) else RE_VALUE_CALL_OR_SEND.search(code)
+    return bool(call and RE_STATE_UPDATE.search(code[call.end():]))
 
 
-# Lấy phần thân các vòng lặp for/while.
-def loop_bodies(code: str) -> List[str]:
-    return RE_LOOP_BODY.findall(code)
-
-
-# Lấy biểu thức điều kiện bên trong if(...) hoặc require(...) (đếm ngoặc lồng nhau).
-def condition_blocks(keyword: str, code: str) -> List[str]:
+# Biểu thức điều kiện bên trong if(...) / require(...) (đếm ngoặc lồng nhau).
+def condition_blocks(keyword: str, code: str) -> list[str]:
     blocks = []
     for match in re_condition_opening(keyword).finditer(code):
-        start = match.end() - 1
-        depth = 0
-        for index in range(start, len(code)):
-            char = code[index]
-            if char == "(":
-                depth += 1
-            elif char == ")":
-                depth -= 1
-                if depth == 0:
-                    blocks.append(code[start + 1 : index])
-                    break
+        close = matching_close(code, match.end() - 1, "(", ")")
+        if close is not None:
+            blocks.append(code[match.end():close])
     return blocks
 
 
-# Có phép gán "=" (không phải "==") trong điều kiện if/require không -> SWC-129.
+# Có phép gán "=" (không phải ==, !=, >=, <=) trong điều kiện if/require không -> SWC-129.
 def find_assignment_in_condition(code: str) -> bool:
     for condition in [*condition_blocks("if", code), *condition_blocks("require", code)]:
-        compact = RE_WHITESPACE.sub("", condition)
-        if any(operator in compact for operator in ("==", "!=", ">=", "<=")):
-            continue
-        if RE_SINGLE_EQUALS.search(condition):
+        if not any(op in RE_WHITESPACE.sub("", condition) for op in ("==", "!=", ">=", "<=")) \
+                and RE_SINGLE_EQUALS.search(condition):
             return True
     return False
-
-
-# Nhiệm vụ: kiểm tra tín hiệu "có ngữ cảnh" cho các SWC dễ báo nhầm (100, 101, 102, 103, 104, 105, 106, 107,
-# 112, 113, 118, 129, 136). Vd SWC-104 chỉ báo khi kết quả .call KHÔNG được kiểm tra; SWC-105/106/112 bỏ qua
-# nếu có guard phân quyền; SWC-101 chỉ báo khi solc < 0.8 và không dùng SafeMath.
-# Trả None nếu SWC không có luật riêng (khi đó dùng regex chung).
-# Mục đích: dùng chung cho RAG (retriever) và static (static_runner gác cổng finding).
-def find_custom_signal_hits(swc_id: str, code: str) -> List[str] | None:
-    if swc_id == "SWC-100":
-        if pragma_before(code, 0, 5) and RE_FUNCTION_WITHOUT_VISIBILITY.search(code):
-            return ["function without explicit visibility on pre-0.5 Solidity"]
-        return []
-
-    if swc_id == "SWC-101":
-        hits = []
-        if RE_UNCHECKED_BLOCK.search(code):
-            hits.append("unchecked arithmetic block")
-        if pragma_before(code, 0, 8) and has_arithmetic_operation(code) and not RE_SAFEMATH.search(code):
-            hits.append("arithmetic on Solidity version without built-in overflow checks")
-        if RE_NARROW_INT_CAST.search(code):
-            hits.append("narrow integer cast can truncate values")
-        return hits
-
-    if swc_id == "SWC-102":
-        return ["outdated Solidity compiler version"] if pragma_before(code, 0, 8) else []
-
-    if swc_id == "SWC-103":
-        return ["floating pragma version"] if RE_FLOATING_PRAGMA.search(code) else []
-
-    if swc_id == "SWC-104":
-        unchecked = [
-            statement
-            for statement in low_level_call_statements(code)
-            if not is_result_checked(code, statement)
-        ]
-        return ["unchecked low-level call return value"] if unchecked else []
-
-    if swc_id == "SWC-105":
-        if has_access_control_guard(code):
-            return []
-        has_ether_transfer = RE_ETHER_TRANSFER.search(code)
-        has_admin_like_withdraw = RE_ADMIN_WITHDRAW_FUNCTION.search(code)
-        drains_contract_balance = RE_CONTRACT_BALANCE.search(code)
-        has_user_balance_guard = RE_USER_BALANCE_GUARD.search(code)
-        if has_ether_transfer and (has_admin_like_withdraw or drains_contract_balance) and not has_user_balance_guard:
-            return ["ether withdrawal path without access control"]
-        return []
-
-    if swc_id == "SWC-106":
-        if RE_SELFDESTRUCT_CALL.search(code) and not has_access_control_guard(code):
-            return ["selfdestruct without access control"]
-        return []
-
-    if swc_id == "SWC-107":
-        return ["external value call before state update"] if has_state_update_after_external_value_call(code) else []
-
-    if swc_id == "SWC-112":
-        if RE_DELEGATECALL_OR_CALLCODE.search(code) and not has_access_control_guard(code):
-            return ["delegatecall/callcode target is externally controllable or unguarded"]
-        return []
-
-    if swc_id == "SWC-113":
-        for body in loop_bodies(code):
-            if RE_EXTERNAL_CALL.search(body):
-                return ["external call inside loop can block progress"]
-        return []
-
-    if swc_id == "SWC-118":
-        if pragma_before(code, 0, 4, 22) and RE_CAPITALIZED_FUNCTION.search(code):
-            return ["old-style constructor-like function on pre-0.4.22 Solidity"]
-        return []
-
-    if swc_id == "SWC-129":
-        return ["assignment used as condition"] if find_assignment_in_condition(code) else []
-
-    if swc_id == "SWC-136":
-        if RE_SENSITIVE_STATE_VALUE.search(code):
-            return ["sensitive value stored in contract state"]
-        return []
-
-    return None
-
-
-# Trả về danh sách tín hiệu của một SWC trong đoạn mã đã lọc bởi extract_signal_code: ưu tiên luật riêng
-# (find_custom_signal_hits), không có thì dò các regex chung của agent.
-def find_signal_hits(signal_code: str, patterns: Sequence[str], swc_id: str | None = None) -> List[str]:
-    custom_hits = find_custom_signal_hits(swc_id, signal_code) if swc_id else None
-    if custom_hits is not None:
-        return custom_hits
-    return [
-        pattern
-        for pattern in patterns
-        if re.search(pattern, signal_code, re.IGNORECASE | re.DOTALL | re.MULTILINE)
-    ]
 
 
 # Mã có cơ chế phân quyền không (onlyOwner, onlyRole, Ownable, require(msg.sender == ...)).
 def has_access_control_guard(code: str) -> bool:
     return bool(RE_ACCESS_CONTROL_GUARD.search(code))
+
+
+# Tín hiệu "có ngữ cảnh" cho SWC dễ báo nhầm (vd SWC-104 chỉ khi kết quả .call KHÔNG được kiểm tra); SWC khác -> None.
+def find_custom_signal_hits(swc_id: str, code: str) -> list[str] | None:
+    if swc_id == "SWC-100":
+        return ["function without explicit visibility on pre-0.5 Solidity"] \
+            if pragma_before(code, 0, 5) and RE_FUNCTION_WITHOUT_VISIBILITY.search(code) else []
+    if swc_id == "SWC-101":
+        checks = (
+            (RE_UNCHECKED_BLOCK.search(code), "unchecked arithmetic block"),
+            (pragma_before(code, 0, 8) and RE_ARITHMETIC_OPERATION.search(code) and not RE_SAFEMATH.search(code),
+             "arithmetic on Solidity version without built-in overflow checks"),
+            (RE_NARROW_INT_CAST.search(code), "narrow integer cast can truncate values"),
+        )
+        return [label for hit, label in checks if hit]
+    if swc_id == "SWC-102":
+        return ["outdated Solidity compiler version"] if pragma_before(code, 0, 8) else []
+    if swc_id == "SWC-103":
+        return ["floating pragma version"] if RE_FLOATING_PRAGMA.search(code) else []
+    if swc_id == "SWC-104":
+        statements = [s.strip() for s in code.split(";") if RE_LOW_LEVEL_CALL.search(s)]
+        unchecked = any(not is_result_checked(code, statement) for statement in statements)
+        return ["unchecked low-level call return value"] if unchecked else []
+    if swc_id == "SWC-105":
+        drains = RE_ADMIN_WITHDRAW_FUNCTION.search(code) or RE_CONTRACT_BALANCE.search(code)
+        return ["ether withdrawal path without access control"] if not has_access_control_guard(code) \
+            and RE_ETHER_TRANSFER.search(code) and drains and not RE_USER_BALANCE_GUARD.search(code) else []
+    if swc_id == "SWC-106":
+        return ["selfdestruct without access control"] \
+            if RE_SELFDESTRUCT_CALL.search(code) and not has_access_control_guard(code) else []
+    if swc_id == "SWC-107":
+        return ["external value call before state update"] if has_state_update_after_external_value_call(code) else []
+    if swc_id == "SWC-112":
+        return ["delegatecall/callcode target is externally controllable or unguarded"] \
+            if RE_DELEGATECALL_OR_CALLCODE.search(code) and not has_access_control_guard(code) else []
+    if swc_id == "SWC-113":
+        return ["external call inside loop can block progress"] \
+            if any(RE_EXTERNAL_CALL.search(body) for body in RE_LOOP_BODY.findall(code)) else []
+    if swc_id == "SWC-118":
+        return ["old-style constructor-like function on pre-0.4.22 Solidity"] \
+            if pragma_before(code, 0, 4, 22) and RE_CAPITALIZED_FUNCTION.search(code) else []
+    if swc_id == "SWC-129":
+        return ["assignment used as condition"] if find_assignment_in_condition(code) else []
+    if swc_id == "SWC-136":
+        return ["sensitive value stored in contract state"] if RE_SENSITIVE_STATE_VALUE.search(code) else []
+    return None
+
+
+# Tín hiệu của một SWC trong mã đã lọc: luật riêng (find_custom_signal_hits) nếu có, không thì regex chung của agent.
+def find_signal_hits(signal_code: str, patterns: Sequence[str], swc_id: str | None = None) -> list[str]:
+    custom = find_custom_signal_hits(swc_id, signal_code) if swc_id else None
+    if custom is not None:
+        return custom
+    return [pattern for pattern in patterns
+            if re.search(pattern, signal_code, re.IGNORECASE | re.DOTALL | re.MULTILINE)]

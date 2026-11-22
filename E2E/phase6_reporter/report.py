@@ -19,17 +19,17 @@ DEFAULT_RECOMMENDATIONS = [
     "Use checks-effects-interactions and established OpenZeppelin guards for external calls.",
     "Repeat the audit after dependency, privilege, or business-logic changes.",
 ]
-CHANNEL_LABELS = {"slither": "Slither", "compile": "Compile", "static": "Static Analysis", "rag": "RAG",
-                  "llm": "Neural Detector"}
+CHANNEL_LABELS = {"slither": "Slither", "compile": "Compile", "static": "Static Analysis", "llm": "Neural Detector"}
 # Trạng thái tự kiểm của vòng sửa -> câu mô tả (apply_verification_to_report ghi đè theo kết luận Phase 5).
 SELF_CHECK_TEXT = {
-    "PASS": "Repair-loop self-check passed (compiler, neural detector, static/RAG re-run)",
-    "FLAGGED": "Repair-loop self-check: the neural detector still flags the patched unit",
+    "PASS": "Repair-loop verification passed (compiler, Slither, behavior, static re-run, neural detector)",
+    "FLAGGED": "Repair-loop verification: a check (often the neural detector) still flags the patched unit",
     "NOT_PATCHED": "Not patched",
 }
 LIMITATIONS = [
     "SWC Registry source material is no longer actively maintained and is not exhaustive.",
-    "The fine-tuned classifier is a binary detector; SWC attribution comes from local static/RAG evidence.",
+    "The fine-tuned classifier is a binary detector; SWC attribution comes from static rules and the nearest "
+    "known case in the knowledge base, and can be wrong.",
     "Security tools can disagree or time out; manual review and project tests remain required.",
 ]
 DISCLAIMER = ("This report represents a best-effort automated security review. It cannot guarantee that all "

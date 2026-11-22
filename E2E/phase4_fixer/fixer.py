@@ -1,26 +1,19 @@
-"""Phase 4 - Fixer: vá từng hàm lỗi bằng Qwen2.5-Coder-14B (prompt -> LLM -> tách hàm -> guard hành vi -> ghép)."""
+"""Phase 4 - Fixer: vá từng hàm lỗi bằng Qwen2.5-Coder-14B (prompt + ca KB của hàm -> LLM -> tách hàm -> ghép)."""
 
 from E2E.common.gpu_client import generate_via_server
+from E2E.common.knowledge_base import KnowledgeBase, default_knowledge_base
 from E2E.common.regex_patterns import RE_FULL_VERSION, RE_PRAGMA_SPEC
 from E2E.phase0_parsing.code_units import CodeUnit, parse_code_units
 from E2E.phase0_parsing.contract_context import build_contract_context
-from E2E.phase4_fixer.behavior_guard import validate_observable_behavior
 from E2E.phase4_fixer.patching import apply_unit_patches, extract_declaration_body, lenient_json_string_field
 
 FIXER_SYSTEM_PROMPT = "You are a Solidity security auditor. Output strictly valid JSON with the requested schema."
 
 
-# Tối đa 3 ca tương tự từ RAG (ưu tiên cùng SWC với lỗi đang sửa, bỏ similarity < 0.08) thành đoạn ví dụ cho Fixer.
-def _build_rag_knowledge_section(rag_context: list[dict], target_swc: str | None = None, max_items: int = 3) -> str:
-    candidates = []
-    for ctx in rag_context or []:
-        similarity = float(ctx.get("similarity") or 0.0)
-        same_swc = bool(target_swc) and (ctx.get("swc") or "Security") == target_swc
-        if similarity >= 0.08 or same_swc:
-            candidates.append((2.0 + similarity if same_swc else similarity, ctx))
-    candidates.sort(key=lambda item: item[0], reverse=True)
+# Đoạn "ca thực nghiệm" cho Fixer từ các ca KB của chính hàm đang sửa (KnowledgeBase.cases_for_unit).
+def _build_rag_knowledge_section(cases: list[dict]) -> str:
     entries = []
-    for _, ctx in candidates[:max_items]:
+    for ctx in cases:
         swc = ctx.get("swc") or "Security"
         entry = f"- [{swc}] {ctx.get('title') or swc} (similarity: {float(ctx.get('similarity') or 0.0):.2f})"
         if root_cause := (ctx.get("root_cause") or ctx.get("description") or "").strip():
@@ -86,9 +79,9 @@ def _version_rules(source_code: str) -> str:
     return "\n".join(rules) + "\n"
 
 
-# Prompt Fixer cho MỘT hàm: lỗi + hướng sửa của Advisor (confirmed/uncertain), mã gốc, ngữ cảnh, RAG, feedback, luật.
+# Prompt Fixer cho MỘT hàm: lỗi + hướng sửa của Advisor (confirmed/uncertain), mã gốc, ngữ cảnh, ca KB, feedback, luật.
 def _build_fixer_prompt(unit: CodeUnit, unit_findings: list[dict], unit_suggestions: list[dict], source_code: str,
-                        feedback_note: str, rag_section: str) -> str:
+                        feedback_note: str, knowledge_base: KnowledgeBase) -> str:
     lines = [f"  * [{item.get('swc', '')}] {item.get('title', '')}" for item in unit_findings]
     for suggestion in unit_suggestions:
         if suggestion.get("advisor_verdict") not in {"confirmed", "uncertain"}:
@@ -99,6 +92,8 @@ def _build_fixer_prompt(unit: CodeUnit, unit_findings: list[dict], unit_suggesti
             lines.append(f"  * Root cause: {suggestion['root_cause']}")
     findings_text = "\n".join(lines) if lines else "Security vulnerability detected."
     context = build_contract_context(unit, source_code, budget_tokens=1500)
+    cases = knowledge_base.cases_for_unit(unit.code, {str(item.get("swc")) for item in unit_findings if item.get("swc")})
+    rag_section = _build_rag_knowledge_section(cases)
     return (
         "You are an expert Solidity smart contract security researcher.\n"
         f"Target vulnerable function: `{unit.name}`\n"
@@ -126,12 +121,14 @@ def _build_fixer_prompt(unit: CodeUnit, unit_findings: list[dict], unit_suggesti
     )
 
 
-# [HÀM CHÍNH PHASE 4] Vá MỘT hàm: prompt -> LLM (temperature 0) -> tách hàm -> guard hành vi -> ghép; lỗi -> rejected.
+# [HÀM CHÍNH PHASE 4] Vá MỘT hàm: prompt -> LLM (temperature 0) -> tách hàm -> ghép; lỗi -> rejected (Phase 5 kiểm chứng).
 def patch_unit(code: str, unit: CodeUnit, *, unit_findings: list[dict], unit_suggestions: list[dict], source_code: str,
-               feedback_note: str, rag_section: str, attempt: int, server_url: str | None) -> tuple[str, dict]:
+               feedback_note: str, attempt: int, server_url: str | None,
+               knowledge_base: KnowledgeBase | None = None) -> tuple[str, dict]:
     outcome, stage, rationale = {"finding_id": f"LLM:Qwen14B:{unit.unit_id}", "unit_id": unit.unit_id}, "prepare", ""
     try:
-        prompt = _build_fixer_prompt(unit, unit_findings, unit_suggestions, source_code, feedback_note, rag_section)
+        prompt = _build_fixer_prompt(unit, unit_findings, unit_suggestions, source_code, feedback_note,
+                                     knowledge_base or default_knowledge_base())
         stage = "generate"
         reply = generate_via_server(prompt, system_prompt=FIXER_SYSTEM_PROMPT, temperature=0.0, server_url=server_url)
         stage = "extract"
@@ -139,8 +136,6 @@ def patch_unit(code: str, unit: CodeUnit, *, unit_findings: list[dict], unit_sug
         candidate = extract_declaration_body(reply, target_name=unit.name)
         if not candidate or unit.name not in candidate:
             raise ValueError(f"Extracted patch does not define expected function {unit.name}")
-        stage = "guard"
-        validate_observable_behavior(unit.code, candidate)
         stage = "apply"
         updated = _splice_unit(code, unit, candidate, f"Qwen-14B patch for {unit.unit_id} (attempt {attempt})")
     except Exception as error:

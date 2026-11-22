@@ -1,4 +1,4 @@
-"""Bước offline - xây cơ sở tri thức cho Phase 1B/2: data/knowledge_base/source -> built (tất định, byte-identical).
+"""Bước offline - xây cơ sở tri thức (KB dùng chung mọi phase): data/knowledge_base/source -> built (tất định).
 
     .venv/bin/python -m E2E.phase1b_rag.build_knowledge_base
 """
@@ -16,8 +16,57 @@ from E2E.common.io_utils import utc_now, write_json
 from E2E.common.regex_patterns import (
     RE_BULLET_PREFIX, RE_MARKDOWN_CODE_BLOCK, RE_MARKDOWN_LINK, RE_MARKDOWN_SYMBOLS, RE_SENTENCE_BREAK, RE_WHITESPACE,
 )
+from E2E.common.swc import SEVERITY_BY_SWC, normalize_swc_id
 from E2E.config import BASELINE_TAXONOMY_PATH, KNOWLEDGE_BASE_DIR, VULNERABILITY_KNOWLEDGE_PATH
-from E2E.phase1b_rag.swc_agents import SEVERITY_BY_SWC, SIGNAL_PATTERNS_BY_SWC, normalize_swc_id
+
+# Dấu hiệu mã của từng SWC dạng regex - CHỈ là văn bản mô tả ghi vào registry / retrieval_text khi build (không dùng
+# để phát hiện; giữ nguyên để artifact KB không đổi).
+REGISTRY_SIGNAL_PATTERNS: dict[str, tuple[str, ...]] = {
+    "SWC-100": (r"function\s+\w+\s*\([^)]*\)\s*(?:returns\s*\([^)]*\)\s*)?\{",),
+    "SWC-101": (r"pragma\s+solidity\s+[^;]*0\.[0-7]\.", r"\bSafeMath\b", r"\bunchecked\s*\{",
+                r"\buint(?:8|16|32|64|128)\s*\(", r"\bint(?:8|16|32|64|128)\s*\(", r"\w+\s*/\s*\w+\s*\*\s*\w+",
+                r"\buint\w*\s+\w+\s*=\s*\w+\s*(?:\+|-|\*)\s*\w+", r"\b1e18\b|\b10\s*\*\*\s*18\b|\bdecimals\s*\("),
+    "SWC-102": (r"pragma\s+solidity\s+[^;]*0\.[0-7]\.",),
+    "SWC-103": (r"pragma\s+solidity\s+\^", r"pragma\s+solidity\s+>="),
+    "SWC-104": (r"\.call\s*[\(\{]", r"\.delegatecall\s*\(", r"\.staticcall\s*\(", r"\.send\s*\("),
+    "SWC-105": (r"function\s+(?:withdraw|drain|rescue|sweep|claim|payout)\b", r"\.call\s*\{[^}]*value\s*:",
+                r"\.transfer\s*\(", r"\.send\s*\("),
+    "SWC-106": (r"\bselfdestruct\s*\(", r"\bsuicide\s*\("),
+    "SWC-107": (r"\.call\s*\{[^}]*value\s*:", r"\.send\s*\(", r"\bbalances?\s*\[.*?\]\s*(?:-=|=|\+=)"),
+    "SWC-108": (r"^\s*(?:uint|int|bool|address|bytes|string|mapping)\s+(?!public|private|internal)\w+\s*(?:=|;)",),
+    "SWC-109": (r"\b\w+\s+storage\s+\w+\s*;",),
+    "SWC-110": (r"\bassert\s*\(",),
+    "SWC-111": (r"\bsuicide\s*\(", r"\bsha3\s*\(", r"\bthrow\b", r"\bcallcode\s*\(", r"\bblock\.blockhash\s*\(",
+                r"\bvar\s+\w+"),
+    "SWC-112": (r"\.delegatecall\s*\(", r"\.callcode\s*\("),
+    "SWC-113": (r"for\s*\([^)]*;\s*\w+\s*<\s*\w+\.length\s*;", r"for[^{]*\{[^}]*(?:\.transfer|\.send|\.call)",
+                r"\.transfer\s*\(", r"\.send\s*\("),
+    "SWC-114": (r"\bapprove\s*\(", r"\ballowance\b", r"\bamountOutMin\s*=\s*0\b|\bminOut\s*=\s*0\b",
+                r"\btx\.gasprice\b", r"\bblock\.number\b", r"function\s+(?:bid|auction|buy|purchase)\b"),
+    "SWC-115": (r"\btx\.origin\b",),
+    "SWC-116": (r"\bblock\.timestamp\b|\bnow\b", r"\bblock\.number\b"),
+    "SWC-117": (r"\becrecover\s*\(", r"\bsignature\b", r"\bv\s*,\s*r\s*,\s*s\b"),
+    "SWC-118": (r"pragma\s+solidity\s+[^;]*0\.[0-4]\.", r"function\s+[A-Z]\w+\s*\("),
+    "SWC-119": (),
+    "SWC-120": (r"\bblockhash\s*\(", r"\bblock\.difficulty\b|\bblock\.prevrandao\b", r"\bkeccak256\s*\([^)]*block\.",
+                r"\brandom\b|rand|entropy"),
+    "SWC-121": (r"\becrecover\s*\(", r"\bnonce\b|\bnonces\b", r"\bchainid\b|\bchainId\b|DOMAIN_SEPARATOR"),
+    "SWC-122": (r"\becrecover\s*\(", r"\bsignature\b", r"\bsigner\b", r"\baddress\s*\(\s*0\s*\)"),
+    "SWC-123": (),
+    "SWC-124": (r"\bassembly\s*\{[^}]*sstore\b", r"\.delegatecall\s*\(", r"\b\w+\s+storage\s+\w+\s*;"),
+    "SWC-125": (r"contract\s+\w+\s+is\s+\w+\s*,\s*\w+",),
+    "SWC-126": (r"\.call\s*\{[^}]*gas\s*:", r"\bgasleft\s*\(", r"\brelayer\b"),
+    "SWC-127": (r"\bfunction\s*\([^)]*\)\s*(?:internal|external)\s+\w+",),
+    "SWC-128": (r"for\s*\([^)]*;\s*\w+\s*<\s*\w+\.length\s*;", r"\bwhile\s*\(", r"\bpush\s*\("),
+    "SWC-129": (r"if\s*\([^)]*[^=!<>]=[^=][^)]*\)", r"require\s*\([^)]*[^=!<>]=[^=][^)]*\)"),
+    "SWC-130": ("‮",),
+    "SWC-131": (),
+    "SWC-132": (r"address\s*\(\s*this\s*\)\.balance", r"\bselfdestruct\s*\("),
+    "SWC-133": (r"abi\.encodePacked\s*\(",),
+    "SWC-134": (r"\.call\s*\{[^}]*gas\s*:\s*\d+",),
+    "SWC-135": (r"\b\w+\s*==\s*\w+\s*;", r"\b\w+\s*!=\s*\w+\s*;"),
+    "SWC-136": (r"\b(?:password|secret|privateKey|apiKey|seed)\b", r"\bprivate\b"),
+}
 
 
 # Bỏ code block, link, ký hiệu Markdown -> văn bản thuần.
@@ -118,7 +167,7 @@ def build_knowledge_items(knowledge_file: Path, baseline_taxonomy_file: Path) ->
         by_swc[record["swc"]].append(record)
     registry_records = []
     for swc in (f"SWC-{number:03d}" for number in range(100, 137)):
-        patterns = list(SIGNAL_PATTERNS_BY_SWC.get(swc, ()))
+        patterns = list(REGISTRY_SIGNAL_PATTERNS.get(swc, ()))
         if swc in by_swc:
             registry_records.append(_registry_record(swc, by_swc[swc], taxonomy.get(swc, {}), patterns))
         else:

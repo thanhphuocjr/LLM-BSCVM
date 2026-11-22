@@ -15,8 +15,9 @@ BENCHMARK_FILES = {
 }
 
 
-# Chạy Phase 0 -> 1A -> fusion (không detector) trên một contract tham chiếu.
-def evaluate_contract(key: str) -> dict:
+# Chạy Phase 0 -> 1A -> fusion trên một contract tham chiếu; detector_probability = điểm detector giả cho mọi hàm có thân
+# (None = không có detector: mọi hàm nhận p = 0.05 như hàm không được chấm).
+def evaluate_contract(key: str, detector_probability: float | None = None) -> dict:
     path = SMARTBUGS_WILD_DIR / BENCHMARK_FILES[key]
     if not path.exists():
         raise unittest.SkipTest(f"benchmark contract not found: {path}")
@@ -24,7 +25,10 @@ def evaluate_contract(key: str) -> dict:
     solc_bin, _, _ = select_best_solc(code)
     units = parse_code_units(code)
     static_res = run_static(code, units=[unit for unit in units if unit.has_body])
-    fused, _ = fuse_findings([], static_res, {"findings": []})
+    unit_results = [] if detector_probability is None else [
+        {"unit_id": unit.unit_id, "status": "ok", "label": "Safe", "vulnerability_probability": detector_probability}
+        for unit in units if unit.has_body]
+    fused, _ = fuse_findings(unit_results, static_res, {"findings": []})
     return {
         "compiler": solc_bin.name if solc_bin else "none",
         "empty_body_units": [unit.unit_id for unit in units if not unit.has_body],
@@ -50,9 +54,10 @@ class TestBenchmarkRegression(unittest.TestCase):
         self.assertLessEqual(res["fused_count"], 5)
         self.assertIn("0.4.11", res["compiler"])
 
-    # elixir: đúng 4 finding SWC-115 (tx.origin), hàm không thân được nhận diện, solc 0.4.11.
+    # elixir: với tín hiệu detector yếu (0.2, dưới ngưỡng) đúng 4 finding SWC-115 (tx.origin) tới agent và chỉ chúng là
+    # Critical; hàm không thân được nhận diện; solc 0.4.11. (Không có detector, finding Critical chỉ-static dưới tau.)
     def test_elixir_benchmark(self):
-        res = evaluate_contract("elixir")
+        res = evaluate_contract("elixir", detector_probability=0.2)
         self.assertEqual(res["fused_swc_115_count"], 4)
         self.assertEqual(res["fused_critical_count"], 4)
         self.assertIn("0.4.11", res["compiler"])

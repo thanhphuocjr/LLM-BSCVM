@@ -6,7 +6,7 @@ Mọi đường dẫn được khai báo một lần trong `E2E/config.py`.
 
 ```text
 data/
-├── knowledge_base/                 CƠ SỞ TRI THỨC LỖ HỔNG (Phase 1B RAG, Phase 2 Advisor)
+├── knowledge_base/                 CƠ SỞ TRI THỨC LỖ HỔNG (dùng chung qua E2E/common/knowledge_base.py: 1B, 2, 3, 4)
 │   ├── source/                     đầu vào của bước xây dựng
 │   │   ├── final-vulnerability-knowledge.json   hàm lỗi + SWC + nguyên nhân + bản vá (DAppSCAN, iAudit, kaggle_ds2)
 │   │   └── baseline_taxonomy.json               mô tả / cách khắc phục chuẩn của 37 SWC (SWC Registry)
@@ -42,6 +42,9 @@ data/
     │   └── ham_sua_lan_2_ket_qua.csv (+ _blind: bỏ cột nhận xét của giám khảo vòng 1)
     ├── round2_regress/             VÒNG 2, nhóm 18 hàm mà bản vá vòng 1 sinh lỗi mới (có self-check)
     ├── solodit_9tools/             kết quả benchmark 9 công cụ (details / summary CSV, report.md)
+    ├── heuristics_tuning/          tối ưu 47 tham số đặt tay (19/11): scripts/, out/, bao_cao/ (PDF)
+    ├── heuristics_tuning_v2/       tái cấu trúc Phase 1 (22/11): RAG chỉ-độ-giống, phân loại 1-NN, fit lại fusion
+    │                               (scripts r1-r7, out/, README.md)
     └── audit_runs/<run_id>/        mỗi lần audit từ web app / CLI (web app đọc lịch sử từ đây)
 ```
 

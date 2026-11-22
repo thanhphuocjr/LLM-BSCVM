@@ -6,31 +6,32 @@ from collections import Counter
 from E2E.common.findings import finding_key
 from E2E.common.gpu_client import check_server_health, get_server_url
 from E2E.common.io_utils import log
+from E2E.common.knowledge_base import default_knowledge_base
 from E2E.config import DEFAULT_DETECTOR_THRESHOLD, MAX_FIX_ATTEMPTS, PIPELINE_VERSION, SCHEMA_VERSION
 from E2E.phase0_parsing.code_units import CodeUnit, as_code_unit
 from E2E.phase1_fusion.fusion import fuse_findings
 from E2E.phase1c_detector.detector import score_units_via_server, summarize_detector
-from E2E.phase2_advisor.advisor import UNMAPPED_CLASS_TITLES, RepairKnowledgeBase
 from E2E.phase2_advisor.advisor_phase import _generate_advisor_section
 from E2E.phase3_assessor.assessor_phase import _generate_assessor_section
-from E2E.phase4_fixer.fixer import _build_rag_knowledge_section, _splice_unit, patch_unit
-from E2E.phase5_verifier.candidate_check import _finding_pairs, _verification_feedback, verify_candidate
+from E2E.phase4_fixer.fixer import _splice_unit, patch_unit
+from E2E.phase5_verifier.verifier import finding_pairs, verification_feedback, verify_patch
 
 
-# Tách finding theo kết luận Advisor: bị loại (kèm lý do) / giữ lại (UNMAPPED đổi tiêu đề theo lớp lỗi Advisor gán).
+# Gắn mã của chính hàm (unit_code) vào mỗi finding để Advisor xét đúng hàm đó.
+def _with_unit_code(findings: list[dict], units: list[CodeUnit]) -> list[dict]:
+    code = {unit.unit_id: unit.code for unit in units if unit.code}
+    return [{**item, "unit_code": code[item["unit_id"]]} if item.get("unit_id") in code and not item.get("unit_code")
+            else dict(item) for item in findings]
+
+
+# Tách finding theo kết luận Advisor: bị loại (kèm lý do Advisor đưa ra) / giữ lại.
 def _apply_advisor_triage(findings: list[dict], advisor: dict) -> tuple[list[dict], list[dict]]:
     dismissed_ids = set(advisor["false_positives"])
-    advisor_swc = {item["finding_id"]: item["advisor_swc"] for item in advisor["suggestions"]
-                   if item.get("advisor_swc")}
     kept, dismissed = [], []
     for item in findings:
         key = finding_key(item)
         if key in dismissed_ids:
             dismissed.append({**item, "dismissal_reason": advisor["false_positive_reasons"].get(key, "")})
-        elif key in advisor_swc:
-            swc = advisor_swc[key]
-            kept.append({**item, "advisor_swc": swc,
-                         "title": f"{UNMAPPED_CLASS_TITLES[swc]} (classified by the Advisor)"})
         else:
             kept.append(item)
     return kept, dismissed
@@ -70,12 +71,13 @@ def _next_attempt_plan(source_code: str, targets: list[CodeUnit], active: list[C
     return rebuilt, keep, [unit for unit in targets if unit.unit_id in failing]
 
 
-# [VÒNG SỬA Phase 4-5, tối đa max_attempts] Fixer vá từng hàm -> verify_candidate -> feedback; chọn attempt tốt nhất.
+# [VÒNG SỬA Phase 4-5, tối đa max_attempts] Fixer vá từng hàm -> verify_patch (đủ mọi kiểm tra) -> feedback; chọn tốt nhất.
 def _repair_loop(source_code: str, targets: list[CodeUnit], units_by_id: dict, findings: list[dict],
-                 suggestions: list[dict], rag_section: str, unit_results: list[dict], known_pairs: set,
-                 threshold: float, max_attempts: int, server_url: str) -> tuple[list[dict], dict | None]:
+                 suggestions: list[dict], unit_results: list[dict], known_pairs: set, threshold: float,
+                 max_attempts: int, server_url: str, file_name: str,
+                 source_root: str | None) -> tuple[list[dict], dict | None]:
     target_ids = {unit.unit_id for unit in targets}
-    target_pairs = {pair for pair in _finding_pairs(findings) if pair[1] in target_ids}
+    kb = default_knowledge_base()
     attempts, best, feedback = [], None, ""
     base_code, carried, active = source_code, [], list(targets)
     for attempt in range(1, max_attempts + 1 if targets else 1):
@@ -86,15 +88,16 @@ def _repair_loop(source_code: str, targets: list[CodeUnit], units_by_id: dict, f
             code, outcome = patch_unit(
                 code, unit, unit_findings=[item for item in findings if item.get("unit_id") == unit.unit_id],
                 unit_suggestions=[item for item in suggestions if item.get("unit_id") == unit.unit_id],
-                source_code=source_code, feedback_note=feedback, rag_section=rag_section, attempt=attempt,
-                server_url=server_url)
+                source_code=source_code, feedback_note=feedback, attempt=attempt, server_url=server_url,
+                knowledge_base=kb)
             outcomes.append(outcome)
         patched_ids = {str(item.get("unit_id")) for item in outcomes
                        if item.get("status") == "applied" and item.get("unit_id")}
-        log(f"[PHASE 5] Verifying candidate ({label}): compiler + neural detector + static/RAG re-run...")
-        verification = verify_candidate(source_code, code, patched_unit_ids=patched_ids, target_unit_ids=target_ids,
-                                        original_unit_results=unit_results, target_pairs=target_pairs,
-                                        known_pairs=known_pairs, threshold=threshold, server_url=server_url)
+        log(f"[PHASE 5] Verifying candidate ({label}): compile + Slither, AST behavior, static re-run, detector...")
+        verification = verify_patch(source_code, code, patch_outcomes=outcomes, target_findings=findings,
+                                    original_unit_results=unit_results, target_unit_ids=target_ids,
+                                    known_pairs=known_pairs, threshold=threshold, server_url=server_url,
+                                    file_name=file_name, source_root=source_root)
         record = {"attempt": attempt, "max_attempts": max_attempts, "threshold": threshold,
                   "verdict": "Safe" if verification["passed"] else "Vulnerable", "code": code,
                   "patch_outcomes": outcomes, **verification}
@@ -107,7 +110,7 @@ def _repair_loop(source_code: str, targets: list[CodeUnit], units_by_id: dict, f
             f"(compile={verification['compilation']['state']}, failing={verification['failing_units']}).")
         if verification["passed"] or attempt == max_attempts:
             break
-        record["feedback"] = feedback = _verification_feedback(attempt, max_attempts, verification)
+        record["feedback"] = feedback = verification_feedback(attempt, max_attempts, verification)
         base_code, carried, active = _next_attempt_plan(source_code, targets, active, outcomes, verification,
                                                         patched_ids, units_by_id)
     return attempts, best
@@ -127,7 +130,7 @@ def _verifier_items(findings: list[dict], patch_outcomes: list[dict], best: dict
     return items
 
 
-# [HÀM TRUNG TÂM PHẦN GPU] request.json -> 1C detector -> 1F fusion -> 2 Advisor -> 3 Assessor -> 4-5 vòng sửa.
+# [HÀM TRUNG TÂM PHẦN GPU] request.json -> 1C detector -> fusion -> 2 Advisor -> 3 Assessor -> 4-5 vòng sửa + kiểm chứng.
 def run_server_gpu_pipeline(request: dict, *, server_url: str | None = None) -> dict:
     started_at = time.perf_counter()
     server_url = get_server_url(server_url)
@@ -139,7 +142,6 @@ def run_server_gpu_pipeline(request: dict, *, server_url: str | None = None) -> 
     max_attempts = min(max(1, requested), MAX_FIX_ATTEMPTS)
     static_p1 = request.get("local_phase1", {}).get("static", {})
     rag_p1 = request.get("local_phase1", {}).get("rag", {})
-    rag_context = rag_p1.get("retrieved_context", [])
     health = check_server_health(server_url)
     if health.get("status") != "ready":
         raise ConnectionError(f"GPU Server tại {server_url} chưa sẵn sàng (trạng thái: {health.get('status')}). "
@@ -155,13 +157,14 @@ def run_server_gpu_pipeline(request: dict, *, server_url: str | None = None) -> 
 
     log("[PHASE 1 FUSED] Synchronizing multi-modal detection signals...")
     findings, candidates = fuse_findings(unit_results, static_p1, rag_p1)
-    knowledge_base = RepairKnowledgeBase()
-    findings = knowledge_base.enrich_findings(findings, code=source_code, code_units=request.get("code_units", []))
-    log(f"[PHASE 1 FUSED] Completed: {len(findings)} confirmed finding(s), {len(candidates)} candidate(s).")
+    findings = _with_unit_code(findings, units)
+    classified = sum(1 for item in findings if item.get("classification"))
+    log(f"[PHASE 1 FUSED] Completed: {len(findings)} confirmed finding(s) ({classified} classified from the "
+        f"nearest known case), {len(candidates)} candidate(s).")
 
-    log("[PHASE 2] Running Security Advisor agent (root cause & remediation analysis)...")
-    advisor = _generate_advisor_section(findings, source_code, use_llm=True, knowledge_base=knowledge_base,
-                                        rag_context=rag_context)
+    log("[PHASE 2] Running Security Advisor agent (triage, root cause & remediation analysis)...")
+    knowledge_base = default_knowledge_base()
+    advisor = _generate_advisor_section(findings, source_code, use_llm=True, knowledge_base=knowledge_base)
     findings, dismissed = _apply_advisor_triage(findings, advisor)
     verdicts = Counter(item.get("advisor_verdict", "no LLM verdict") for item in advisor["suggestions"])
     log(f"[PHASE 2] Completed: {len(advisor['suggestions'])} suggestion(s) {dict(verdicts)}, "
@@ -173,14 +176,13 @@ def run_server_gpu_pipeline(request: dict, *, server_url: str | None = None) -> 
     log(f"[PHASE 3] Completed: {len(assessor.get('assessments', []))} item(s) assessed.")
 
     targets = _repair_targets(units, findings, unit_results, assessor)
-    known_pairs = _finding_pairs([*static_p1.get("findings", []), *static_p1.get("candidates", []),
-                                  *rag_p1.get("findings", [])])
-    first_swc = next((item.get("swc") for item in findings if item.get("swc") not in {None, "UNMAPPED"}), None)
-    rag_section = _build_rag_knowledge_section(rag_context, target_swc=first_swc)
+    known_pairs = finding_pairs([*static_p1.get("findings", []), *static_p1.get("candidates", []),
+                                 *rag_p1.get("findings", [])])
     fixer_started = time.perf_counter()
     attempts, best = _repair_loop(source_code, targets, {unit.unit_id: unit for unit in units}, findings,
-                                  advisor.get("suggestions", []), rag_section, unit_results, known_pairs, threshold,
-                                  max_attempts, server_url)
+                                  advisor.get("suggestions", []), unit_results, known_pairs, threshold, max_attempts,
+                                  server_url, request.get("source", {}).get("file_name") or "Contract.sol",
+                                  execution.get("source_root"))
     fixer_ms = round((time.perf_counter() - fixer_started) * 1000, 2)
     fixed_code, patch_outcomes = (best["code"], best["patch_outcomes"]) if best else (source_code, [])
     overall_verdict = "NOT_APPLICABLE" if best is None else "PASS" if best["passed"] else "WARN"
@@ -206,12 +208,14 @@ def run_server_gpu_pipeline(request: dict, *, server_url: str | None = None) -> 
             "fixer": {"status": "ok", "fixed_code": fixed_code, "patch_outcomes": patch_outcomes},
             "verifier": {
                 "status": "ok",
-                "verification_model": "solc baseline + Qwen2.5-Coder-14B v13 detector + static/RAG re-run",
+                "verification_model": "solc + Slither + AST behavior + static re-run + Qwen2.5-Coder-14B v13 detector",
                 "overall_verdict": overall_verdict, "verifications": _verifier_items(findings, patch_outcomes, best),
                 "attempts_count": len(attempts), "max_attempts": max_attempts,
                 "attempts": [{key: value for key, value in record.items() if key != "code"} for record in attempts],
                 "compilation": best["compilation"] if best else {},
                 "fixed_unit_results": fixed_detector.get("unit_results", []),
+                "final": {key: best[key] for key in ("tool_verification", "behavioral_verification", "fixed_static")}
+                if best else None,
             },
         },
         "timings": {"total_ms": round((time.perf_counter() - started_at) * 1000, 2), "detector_ms": detector_ms,

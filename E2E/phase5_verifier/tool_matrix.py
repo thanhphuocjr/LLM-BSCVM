@@ -2,6 +2,7 @@
 
 import platform
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 
 from E2E.common.regex_patterns import RE_LOCATION_IN_MESSAGE, RE_WHITESPACE
@@ -18,6 +19,10 @@ SWC_CATEGORY = {"SWC-100": "access_control", "SWC-101": "arithmetic", "SWC-104":
 # Nhóm Slither phát hiện được; lỗi mục tiêu ngoài nhóm này thì Slither chạy sạch cũng không chứng minh đã sửa.
 SLITHER_COVERAGE = {"access_control", "arithmetic", "denial_of_service", "reentrancy", "selfdestruct", "timestamp",
                     "tx_origin", "unchecked_low_level_calls"}
+
+
+# Slither trên bản GỐC (có nhớ): vòng sửa kiểm chứng tối đa 3 bản vá của cùng một contract.
+_original_slither = lru_cache(maxsize=8)(_run_native_slither)
 
 
 # Đổi mức độ của tool thành số để so sánh (thang RISK_ORDER).
@@ -156,7 +161,7 @@ def verify_security_tool_matrix(original_code: str, fixed_code: str, *, file_nam
     compile_status = compile_result.get("status")
     target_categories = _target_categories(target_findings)
     if compile_status == "passed":
-        original_run = _run_native_slither(original_code, file_name, source_root, solc, reason)
+        original_run = _original_slither(original_code, file_name, source_root, solc, reason)
         fixed_run = _run_native_slither(fixed_code, file_name, source_root, solc, reason)
     else:
         original_run = fixed_run = {"run_status": "skipped", "findings": [], "error": "fixed source did not compile",

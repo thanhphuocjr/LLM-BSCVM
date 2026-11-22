@@ -24,6 +24,9 @@ def re_call(name: str) -> re.Pattern[str]:
     return re.compile(rf"\b{re.escape(name)}\s*\(")
 
 
+# Mã "SWC-xxx" trong một chuỗi bất kỳ.
+RE_SWC_ID = re.compile(r"SWC-\d{3}")
+
 # ══ PHASE 0 - TÁCH CODE UNIT (code_units.py) + NGỮ CẢNH PROMPT (contract_context.py) ══
 
 # Đầu một code unit: "function f(" (group function), "function (" (unnamed_fallback), constructor/receive/fallback (special).
@@ -420,13 +423,8 @@ def re_enum_conversion(enum_name: str) -> re.Pattern[str]:
     return re.compile(rf'\b{re.escape(enum_name)}\s*\([^)]*\)')
 
 
-# ══ PHASE 1B - RAG: 37 SWC AGENT (swc_agents.py) + XÂY CƠ SỞ TRI THỨC (build_knowledge_base.py) ══
+# ══ PHASE 1A - CỔNG TÍN HIỆU SWC CỦA LUẬT TĨNH (swc_signals.py) ══
 
-# Mã "SWC-xxx" trong một chuỗi bất kỳ.
-RE_SWC_ID = re.compile(r"SWC-\d{3}")
-
-# Nội dung các khối ```...``` (có hoặc không tên ngôn ngữ), group(1) = phần mã.
-RE_ANY_CODE_FENCE = re.compile(r"```(?:\w+)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 
 # Như RE_PRAGMA_SPEC nhưng bỏ qua hoa/thường.
 RE_PRAGMA_SPEC_ANY_CASE = re.compile(r"pragma\s+solidity\s+([^;]+);", re.IGNORECASE)
@@ -473,8 +471,6 @@ RE_STATE_UPDATE = re.compile(
 # Thân vòng lặp for/while (tới dấu "}" đầu tiên), group(1) = thân.
 RE_LOOP_BODY = re.compile(r"\b(?:for|while)\s*\([^)]*\)\s*\{(.*?)\}", re.IGNORECASE | re.DOTALL)
 
-# Dấu "=" đứng một mình (phép gán, không phải ==, !=, <=, >=, =>).
-RE_SINGLE_EQUALS = re.compile(r"(?<![=!<>])=(?![=>])")
 
 # SWC-100: hàm mà header sau ")" không có visibility.
 RE_FUNCTION_WITHOUT_VISIBILITY = re.compile(
@@ -491,8 +487,6 @@ RE_SAFEMATH = re.compile(r"\bSafeMath\b")
 # Ép kiểu thu hẹp "uint8(" ... "int128(".
 RE_NARROW_INT_CAST = re.compile(r"\b(?:u?int)(?:8|16|32|64|128)\s*\(")
 
-# Pragma "trôi" có ^, >=, > hoặc *: "pragma solidity ^0.4.24".
-RE_FLOATING_PRAGMA = re.compile(r"pragma\s+solidity\s+[^;]*(?:\^|>=|>|\*)", re.IGNORECASE)
 
 # Lời gọi gửi ETH: ".call{value: ...}", ".send(", ".transfer(".
 RE_ETHER_TRANSFER = re.compile(r"\.(?:call\s*\{[^}]*value\s*:|send\s*\(|transfer\s*\()", re.IGNORECASE | re.DOTALL)
@@ -511,20 +505,10 @@ RE_USER_BALANCE_GUARD = re.compile(r"balances?\s*\[\s*msg\.sender\s*\].{0,80}(?:
 # Lời gọi selfdestruct( / suicide(.
 RE_SELFDESTRUCT_CALL = re.compile(r"\b(?:selfdestruct|suicide)\s*\(", re.IGNORECASE)
 
-# Lời gọi .delegatecall( / .callcode(.
-RE_DELEGATECALL_OR_CALLCODE = re.compile(r"\.\s*(?:delegatecall|callcode)\s*\(", re.IGNORECASE)
 
 # Lời gọi ra ngoài .transfer / .send / .call (trong thân vòng lặp).
 RE_EXTERNAL_CALL = re.compile(r"\.(?:transfer|send|call)\s*[\(\{]", re.IGNORECASE | re.DOTALL)
 
-# Hàm tên viết hoa (constructor kiểu cũ trùng tên contract).
-RE_CAPITALIZED_FUNCTION = re.compile(r"\bfunction\s+[A-Z]\w+\s*\(")
-
-# Biến lưu giá trị nhạy cảm: "string private password", "bytes32 secretKey"...
-RE_SENSITIVE_STATE_VALUE = re.compile(
-    r"\b(?:string|bytes\d*|uint\d*|address)\s+(?:private\s+)?\w*(?:password|secret|privateKey|apiKey|seed)\w*",
-    re.IGNORECASE,
-)
 
 # Có cơ chế phân quyền: onlyOwner, onlyRole, onlyAdmin, AccessControl, Ownable, require(msg.sender == ...).
 RE_ACCESS_CONTROL_GUARD = re.compile(
@@ -542,10 +526,7 @@ def re_result_check(name: str) -> re.Pattern[str]:
     )
 
 
-# Mở đầu điều kiện "<keyword>(" với keyword = "if" hoặc "require".
-def re_condition_opening(keyword: str) -> re.Pattern[str]:
-    return re.compile(rf"\b{re.escape(keyword)}\s*\(", re.IGNORECASE)
-
+# ══ PHASE 1B - XÂY CƠ SỞ TRI THỨC (build_knowledge_base.py) ══
 
 # Markdown (build_knowledge_base): làm sạch mô tả SWC thành văn bản thuần.
 RE_MARKDOWN_CODE_BLOCK = re.compile(r"```[\s\S]*?```")          # khối ```code```
@@ -561,7 +542,7 @@ RE_SENTENCE_BREAK = re.compile(r"[.;]\s+")                      # chỗ ngắt c
 RE_QUOTE_ELLIPSIS = re.compile(r"\.\.\.|…")
 
 
-# ══ PHASE 4 - FIXER (fixer.py, patching.py, behavior_guard.py) ══
+# ══ PHASE 4 - FIXER (fixer.py, patching.py) ══
 
 # Mọi phiên bản "x.y.z" trong pragma: ">=0.4.22 <0.6.0" -> [(0,4,22), (0,6,0)].
 RE_FULL_VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)")
@@ -590,7 +571,9 @@ def re_declaration_start(target_name: str | None) -> re.Pattern[str]:
     return re.compile(r"\b(function\s+[A-Za-z_$][\w$]*\s*\(|function\s*\(|(?:constructor|receive|fallback)\s*\()")
 
 
-# Guard hành vi: các kiểu chuyển ETH và dạng an toàn tương đương.
+# ══ PHASE 5 - VERIFIER (verifier.py, behavior_verifier.py, tool_matrix.py) ══
+
+# Kiểm tra hành vi (dự phòng cú pháp khi không so được AST): các kiểu chuyển ETH và dạng an toàn tương đương.
 RE_ETH_VALUE_CALL = re.compile(r"(?:\.call\s*\{\s*value\s*:|\.call\.value\s*\()")   # .call{value: x}( / .call.value(x)(
 RE_TRANSFER_CALL = re.compile(r"\.transfer\s*\(")                                    # to.transfer(
 RE_SAFE_TRANSFER_CALL = re.compile(r"\.safeTransfer\s*\(")                           # token.safeTransfer(
@@ -609,9 +592,6 @@ RE_EMIT_EVENT = re.compile(r"\bemit\s+([A-Za-z_$][\w$]*)\s*\(")
 
 # Câu lệnh bắt đầu bằng tên viết hoa rồi "(" (event Solidity < 0.4.21), group(1) = tên.
 RE_LEGACY_EVENT_STATEMENT = re.compile(r"(?:^|[;{}])\s*([A-Z][\w$]*)\s*\(")
-
-
-# ══ PHASE 5 - VERIFIER (candidate_check.py, tool_matrix.py) ══
 
 # Số dòng trong vị trí lỗi solc: "--> a.sol:12:5" (>= 0.5) và "a.sol:12:5: Error" (0.4).
 RE_SOLC_ERROR_LINE = re.compile(r"\S+?\.sol:(\d+):\d+")

@@ -8,9 +8,9 @@ from E2E.common.solc import select_best_solc
 from E2E.config import RISK_ORDER
 from E2E.phase0_parsing.code_units import CodeUnit, parse_code_units
 from E2E.phase1a_static.static_analyzer import extract_guard_modifiers, run_static_analysis
-from E2E.phase1b_rag.swc_agents import find_custom_signal_hits
+from E2E.phase1a_static.swc_signals import signal_gate_hits
 
-# Loại lỗi dễ báo nhầm: chỉ confirmed khi SWC agent tương ứng (Phase 1B) cũng thấy tín hiệu trong mã.
+# Loại lỗi dễ báo nhầm: chỉ confirmed khi cổng tín hiệu SWC (swc_signals.py) thấy tín hiệu đúng ngữ cảnh trong mã.
 SIGNAL_GATED_TYPES = {
     "reentrancy": "SWC-107", "unprotected_ether_withdrawal": "SWC-105", "unprotected_selfdestruct": "SWC-106",
     "function_default_visibility": "SWC-100", "unchecked_low_level_calls": "SWC-104",
@@ -37,7 +37,7 @@ def _file_line(unit: CodeUnit | None, line):
     return unit.start_line + line - 1 if unit is not None and isinstance(line, int) else line
 
 
-# Kết quả bộ luật -> các "dòng finding" chuẩn của pipeline (loại dễ báo nhầm phải qua cổng tín hiệu SWC agent).
+# Kết quả bộ luật -> các "dòng finding" chuẩn của pipeline (loại dễ báo nhầm phải qua cổng tín hiệu SWC).
 def _finding_rows(result: dict, analysis_code: str, unit: CodeUnit | None = None) -> list[dict]:
     rows = []
     for finding in map(jsonable, result.get("findings", {}).values()):
@@ -49,7 +49,7 @@ def _finding_rows(result: dict, analysis_code: str, unit: CodeUnit | None = None
             "severity": finding.get("risk_level", "Unknown"),
             "confidence": round(min(1.0, sum(float(m.get("pattern_weight") or 0.0)
                                              for m in finding.get("matches", []))), 6),
-            "confirmed": bool(find_custom_signal_hits(gate_swc, analysis_code)) if gate_swc
+            "confirmed": bool(signal_gate_hits(gate_swc, analysis_code)) if gate_swc
             else bool(finding.get("confirmed")),
             "line": _file_line(unit, matches[0].get("line")), "unit_id": unit.unit_id if unit else None,
             "matched_text": matches[0].get("matched_text"),

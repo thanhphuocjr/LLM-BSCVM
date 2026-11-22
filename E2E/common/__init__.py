@@ -1,1 +1,1 @@
-"""Phần dùng chung: client GPU server, Slither, solc, IO, regex (regex_patterns.py)."""
+"""Phần dùng chung: cơ sở tri thức (knowledge_base.py), danh mục SWC, client GPU server, Slither, solc, IO, regex."""

@@ -19,9 +19,7 @@ from E2E.phase0_parsing.code_units import parse_code_units
 from E2E.phase1_fusion.fusion import fuse_detection
 from E2E.phase1a_static.static_runner import run_static
 from E2E.phase1b_rag.rag_runner import run_rag
-from E2E.phase5_verifier.final_verification import (
-    build_verification_channels, decide_overall_verdict, skipped_verification, verify_final_patch,
-)
+from E2E.phase5_verifier.verifier import build_verification_channels, decide_overall_verdict, skipped_verification
 from E2E.phase6_reporter.report import apply_verification_to_report, build_report_data, render_markdown, write_reports
 
 
@@ -79,35 +77,32 @@ def _local_phase1(code: str, units: list, local_phase1: dict | None) -> tuple[di
         return static.result(), rag.result()
 
 
-# Phase 5 cuối: có bản vá thì kiểm chứng (Slither, AST, static/RAG) rồi ra overall_verdict -> phase5_verification.json.
-def _final_verification(code: str, remote: dict, fused: dict, file_name: str, source_root,
-                        run_dir: Path) -> tuple[dict, dict]:
+# Phase 5 cuối: lấy kết quả kiểm chứng của bản vá tốt nhất (đã chạy trong vòng sửa) -> overall_verdict.
+def _final_verification(code: str, remote: dict, fused: dict, run_dir: Path) -> tuple[dict, dict]:
     fixer = remote.get("phases", {}).get("fixer", {})
+    verifier = remote.get("phases", {}).get("verifier", {}) if remote else {}
     fixed_code = fixer.get("fixed_code") or code
     patch_outcomes = fixer.get("patch_outcomes", []) if remote else []
     patch_applied = any(item.get("status") == "applied" for item in patch_outcomes)
-    fixed_static = fixed_rag = None
-    if remote and remote.get("status") in {"ok", "partial"} and fixed_code and fixed_code != code:
-        log("[PHASE 5] Verifying patch: compile + Slither, AST behavior check, static/RAG re-run...")
-        tool_result, behavioral, fixed_static, fixed_rag = verify_final_patch(
-            code, fixed_code, patch_outcomes=patch_outcomes, fused=fused, file_name=file_name, source_root=source_root)
+    final = verifier.get("final") if fixed_code != code else None
+    if final:
+        tool_result, behavioral, fixed_static = (dict(final["tool_verification"]), final["behavioral_verification"],
+                                                 final["fixed_static"])
         write_json(run_dir / "phase5_fixed_static.json", fixed_static)
-        write_json(run_dir / "phase5_fixed_rag.json", fixed_rag)
     else:
-        tool_result, behavioral = skipped_verification()
+        (tool_result, behavioral), fixed_static = skipped_verification("No verified patch."), None
     tool_result["behavioral"] = behavioral
     verdict = decide_overall_verdict(remote=remote, fused=fused, code=code, fixed_code=fixed_code,
                                      patch_applied=patch_applied, tool_result=tool_result, behavioral_result=behavioral,
-                                     fixed_static=fixed_static, fixed_rag=fixed_rag)
+                                     fixed_static=fixed_static)
     remote_fixed = _remote_detector(remote, "fixed")
-    verifier = remote.get("phases", {}).get("verifier", {}) if remote else {}
     complete = tool_result.get("policy_verdict", "inconclusive") in {"passed", "failed"} \
         and tool_result.get("status") in {"ok", "partial"}
     verification = {
         "status": "complete" if complete else "inconclusive" if not remote or remote.get("status") != "ok" else "partial",
         "original_detection": fused, "fixed_detection": remote_fixed or {}, "tool_verification": tool_result,
         "behavioral_verification": behavioral,
-        "verification_channels": build_verification_channels(tool_result, static_result=fixed_static, rag_result=fixed_rag,
+        "verification_channels": build_verification_channels(tool_result, static_result=fixed_static,
                                                              detector_fixed=remote_fixed),
         "attempts_count": verifier.get("attempts_count", 1) if remote else 0,
         "max_attempts": verifier.get("max_attempts", MAX_FIX_ATTEMPTS),
@@ -150,6 +145,7 @@ def run_pipeline(code: str, *, file_name: str = "Contract.sol", run_id: str | No
         **header, "created_at": utc_now(), "source": source, "code_units": [unit.to_dict() for unit in units],
         "local_phase1": {"static": static_result, "rag": rag_result, "provisional_fusion": provisional},
         "execution": {"detector_threshold": resolve_detector_threshold(detector_threshold),
+                      "source_root": str(source_root) if source_root else None,
                       "repair": {"attempt": 1, "max_attempts": min(max(1, max_fix_attempts), MAX_FIX_ATTEMPTS)}},
     }
     request_path = write_json(run_dir / "request.json", request)
@@ -164,7 +160,7 @@ def run_pipeline(code: str, *, file_name: str = "Contract.sol", run_id: str | No
     for number, name in ((2, "advisor"), (3, "assessor"), (4, "fixer")):
         write_json(run_dir / f"phase{number}_{name}.json", remote.get("phases", {}).get(
             name, {"status": "pending", "reason": "GPU server result has not been supplied"}))
-    tool_result, verification = _final_verification(code, remote, fused, file_name, source_root, run_dir)
+    tool_result, verification = _final_verification(code, remote, fused, run_dir)
     if remote:
         log(f"[PHASE 5] Completed: Verification verdict: {verification['overall_verdict']}.")
         log("[PHASE 6] Generating multi-format audit reports (HTML, PDF, Markdown)...")

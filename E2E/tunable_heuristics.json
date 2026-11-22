@@ -1,7 +1,7 @@
 {
   "title": "E2E Pipeline Tunable Heuristics & Combination Formulas Catalog",
   "description": "Danh mục các công thức kết hợp đa phương thức và hệ số định tính (đã loại bỏ hoàn toàn các siêu tham số huấn luyện của LLM như detector threshold 0.7, nhiệt độ, giới hạn token, và các trọng số lỗ hổng SWC/CVSS tiêu chuẩn).",
-  "total_parameters": 47,
+  "total_parameters": 38,
   "parameters": [
     {
       "phase": "Phase 1 Fusion",
@@ -9,14 +9,14 @@
       "component_function": "fuse_findings",
       "file_location": "E2E/phase1_fusion/fusion_calibration.json:3",
       "parameter_name": "intercept",
-      "current_value": -1.6694,
+      "current_value": -1.4861,
       "value_type": "float",
       "formula_rule": "z = intercept + sum(w_i * x_i); p_final = 1 / (1 + exp(-z))",
       "heuristic_rationale": "Hệ số tự do (bias) trong mô hình logistic regression gộp tín hiệu từng finding. Đặt tay để cân bằng xác suất ban đầu.",
       "tuning_direction": "Fit bằng hồi quy Logistic thực tế trên tập validation của smart contracts thay vì đặt tay.",
-      "previous_value": -2.15,
-      "optimization_status": "Đã tối ưu (đổi giá trị)",
-      "optimization_evidence": "Fit bằng hồi quy logistic có ràng buộc (w_static, w_rag, w_corroborated >= 0; L2 = 1) trên finding local của 1,110 hàm thật v12 val+test (nhãn = nhãn của hàm; bỏ kaggle_ds2 tổng hợp)."
+      "previous_value": -1.6694,
+      "optimization_status": "Đã tối ưu lại (22/11, sau tái cấu trúc Phase 1)",
+      "optimization_evidence": "Fit lại 22/11 bằng hồi quy logistic có ràng buộc (w_static, w_rag, w_corroborated >= 0; L2 = 1) trên finding local của 1,110 hàm thật v12 val+test sau tái cấu trúc: RAG chỉ còn độ giống ca đã biết (không dùng regex tín hiệu của static) nên static và RAG là hai kênh độc lập; hàm chỉ detector báo được Phase 1 phân loại."
     },
     {
       "phase": "Phase 1 Fusion",
@@ -24,14 +24,14 @@
       "component_function": "fuse_findings",
       "file_location": "E2E/phase1_fusion/fusion_calibration.json:5",
       "parameter_name": "w_p_detector",
-      "current_value": 3.5825,
+      "current_value": 3.6935,
       "value_type": "float",
-      "formula_rule": "z += 3.5825 * p_detector",
+      "formula_rule": "z += 3.6935 * p_detector",
       "heuristic_rationale": "Trọng số đóng góp của xác suất từ Neural Detector khi hợp nhất tín hiệu đa phương thức cho 1 finding.",
       "tuning_direction": "Fit cùng với intercept bằng hồi quy Logistic đa biến trên tập validation.",
-      "previous_value": 3.85,
-      "optimization_status": "Đã tối ưu (đổi giá trị)",
-      "optimization_evidence": "Fit bằng hồi quy logistic có ràng buộc (w_static, w_rag, w_corroborated >= 0; L2 = 1) trên finding local của 1,110 hàm thật v12 val+test (nhãn = nhãn của hàm; bỏ kaggle_ds2 tổng hợp). Detector là tín hiệu duy nhất có sức phân biệt rõ."
+      "previous_value": 3.5825,
+      "optimization_status": "Đã tối ưu lại (22/11, sau tái cấu trúc Phase 1)",
+      "optimization_evidence": "Fit lại 22/11 bằng hồi quy logistic có ràng buộc (w_static, w_rag, w_corroborated >= 0; L2 = 1) trên finding local của 1,110 hàm thật v12 val+test sau tái cấu trúc: RAG chỉ còn độ giống ca đã biết (không dùng regex tín hiệu của static) nên static và RAG là hai kênh độc lập; hàm chỉ detector báo được Phase 1 phân loại. Detector vẫn là tín hiệu phân biệt mạnh nhất."
     },
     {
       "phase": "Phase 1 Fusion",
@@ -44,9 +44,9 @@
       "formula_rule": "z += 0.0 * static_conf",
       "heuristic_rationale": "Trọng số đóng góp của điểm tin cậy từ phân tích tĩnh (Slither + Regex rules).",
       "tuning_direction": "Fit cùng bộ trọng số logistic trên tập validation.",
-      "previous_value": 1.2,
-      "optimization_status": "Đã tối ưu (đổi giá trị)",
-      "optimization_evidence": "Fit bằng hồi quy logistic có ràng buộc (w_static, w_rag, w_corroborated >= 0; L2 = 1) trên finding local của 1,110 hàm thật v12 val+test (nhãn = nhãn của hàm; bỏ kaggle_ds2 tổng hợp). Trọng số chạm biên 0: khi đã biết p_detector, confidence static không thêm thông tin (khớp kết luận đợt hiệu chuẩn 17/11)."
+      "previous_value": 0.0,
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Fit lại 22/11 bằng hồi quy logistic có ràng buộc (w_static, w_rag, w_corroborated >= 0; L2 = 1) trên finding local của 1,110 hàm thật v12 val+test sau tái cấu trúc: RAG chỉ còn độ giống ca đã biết (không dùng regex tín hiệu của static) nên static và RAG là hai kênh độc lập; hàm chỉ detector báo được Phase 1 phân loại. Vẫn chạm biên 0: khi đã biết p_detector, confidence static không thêm thông tin."
     },
     {
       "phase": "Phase 1 Fusion",
@@ -54,14 +54,14 @@
       "component_function": "fuse_findings",
       "file_location": "E2E/phase1_fusion/fusion_calibration.json:7",
       "parameter_name": "w_rag_conf",
-      "current_value": 0.0564,
+      "current_value": 0.4812,
       "value_type": "float",
-      "formula_rule": "z += 0.0564 * rag_conf",
+      "formula_rule": "z += 0.4812 * rag_conf",
       "heuristic_rationale": "Trọng số đóng góp của điểm tin cậy từ RAG Retriever (TF-IDF + Signal gating).",
       "tuning_direction": "Fit cùng bộ trọng số logistic trên tập validation.",
-      "previous_value": 1.1,
-      "optimization_status": "Đã tối ưu (đổi giá trị)",
-      "optimization_evidence": "Fit bằng hồi quy logistic có ràng buộc (w_static, w_rag, w_corroborated >= 0; L2 = 1) trên finding local của 1,110 hàm thật v12 val+test (nhãn = nhãn của hàm; bỏ kaggle_ds2 tổng hợp). Gần 0: confidence RAG gần như không thêm thông tin khi đã biết p_detector."
+      "previous_value": 0.0564,
+      "optimization_status": "Đã tối ưu lại (22/11, sau tái cấu trúc Phase 1)",
+      "optimization_evidence": "Fit lại 22/11 bằng hồi quy logistic có ràng buộc (w_static, w_rag, w_corroborated >= 0; L2 = 1) trên finding local của 1,110 hàm thật v12 val+test sau tái cấu trúc: RAG chỉ còn độ giống ca đã biết (không dùng regex tín hiệu của static) nên static và RAG là hai kênh độc lập; hàm chỉ detector báo được Phase 1 phân loại. Tăng 0.056 -> 0.481: độ giống ca đã biết mang thông tin riêng (trước đây confidence RAG chủ yếu là regex trùng với static)."
     },
     {
       "phase": "Phase 1 Fusion",
@@ -69,14 +69,14 @@
       "component_function": "fuse_findings",
       "file_location": "E2E/phase1_fusion/fusion_calibration.json:8",
       "parameter_name": "w_corroborated",
-      "current_value": 0.6884,
+      "current_value": 0.0774,
       "value_type": "float",
-      "formula_rule": "z += 0.6884 (khi static và RAG cùng báo finding)",
+      "formula_rule": "z += 0.0774 (khi static và RAG cùng báo finding)",
       "heuristic_rationale": "Điểm thưởng khi finding được đồng thuận bởi 2 kênh bằng chứng độc lập (Static và RAG).",
       "tuning_direction": "Fit bằng hồi quy Logistic để xác định giá trị gia tăng thực tế của sự đồng thuận đa kênh.",
-      "previous_value": 0.65,
-      "optimization_status": "Đã tối ưu (đổi giá trị)",
-      "optimization_evidence": "Fit bằng hồi quy logistic có ràng buộc (w_static, w_rag, w_corroborated >= 0; L2 = 1) trên finding local của 1,110 hàm thật v12 val+test (nhãn = nhãn của hàm; bỏ kaggle_ds2 tổng hợp). Static + RAG cùng báo vẫn có giá trị cộng thêm."
+      "previous_value": 0.6884,
+      "optimization_status": "Đã tối ưu lại (22/11, sau tái cấu trúc Phase 1)",
+      "optimization_evidence": "Fit lại 22/11 bằng hồi quy logistic có ràng buộc (w_static, w_rag, w_corroborated >= 0; L2 = 1) trên finding local của 1,110 hàm thật v12 val+test sau tái cấu trúc: RAG chỉ còn độ giống ca đã biết (không dùng regex tín hiệu của static) nên static và RAG là hai kênh độc lập; hàm chỉ detector báo được Phase 1 phân loại. Giảm 0.688 -> 0.077: khi hai kênh thật sự độc lập, việc cùng báo gần như không thêm thông tin ngoài từng kênh; trước đây trọng số lớn đến từ regex dùng chung."
     },
     {
       "phase": "Phase 1 Fusion",
@@ -84,14 +84,14 @@
       "component_function": "fuse_findings",
       "file_location": "E2E/phase1_fusion/fusion_calibration.json:9",
       "parameter_name": "w_severity_critical",
-      "current_value": -0.2158,
+      "current_value": -0.482,
       "value_type": "float",
-      "formula_rule": "z += -0.2158 (khi severity là Critical)",
+      "formula_rule": "z += -0.482 (khi severity là Critical)",
       "heuristic_rationale": "Hệ số tăng ưu tiên cho lỗ hổng Critical để đảm bảo không bị bỏ sót khi vào pipeline sửa.",
       "tuning_direction": "Tối ưu theo ma trận chi phí rủi ro (Cost-sensitive learning).",
-      "previous_value": 0.8,
-      "optimization_status": "Đã tối ưu (đổi giá trị)",
-      "optimization_evidence": "Fit bằng hồi quy logistic có ràng buộc (w_static, w_rag, w_corroborated >= 0; L2 = 1) trên finding local của 1,110 hàm thật v12 val+test (nhãn = nhãn của hàm; bỏ kaggle_ds2 tổng hợp). Âm: luật Critical (reentrancy, unchecked call, access control) bắn cả trên hàm an toàn. Finding Critical vẫn qua tau khi p_detector >= 0.004 (p_final 0.154 tại p_detector = 0.05; 0.132 tại p_detector = 0)."
+      "previous_value": -0.2158,
+      "optimization_status": "Đã tối ưu lại (22/11, sau tái cấu trúc Phase 1)",
+      "optimization_evidence": "Fit lại 22/11 bằng hồi quy logistic có ràng buộc (w_static, w_rag, w_corroborated >= 0; L2 = 1) trên finding local của 1,110 hàm thật v12 val+test sau tái cấu trúc: RAG chỉ còn độ giống ca đã biết (không dùng regex tín hiệu của static) nên static và RAG là hai kênh độc lập; hàm chỉ detector báo được Phase 1 phân loại. Âm hơn: finding Critical chỉ-static cần p_detector >= 0.13 mới qua tau (trước 0.004); finding Medium/High qua với mọi p_detector."
     },
     {
       "phase": "Phase 1 Fusion",
@@ -99,14 +99,14 @@
       "component_function": "fuse_findings",
       "file_location": "E2E/phase1_fusion/fusion_calibration.json:10",
       "parameter_name": "w_severity_high",
-      "current_value": 0.1421,
+      "current_value": -0.1185,
       "value_type": "float",
-      "formula_rule": "z += 0.1421 (khi severity là High)",
+      "formula_rule": "z += -0.1185 (khi severity là High)",
       "heuristic_rationale": "Hệ số tăng ưu tiên vừa phải cho lỗ hổng High.",
       "tuning_direction": "Tối ưu cùng bộ trọng số severity.",
-      "previous_value": 0.4,
-      "optimization_status": "Đã tối ưu (đổi giá trị)",
-      "optimization_evidence": "Fit bằng hồi quy logistic có ràng buộc (w_static, w_rag, w_corroborated >= 0; L2 = 1) trên finding local của 1,110 hàm thật v12 val+test (nhãn = nhãn của hàm; bỏ kaggle_ds2 tổng hợp)."
+      "previous_value": 0.1421,
+      "optimization_status": "Đã tối ưu lại (22/11, sau tái cấu trúc Phase 1)",
+      "optimization_evidence": "Fit lại 22/11 bằng hồi quy logistic có ràng buộc (w_static, w_rag, w_corroborated >= 0; L2 = 1) trên finding local của 1,110 hàm thật v12 val+test sau tái cấu trúc: RAG chỉ còn độ giống ca đã biết (không dùng regex tín hiệu của static) nên static và RAG là hai kênh độc lập; hàm chỉ detector báo được Phase 1 phân loại."
     },
     {
       "phase": "Phase 1 Fusion",
@@ -120,8 +120,8 @@
       "heuristic_rationale": "Mức chuẩn trung tính (baseline) cho severity Medium.",
       "tuning_direction": "Giữ làm mốc tham chiếu 0.0.",
       "previous_value": 0.0,
-      "optimization_status": "Giữ nguyên - đã kiểm chứng trên dữ liệu",
-      "optimization_evidence": "Mốc tham chiếu 0 (giữ nguyên)."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Fit lại 22/11 bằng hồi quy logistic có ràng buộc (w_static, w_rag, w_corroborated >= 0; L2 = 1) trên finding local của 1,110 hàm thật v12 val+test sau tái cấu trúc: RAG chỉ còn độ giống ca đã biết (không dùng regex tín hiệu của static) nên static và RAG là hai kênh độc lập; hàm chỉ detector báo được Phase 1 phân loại. Mốc tham chiếu 0."
     },
     {
       "phase": "Phase 1 Fusion",
@@ -129,14 +129,14 @@
       "component_function": "fuse_findings",
       "file_location": "E2E/phase1_fusion/fusion_calibration.json:12",
       "parameter_name": "w_severity_low",
-      "current_value": -0.4823,
+      "current_value": -0.7158,
       "value_type": "float",
-      "formula_rule": "z += -0.4823 (khi severity là Low)",
+      "formula_rule": "z += -0.7158 (khi severity là Low)",
       "heuristic_rationale": "Hệ số phạt giảm ưu tiên cho lỗ hổng Low nhằm tránh quá tải cho các agent phía sau.",
       "tuning_direction": "Tối ưu theo ma trận chi phí rủi ro.",
-      "previous_value": -0.5,
-      "optimization_status": "Đã tối ưu (đổi giá trị)",
-      "optimization_evidence": "Fit bằng hồi quy logistic có ràng buộc (w_static, w_rag, w_corroborated >= 0; L2 = 1) trên finding local của 1,110 hàm thật v12 val+test (nhãn = nhãn của hàm; bỏ kaggle_ds2 tổng hợp)."
+      "previous_value": -0.4823,
+      "optimization_status": "Đã tối ưu lại (22/11, sau tái cấu trúc Phase 1)",
+      "optimization_evidence": "Fit lại 22/11 bằng hồi quy logistic có ràng buộc (w_static, w_rag, w_corroborated >= 0; L2 = 1) trên finding local của 1,110 hàm thật v12 val+test sau tái cấu trúc: RAG chỉ còn độ giống ca đã biết (không dùng regex tín hiệu của static) nên static và RAG là hai kênh độc lập; hàm chỉ detector báo được Phase 1 phân loại."
     },
     {
       "phase": "Phase 1 Fusion",
@@ -144,20 +144,20 @@
       "component_function": "fuse_findings",
       "file_location": "E2E/phase1_fusion/fusion_calibration.json:14",
       "parameter_name": "tau_agent",
-      "current_value": 0.1333,
+      "current_value": 0.1848,
       "value_type": "float",
       "formula_rule": "if p_final >= tau_agent (0.1333) then confirmed else candidate",
       "heuristic_rationale": "Ngưỡng phân tách finding chuyển tiếp sang Advisor/Fixer (confirmed) hay giữ lại làm candidate cảnh báo.",
       "tuning_direction": "Quét threshold (0.35 - 0.55) trên đường cong Precision-Recall để cân bằng số lượng lỗi gửi sang LLM.",
-      "previous_value": 0.45,
-      "optimization_status": "Đã tối ưu (đổi giá trị)",
-      "optimization_evidence": "Chọn theo F2 (recall nặng gấp đôi precision - chính sách ưu tiên recall), có ràng buộc finding yếu nhất trên unit detector >= 0.70 vẫn qua (tau <= 0.588). CV 5x3 trên hàm thật: recall tới Fixer 0.664 -> 0.708, FPR 0.130 -> 0.228. Phần recall tăng thêm đi kèm SWC khác nhãn thật. Hợp đồng đầy đủ (round1, 2,374): hàm vào Fixer 6.42 -> 7.76 / hợp đồng."
+      "previous_value": 0.1333,
+      "optimization_status": "Đã tối ưu lại (22/11, sau tái cấu trúc Phase 1)",
+      "optimization_evidence": "Chọn lại theo F2 (ưu tiên recall) với ràng buộc finding yếu nhất trên unit detector >= 0.70 vẫn qua (tau <= 0.5947). CV 5x3 trên 1,110 hàm thật, cùng quy trình cho cả hai thiết kế: cũ (fit lại) recall 0.814 / FPR 0.2532 / F2 0.781; mới recall 0.8194 / FPR 0.2522 / F2 0.7856. Tỉ lệ lỗ thật tới Fixer kèm ĐÚNG SWC: 0.0648 -> 0.3241."
     },
     {
       "phase": "Phase 1 Fusion",
       "category": "fusion_finding_level",
       "component_function": "fuse_findings",
-      "file_location": "E2E/phase1_fusion/fusion.py:110",
+      "file_location": "E2E/phase1_fusion/fusion.py:124",
       "parameter_name": "p_detector_error_imputation",
       "current_value": 0.5,
       "value_type": "float",
@@ -165,14 +165,14 @@
       "heuristic_rationale": "Giá trị thế chấp trung tính (prior uninformative), không coi hàm là an toàn cũng không khẳng định có lỗi khi mất tín hiệu detector.",
       "tuning_direction": "Có thể thử nghiệm dải 0.35 - 0.50 tùy theo mức độ thận trọng (fail-safe).",
       "previous_value": 0.5,
-      "optimization_status": "Giữ nguyên - không đủ dữ liệu để tối ưu",
-      "optimization_evidence": "Dữ liệu không có lần detector lỗi nào nên không fit được. Với trọng số mới, mọi giá trị >= 0.078 cho cùng quyết định (mọi finding local trên unit lỗi đều qua tau): 0.5 nằm trong vùng phẳng và đúng tinh thần 'lỗi = không chặn'."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Dữ liệu không có lần detector lỗi nào nên không fit được. Với trọng số 22/11, finding chỉ-static qua tau khi p_detector >= 0.0005 (Medium), 0.033 (High), 0.131 (Critical), 0.194 (Low): mọi giá trị >= 0.194 cho cùng quyết định, 0.5 nằm trong vùng phẳng và đúng tinh thần 'detector lỗi = không chặn'."
     },
     {
       "phase": "Phase 1 Fusion",
       "category": "fusion_finding_level",
       "component_function": "fuse_findings",
-      "file_location": "E2E/phase1_fusion/fusion.py:112",
+      "file_location": "E2E/phase1_fusion/fusion.py:126",
       "parameter_name": "p_detector_missing_imputation",
       "current_value": 0.05,
       "value_type": "float",
@@ -180,8 +180,8 @@
       "heuristic_rationale": "Prior an toàn cho các hàm interface, hàm thuần túy khai báo không có logic thực thi.",
       "tuning_direction": "Giữ mức thấp 0.01 - 0.05.",
       "previous_value": 0.05,
-      "optimization_status": "Giữ nguyên - không đủ dữ liệu để tối ưu",
-      "optimization_evidence": "Chỉ dùng cho unit không có thân (detector không chấm), không bao giờ là mục tiêu Fixer. Lưu ý: với trọng số mới, finding Medium/High trên unit không thân luôn qua tau với mọi giá trị >= 0 của tham số này; Critical qua khi >= 0.004, Low khi >= 0.078."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Chỉ dùng cho unit không có thân (detector không chấm), không bao giờ là mục tiêu Fixer. Với trọng số 22/11, ở 0.05 finding chỉ-static Medium/High trên unit không thân vẫn qua tau, Critical (cần >= 0.131) và Low (cần >= 0.194) thành candidate."
     },
     {
       "phase": "Phase 1 Fusion",
@@ -195,8 +195,8 @@
       "heuristic_rationale": "Trọng số mặc định của Neural Detector khi tổng hợp điểm đánh giá hợp đồng.",
       "tuning_direction": "Tối ưu hóa tỷ lệ phân bổ trên tập benchmark hợp đồng (Grid search hoặc Optuna).",
       "previous_value": 0.65,
-      "optimization_status": "Giữ nguyên - không ảnh hưởng quyết định nào trên dữ liệu",
-      "optimization_evidence": "Quét 0.3-1.0: 0/1,110 verdict thay đổi (khi detector >= ngưỡng hoặc có finding mạnh thì sàn điểm quyết định; còn lại dùng bộ trọng số adaptive)."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Quét 0.3-1.0: 0/1,110 verdict thay đổi (khi detector >= ngưỡng hoặc có finding mạnh thì sàn điểm quyết định; còn lại dùng bộ trọng số adaptive). Kiểm chứng lại 22/11 (R4) với finding local mới: không thay đổi nào cải thiện F2 cấp contract quá nhiễu (F2 0.750 +- 0.004); verdict cấp contract recall 0.748 / FPR 0.150 (cũ 0.755 / 0.181)."
     },
     {
       "phase": "Phase 1 Fusion",
@@ -210,8 +210,8 @@
       "heuristic_rationale": "Trọng số mặc định của Static Analysis khi tổng hợp điểm cấp Contract.",
       "tuning_direction": "Tối ưu cùng default_weight_detector và default_weight_rag.",
       "previous_value": 0.2,
-      "optimization_status": "Giữ nguyên - không ảnh hưởng quyết định nào trên dữ liệu",
-      "optimization_evidence": "Quét 0.0-0.4: 0/1,110 verdict thay đổi."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Quét 0.0-0.4: 0/1,110 verdict thay đổi. Kiểm chứng lại 22/11 (R4) với finding local mới: không thay đổi nào cải thiện F2 cấp contract quá nhiễu (F2 0.750 +- 0.004); verdict cấp contract recall 0.748 / FPR 0.150 (cũ 0.755 / 0.181)."
     },
     {
       "phase": "Phase 1 Fusion",
@@ -225,14 +225,14 @@
       "heuristic_rationale": "Trọng số mặc định của RAG Retriever khi tổng hợp điểm cấp Contract.",
       "tuning_direction": "Tối ưu cùng bộ trọng số mặc định.",
       "previous_value": 0.15,
-      "optimization_status": "Giữ nguyên - không ảnh hưởng quyết định nào trên dữ liệu",
-      "optimization_evidence": "Quét 0.0-0.5: 0/1,110 verdict thay đổi."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Quét 0.0-0.5: 0/1,110 verdict thay đổi. Kiểm chứng lại 22/11 (R4) với finding local mới: không thay đổi nào cải thiện F2 cấp contract quá nhiễu (F2 0.750 +- 0.004); verdict cấp contract recall 0.748 / FPR 0.150 (cũ 0.755 / 0.181)."
     },
     {
       "phase": "Phase 1 Fusion",
       "category": "fusion_contract_level",
       "component_function": "fuse_detection",
-      "file_location": "E2E/phase1_fusion/fusion.py:144",
+      "file_location": "E2E/phase1_fusion/fusion.py:158",
       "parameter_name": "adaptive_offline_weight_rag",
       "current_value": 0.5,
       "value_type": "float",
@@ -240,14 +240,14 @@
       "heuristic_rationale": "Tái phân bổ đều 50/50 cho RAG khi Neural Detector offline hoặc chưa sẵn sàng.",
       "tuning_direction": "Có thể phân bổ theo tỷ lệ năng lực thực tế (ví dụ 0.55 static, 0.45 rag).",
       "previous_value": 0.5,
-      "optimization_status": "Giữ nguyên - đã kiểm chứng trên dữ liệu",
-      "optimization_evidence": "Chế độ không detector (lượt tạm): recall 0.257-0.273, FPR 0.10-0.14 khi quét 0.2-0.8 (static = 1 - rag); phẳng, không có điểm tốt hơn rõ rệt."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Chế độ không detector (lượt tạm): recall 0.257-0.273, FPR 0.10-0.14 khi quét 0.2-0.8 (static = 1 - rag); phẳng, không có điểm tốt hơn rõ rệt. Kiểm chứng lại 22/11 (R4) với finding local mới: không thay đổi nào cải thiện F2 cấp contract quá nhiễu (F2 0.750 +- 0.004); verdict cấp contract recall 0.748 / FPR 0.150 (cũ 0.755 / 0.181)."
     },
     {
       "phase": "Phase 1 Fusion",
       "category": "fusion_contract_level",
       "component_function": "fuse_detection",
-      "file_location": "E2E/phase1_fusion/fusion.py:144",
+      "file_location": "E2E/phase1_fusion/fusion.py:158",
       "parameter_name": "adaptive_offline_weight_static",
       "current_value": 0.5,
       "value_type": "float",
@@ -255,14 +255,14 @@
       "heuristic_rationale": "Tái phân bổ đều 50/50 cho Static khi Neural Detector offline.",
       "tuning_direction": "Tối ưu cùng adaptive_offline_weight_rag.",
       "previous_value": 0.5,
-      "optimization_status": "Giữ nguyên - đã kiểm chứng trên dữ liệu",
-      "optimization_evidence": "Tối ưu cùng adaptive_offline_weight_rag (xem trên)."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Tối ưu cùng adaptive_offline_weight_rag (xem trên). Kiểm chứng lại 22/11 (R4) với finding local mới: không thay đổi nào cải thiện F2 cấp contract quá nhiễu (F2 0.750 +- 0.004); verdict cấp contract recall 0.748 / FPR 0.150 (cũ 0.755 / 0.181)."
     },
     {
       "phase": "Phase 1 Fusion",
       "category": "fusion_contract_level",
       "component_function": "fuse_detection",
-      "file_location": "E2E/phase1_fusion/fusion.py:146",
+      "file_location": "E2E/phase1_fusion/fusion.py:160",
       "parameter_name": "adaptive_low_det_weight_detector",
       "current_value": 0.2,
       "value_type": "float",
@@ -270,14 +270,14 @@
       "heuristic_rationale": "Hạ trọng số detector từ 65% xuống 20% khi detector không kích hoạt nhưng Static/RAG có phát hiện cụ thể.",
       "tuning_direction": "Tối ưu bộ 3 trọng số adaptive để tránh false negative.",
       "previous_value": 0.2,
-      "optimization_status": "Giữ nguyên - đã kiểm chứng trên dữ liệu",
-      "optimization_evidence": "Quét 0-0.6: tối đa 16 verdict đổi, không cải thiện recall (0.755)."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Quét 0-0.6: tối đa 16 verdict đổi, không cải thiện recall (0.755). Kiểm chứng lại 22/11 (R4) với finding local mới: không thay đổi nào cải thiện F2 cấp contract quá nhiễu (F2 0.750 +- 0.004); verdict cấp contract recall 0.748 / FPR 0.150 (cũ 0.755 / 0.181)."
     },
     {
       "phase": "Phase 1 Fusion",
       "category": "fusion_contract_level",
       "component_function": "fuse_detection",
-      "file_location": "E2E/phase1_fusion/fusion.py:146",
+      "file_location": "E2E/phase1_fusion/fusion.py:160",
       "parameter_name": "adaptive_low_det_weight_rag",
       "current_value": 0.4,
       "value_type": "float",
@@ -285,14 +285,14 @@
       "heuristic_rationale": "Tăng trọng số RAG lên 40% để cứu các phát hiện mà detector bỏ sót.",
       "tuning_direction": "Tối ưu cùng bộ adaptive.",
       "previous_value": 0.4,
-      "optimization_status": "Giữ nguyên - đã kiểm chứng trên dữ liệu",
-      "optimization_evidence": "0.1: recall +0.9pp nhưng FPR +1.5pp; 0.7: không lợi. Không có lợi ích vững."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "0.1: recall +0.9pp nhưng FPR +1.5pp; 0.7: không lợi. Không có lợi ích vững. Kiểm chứng lại 22/11 (R4) với finding local mới: không thay đổi nào cải thiện F2 cấp contract quá nhiễu (F2 0.750 +- 0.004); verdict cấp contract recall 0.748 / FPR 0.150 (cũ 0.755 / 0.181)."
     },
     {
       "phase": "Phase 1 Fusion",
       "category": "fusion_contract_level",
       "component_function": "fuse_detection",
-      "file_location": "E2E/phase1_fusion/fusion.py:146",
+      "file_location": "E2E/phase1_fusion/fusion.py:160",
       "parameter_name": "adaptive_low_det_weight_static",
       "current_value": 0.4,
       "value_type": "float",
@@ -300,14 +300,14 @@
       "heuristic_rationale": "Tăng trọng số Static lên 40% để cứu các phát hiện mà detector bỏ sót.",
       "tuning_direction": "Tối ưu cùng bộ adaptive.",
       "previous_value": 0.4,
-      "optimization_status": "Giữ nguyên - đã kiểm chứng trên dữ liệu",
-      "optimization_evidence": "0.7: recall +0.5pp, FPR +1.6pp; 0.1: gần như không đổi. Không có lợi ích vững."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "0.7: recall +0.5pp, FPR +1.6pp; 0.1: gần như không đổi. Không có lợi ích vững. Kiểm chứng lại 22/11 (R4) với finding local mới: không thay đổi nào cải thiện F2 cấp contract quá nhiễu (F2 0.750 +- 0.004); verdict cấp contract recall 0.748 / FPR 0.150 (cũ 0.755 / 0.181)."
     },
     {
       "phase": "Phase 1 Fusion",
       "category": "fusion_contract_level",
       "component_function": "fuse_detection",
-      "file_location": "E2E/phase1_fusion/fusion.py:157",
+      "file_location": "E2E/phase1_fusion/fusion.py:171",
       "parameter_name": "floor_provisional_critical",
       "current_value": 0.78,
       "value_type": "float",
@@ -315,14 +315,14 @@
       "heuristic_rationale": "Sàn điểm bảo đảm hợp đồng bị gắn nhãn Vulnerable khi có lỗi Critical dù thiếu detector.",
       "tuning_direction": "Tinh chỉnh trong khoảng 0.75 - 0.85.",
       "previous_value": 0.78,
-      "optimization_status": "Giữ nguyên - không ảnh hưởng quyết định nào trên dữ liệu",
-      "optimization_evidence": "Mọi giá trị >= ngưỡng hợp đồng 0.5 cho verdict giống hệt; < 0.5 làm giảm recall."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Mọi giá trị >= ngưỡng hợp đồng 0.5 cho verdict giống hệt; < 0.5 làm giảm recall. Kiểm chứng lại 22/11 (R4) với finding local mới: không thay đổi nào cải thiện F2 cấp contract quá nhiễu (F2 0.750 +- 0.004); verdict cấp contract recall 0.748 / FPR 0.150 (cũ 0.755 / 0.181)."
     },
     {
       "phase": "Phase 1 Fusion",
       "category": "fusion_contract_level",
       "component_function": "fuse_detection",
-      "file_location": "E2E/phase1_fusion/fusion.py:157",
+      "file_location": "E2E/phase1_fusion/fusion.py:171",
       "parameter_name": "floor_provisional_high",
       "current_value": 0.68,
       "value_type": "float",
@@ -330,14 +330,14 @@
       "heuristic_rationale": "Sàn điểm bảo đảm hợp đồng bị gắn nhãn Vulnerable khi có lỗi High dù thiếu detector.",
       "tuning_direction": "Tinh chỉnh trong khoảng 0.65 - 0.72.",
       "previous_value": 0.68,
-      "optimization_status": "Giữ nguyên - không ảnh hưởng quyết định nào trên dữ liệu",
-      "optimization_evidence": "Mọi giá trị >= 0.5 cho verdict giống hệt; 0.4 làm recall 0.262 -> 0.222."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Mọi giá trị >= 0.5 cho verdict giống hệt; 0.4 làm recall 0.262 -> 0.222. Kiểm chứng lại 22/11 (R4) với finding local mới: không thay đổi nào cải thiện F2 cấp contract quá nhiễu (F2 0.750 +- 0.004); verdict cấp contract recall 0.748 / FPR 0.150 (cũ 0.755 / 0.181)."
     },
     {
       "phase": "Phase 1 Fusion",
       "category": "fusion_contract_level",
       "component_function": "fuse_detection",
-      "file_location": "E2E/phase1_fusion/fusion.py:159",
+      "file_location": "E2E/phase1_fusion/fusion.py:173",
       "parameter_name": "floor_static_rag_corroborated",
       "current_value": 0.72,
       "value_type": "float",
@@ -345,14 +345,14 @@
       "heuristic_rationale": "Sàn điểm khi cả Static và RAG cùng độc lập khẳng định cùng 1 lỗi.",
       "tuning_direction": "Tinh chỉnh trong khoảng 0.70 - 0.75.",
       "previous_value": 0.72,
-      "optimization_status": "Giữ nguyên - không ảnh hưởng quyết định nào trên dữ liệu",
-      "optimization_evidence": "Mọi giá trị >= 0.5 cho verdict giống hệt (0.4: đổi 1 verdict)."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Mọi giá trị >= 0.5 cho verdict giống hệt (0.4: đổi 1 verdict). Kiểm chứng lại 22/11 (R4) với finding local mới: không thay đổi nào cải thiện F2 cấp contract quá nhiễu (F2 0.750 +- 0.004); verdict cấp contract recall 0.748 / FPR 0.150 (cũ 0.755 / 0.181)."
     },
     {
       "phase": "Phase 1 Fusion",
       "category": "fusion_contract_level",
       "component_function": "fuse_detection",
-      "file_location": "E2E/phase1_fusion/fusion.py:161",
+      "file_location": "E2E/phase1_fusion/fusion.py:175",
       "parameter_name": "floor_strong_local_evidence",
       "current_value": 0.65,
       "value_type": "float",
@@ -360,14 +360,14 @@
       "heuristic_rationale": "Sàn điểm cho bằng chứng cục bộ có độ tin cậy cao.",
       "tuning_direction": "Tinh chỉnh đồng bộ với strong_local_evidence_conf_threshold.",
       "previous_value": 0.65,
-      "optimization_status": "Giữ nguyên - không ảnh hưởng quyết định nào trên dữ liệu",
-      "optimization_evidence": "Mọi giá trị >= 0.5 cho verdict giống hệt; 0.4 làm recall -0.9pp."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Mọi giá trị >= 0.5 cho verdict giống hệt; 0.4 làm recall -0.9pp. Kiểm chứng lại 22/11 (R4) với finding local mới: không thay đổi nào cải thiện F2 cấp contract quá nhiễu (F2 0.750 +- 0.004); verdict cấp contract recall 0.748 / FPR 0.150 (cũ 0.755 / 0.181)."
     },
     {
       "phase": "Phase 1 Fusion",
       "category": "fusion_contract_level",
       "component_function": "fuse_detection",
-      "file_location": "E2E/phase1_fusion/fusion.py:160",
+      "file_location": "E2E/phase1_fusion/fusion.py:174",
       "parameter_name": "strong_local_evidence_conf_threshold",
       "current_value": 0.65,
       "value_type": "float",
@@ -375,14 +375,14 @@
       "heuristic_rationale": "Ngưỡng xác định bằng chứng địa phương đủ mạnh để kích hoạt sàn điểm.",
       "tuning_direction": "Tinh chỉnh trong dải 0.60 - 0.70.",
       "previous_value": 0.65,
-      "optimization_status": "Giữ nguyên - đã kiểm chứng trên dữ liệu",
-      "optimization_evidence": "0.5: recall +0.2pp / FPR +0.7pp; 0.4: +1.6pp / +2.7pp; 0.8: -0.2pp / -0.9pp. 0.65 nằm ở điểm gãy."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "0.5: recall +0.2pp / FPR +0.7pp; 0.4: +1.6pp / +2.7pp; 0.8: -0.2pp / -0.9pp. 0.65 nằm ở điểm gãy. Kiểm chứng lại 22/11 (R4) với finding local mới: không thay đổi nào cải thiện F2 cấp contract quá nhiễu (F2 0.750 +- 0.004); verdict cấp contract recall 0.748 / FPR 0.150 (cũ 0.755 / 0.181)."
     },
     {
       "phase": "Phase 1 Fusion",
       "category": "fusion_contract_level",
       "component_function": "fuse_detection",
-      "file_location": "E2E/phase1_fusion/fusion.py:162",
+      "file_location": "E2E/phase1_fusion/fusion.py:176",
       "parameter_name": "floor_detector_threshold",
       "current_value": 0.58,
       "value_type": "float",
@@ -390,14 +390,14 @@
       "heuristic_rationale": "Sàn điểm khi chỉ một mình Neural Detector vượt ngưỡng phát hiện.",
       "tuning_direction": "Tinh chỉnh trong dải 0.52 - 0.60.",
       "previous_value": 0.58,
-      "optimization_status": "Giữ nguyên - không ảnh hưởng quyết định nào trên dữ liệu",
-      "optimization_evidence": "Mọi giá trị >= 0.5 cho verdict giống hệt (detector >= 0.70 luôn -> Vulnerable)."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Mọi giá trị >= 0.5 cho verdict giống hệt (detector >= 0.70 luôn -> Vulnerable). Kiểm chứng lại 22/11 (R4) với finding local mới: không thay đổi nào cải thiện F2 cấp contract quá nhiễu (F2 0.750 +- 0.004); verdict cấp contract recall 0.748 / FPR 0.150 (cũ 0.755 / 0.181)."
     },
     {
       "phase": "Phase 1 Fusion",
       "category": "fusion_contract_level",
       "component_function": "fuse_detection",
-      "file_location": "E2E/phase1_fusion/fusion.py:163",
+      "file_location": "E2E/phase1_fusion/fusion.py:177",
       "parameter_name": "floor_detector_local_corroborated",
       "current_value": 0.62,
       "value_type": "float",
@@ -405,8 +405,8 @@
       "heuristic_rationale": "Sàn điểm tăng cường khi detector vượt ngưỡng kết hợp cùng có lỗi từ static/RAG.",
       "tuning_direction": "Tinh chỉnh trong dải 0.60 - 0.65.",
       "previous_value": 0.62,
-      "optimization_status": "Giữ nguyên - không ảnh hưởng quyết định nào trên dữ liệu",
-      "optimization_evidence": "Quét 0.4-0.8: 0 verdict thay đổi (trùng vai trò floor_detector_threshold)."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Quét 0.4-0.8: 0 verdict thay đổi (trùng vai trò floor_detector_threshold). Kiểm chứng lại 22/11 (R4) với finding local mới: không thay đổi nào cải thiện F2 cấp contract quá nhiễu (F2 0.750 +- 0.004); verdict cấp contract recall 0.748 / FPR 0.150 (cũ 0.755 / 0.181)."
     },
     {
       "phase": "Phase 1 Fusion",
@@ -420,134 +420,29 @@
       "heuristic_rationale": "Ngưỡng quyết định hợp đồng có bị kết luận là Vulnerable hay không.",
       "tuning_direction": "Quét ROC curve cấp contract trên tập benchmark để tối ưu Macro F1.",
       "previous_value": 0.5,
-      "optimization_status": "Giữ nguyên - đã kiểm chứng trên dữ liệu",
-      "optimization_evidence": "0.4: recall +0.5pp nhưng FPR +2.5pp; 0.3: +1.6pp / +5pp; 0.6: recall -7pp. 0.5 nằm ở điểm gãy. Verdict hợp đồng hiện tại: recall 0.755, FPR 0.181 (hàm thật)."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "0.4: recall +0.5pp nhưng FPR +2.5pp; 0.3: +1.6pp / +5pp; 0.6: recall -7pp. 0.5 nằm ở điểm gãy. Verdict hợp đồng hiện tại: recall 0.755, FPR 0.181 (hàm thật). Kiểm chứng lại 22/11 (R4) với finding local mới: không thay đổi nào cải thiện F2 cấp contract quá nhiễu (F2 0.750 +- 0.004); verdict cấp contract recall 0.748 / FPR 0.150 (cũ 0.755 / 0.181)."
     },
     {
       "phase": "Phase 1B - RAG",
-      "category": "rag_retrieval_scoring",
-      "component_function": "LocalRAGRetriever.analyze",
-      "file_location": "E2E/phase1b_rag/retriever.py:93",
-      "parameter_name": "rag_signal_weight",
-      "current_value": 0.55,
+      "category": "rag_similarity",
+      "component_function": "retriever.analyze",
+      "file_location": "E2E/phase1b_rag/retriever.py:11",
+      "parameter_name": "rag_min_similarity",
+      "current_value": 0.4,
       "value_type": "float",
-      "formula_rule": "confidence = clamp(0.55 * signal_strength + 0.45 * min(1.0, semantic_score * 2.5))",
-      "heuristic_rationale": "Trọng số đóng góp của tín hiệu regex tất định khi kết hợp với semantic similarity.",
-      "tuning_direction": "Tối ưu cặp tỷ lệ (signal / semantic) bằng Grid Search hoặc Optuna.",
-      "previous_value": 0.55,
-      "optimization_status": "Giữ nguyên - đã kiểm chứng trên dữ liệu",
-      "optimization_evidence": "Quét 0.35-0.75 (fusion fit lại + tau theo F2 trong từng fold CV): F2 dao động <= 0.005, cỡ nhiễu CV."
+      "formula_rule": "SWC s được báo cho unit u khi trùng khớp hoặc max cosine(u, ca KB của s) >= 0.40; confidence = sim",
+      "heuristic_rationale": "RAG chỉ dựa trên độ giống với ca lỗi đã biết (không dùng regex tín hiệu của static).",
+      "tuning_direction": "Chọn bằng CV cùng fusion fit lại trong từng fold.",
+      "previous_value": null,
+      "optimization_status": "Mới (22/11) - chọn bằng CV",
+      "optimization_evidence": "R2: quét θ 0.30-0.70 (và tắt RAG) x N 1/2/3/10, fusion fit lại trong từng fold: F2 CV phẳng 0.777-0.786; θ = 0.40 cho F2 cao nhất. θ thấp hơn đưa thêm finding đúng SWC (useful 0.324 -> 0.387 ở θ 0.30) nhưng trên DAppSCAN (dự án không có trong KB) precision RAG ở θ <= 0.40 không hơn tỉ lệ nền (0.36-0.43 vs 0.35)."
     },
     {
       "phase": "Phase 1B - RAG",
       "category": "rag_retrieval_scoring",
-      "component_function": "LocalRAGRetriever.analyze",
-      "file_location": "E2E/phase1b_rag/retriever.py:93",
-      "parameter_name": "rag_semantic_weight",
-      "current_value": 0.45,
-      "value_type": "float",
-      "formula_rule": "confidence = clamp(0.55 * signal_strength + 0.45 * min(1.0, semantic_score * 2.5))",
-      "heuristic_rationale": "Trọng số đóng góp của cosine similarity TF-IDF khi kết hợp với signal.",
-      "tuning_direction": "Tối ưu cùng rag_signal_weight (tổng bằng 1.0).",
-      "previous_value": 0.45,
-      "optimization_status": "Giữ nguyên - đã kiểm chứng trên dữ liệu",
-      "optimization_evidence": "Quét 0.25-0.65: F2 dao động <= 0.002."
-    },
-    {
-      "phase": "Phase 1B - RAG",
-      "category": "rag_retrieval_scoring",
-      "component_function": "LocalRAGRetriever.analyze",
-      "file_location": "E2E/phase1b_rag/retriever.py:93",
-      "parameter_name": "rag_semantic_scale_with_signal",
-      "current_value": 2.5,
-      "value_type": "float",
-      "formula_rule": "min(1.0, semantic_score * 2.5)",
-      "heuristic_rationale": "Hệ số phóng đại điểm cosine similarity vì TF-IDF char 3-5 gram thường có cosine thấp (0.2-0.5).",
-      "tuning_direction": "Tinh chỉnh trong khoảng 2.0 - 3.0.",
-      "previous_value": 2.5,
-      "optimization_status": "Giữ nguyên - đã kiểm chứng trên dữ liệu",
-      "optimization_evidence": "Quét 1.0-4.0: F2 dao động <= 0.002."
-    },
-    {
-      "phase": "Phase 1B - RAG",
-      "category": "rag_retrieval_scoring",
-      "component_function": "LocalRAGRetriever.analyze",
-      "file_location": "E2E/phase1b_rag/retriever.py:95",
-      "parameter_name": "rag_semantic_scale_alone",
-      "current_value": 1.8,
-      "value_type": "float",
-      "formula_rule": "min(1.0, semantic_score * 1.8)",
-      "heuristic_rationale": "Hệ số phóng đại điểm khi chỉ có semantic mà không có tín hiệu regex.",
-      "tuning_direction": "Tinh chỉnh trong khoảng 1.5 - 2.0.",
-      "previous_value": 1.8,
-      "optimization_status": "Giữ nguyên - không ảnh hưởng quyết định nào trên dữ liệu",
-      "optimization_evidence": "0 thay đổi khi quét 1.0-2.5: nhánh chỉ-similarity chỉ được báo khi sim >= 0.60, khi đó sim x 1.8 > 1 nên confidence luôn bị kẹp về 1.0."
-    },
-    {
-      "phase": "Phase 1B - RAG",
-      "category": "rag_retrieval_scoring",
-      "component_function": "LocalRAGRetriever.analyze",
-      "file_location": "E2E/phase1b_rag/retriever.py:96",
-      "parameter_name": "min_semantic_only_similarity",
-      "current_value": 0.6,
-      "value_type": "float",
-      "formula_rule": "if semantic_score < 0.60: confidence = min(confidence, 0.59)",
-      "heuristic_rationale": "Ngưỡng chặn không cho semantic thuần túy trở thành confirmed finding nếu độ tương đồng dưới 0.60.",
-      "tuning_direction": "Điều chỉnh trong dải 0.55 - 0.65 để khống chế false positive.",
-      "previous_value": 0.6,
-      "optimization_status": "Giữ nguyên - đã kiểm chứng trên dữ liệu",
-      "optimization_evidence": "0.4 trông tốt hơn (finding đúng SWC +3.7pp) nhưng lợi ích đến từ iAudit, nguồn có hàm 'anh em' nằm sẵn trong KB; trên DAppSCAN (không có trong KB) precision của finding thêm chỉ 33%, thấp hơn tỉ lệ nền -> rò rỉ, không hạ."
-    },
-    {
-      "phase": "Phase 1B - RAG",
-      "category": "rag_retrieval_scoring",
-      "component_function": "LocalRAGRetriever.analyze",
-      "file_location": "E2E/phase1b_rag/retriever.py:97",
-      "parameter_name": "candidate_confidence_cap",
-      "current_value": 0.59,
-      "value_type": "float",
-      "formula_rule": "confidence = min(confidence, 0.59)",
-      "heuristic_rationale": "Mức trần điểm tin cậy cho finding chỉ có semantic dưới ngưỡng (để không chạm ngưỡng lỗ hổng 0.60).",
-      "tuning_direction": "Cố định luôn bằng vulnerable_confidence_threshold - 0.01.",
-      "previous_value": 0.59,
-      "optimization_status": "Giữ nguyên - không ảnh hưởng quyết định nào trên dữ liệu",
-      "optimization_evidence": "Chỉ có vai trò chặn finding chỉ-similarity dưới min_semantic_only_similarity; phải luôn < vulnerable_confidence_threshold. Trùng vai trò, không ảnh hưởng quyết định."
-    },
-    {
-      "phase": "Phase 1B - RAG",
-      "category": "rag_retrieval_scoring",
-      "component_function": "LocalRAGRetriever.analyze",
-      "file_location": "E2E/phase1b_rag/retriever.py:98",
-      "parameter_name": "vulnerable_confidence_threshold",
-      "current_value": 0.6,
-      "value_type": "float",
-      "formula_rule": "if confidence < 0.60: continue",
-      "heuristic_rationale": "Ngưỡng tối thiểu để RAG xuất một finding ra danh sách kết quả.",
-      "tuning_direction": "Quét threshold trong dải 0.50 - 0.65 trên tập validation RAG.",
-      "previous_value": 0.6,
-      "optimization_status": "Giữ nguyên - đã kiểm chứng trên dữ liệu",
-      "optimization_evidence": "Quét 0.5-0.9: F2 dao động <= 0.005 (0.55: recall +0.7pp / FPR +0.6pp)."
-    },
-    {
-      "phase": "Phase 1B - RAG",
-      "category": "rag_retrieval_scoring",
-      "component_function": "LocalRAGRetriever.analyze",
-      "file_location": "E2E/phase1b_rag/retriever.py:87",
-      "parameter_name": "semantic_gate_min_similarity",
-      "current_value": 0.28,
-      "value_type": "float",
-      "formula_rule": "if not signal_hits and semantic_score < 0.28 and not exact_code_match: skip",
-      "heuristic_rationale": "Ngưỡng tương đồng cosine tối thiểu để không bị loại bỏ ngay từ vòng duyệt ban đầu khi không có regex.",
-      "tuning_direction": "Quét trong khoảng 0.20 - 0.35 để tối ưu giữa tốc độ chạy và Recall.",
-      "previous_value": 0.28,
-      "optimization_status": "Giữ nguyên - không ảnh hưởng quyết định nào trên dữ liệu",
-      "optimization_evidence": "Thành phần không có tín hiệu chỉ được báo khi sim >= 0.60 (do cap), nên cổng 0.28 chỉ tiết kiệm tính toán, không đổi quyết định."
-    },
-    {
-      "phase": "Phase 1B - RAG",
-      "category": "rag_retrieval_scoring",
-      "component_function": "LocalRAGRetriever.analyze",
-      "file_location": "E2E/phase1b_rag/retriever.py:18",
+      "component_function": "retriever.analyze",
+      "file_location": "E2E/phase1b_rag/retriever.py:7",
       "parameter_name": "min_exact_match_chars",
       "current_value": 80,
       "value_type": "int",
@@ -555,14 +450,14 @@
       "heuristic_rationale": "Độ dài tối thiểu để xét trùng khớp hoàn toàn, tránh việc các hàm getter ngắn bị match nhầm.",
       "tuning_direction": "Tinh chỉnh trong dải 60 - 100 ký tự.",
       "previous_value": 80,
-      "optimization_status": "Giữ nguyên - đã kiểm chứng trên dữ liệu",
-      "optimization_evidence": "Định nghĩa 'trùng khớp chính xác' (chặn getter ngắn khớp nhầm, lỗi đã sửa 10/2026); không phải tham số chấm điểm nên không tune."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Giữ nguyên trong RAG chỉ-độ-giống: R2 quét max_findings_per_unit 1/2/3/10 ở θ = 0.40 cho cùng F2 CV (0.786); luật trùng khớp (>= 80 ký tự, độ dài chênh <= 20%, confidence 0.95) không đổi."
     },
     {
       "phase": "Phase 1B - RAG",
       "category": "rag_retrieval_scoring",
-      "component_function": "LocalRAGRetriever.analyze",
-      "file_location": "E2E/phase1b_rag/retriever.py:21",
+      "component_function": "retriever.analyze",
+      "file_location": "E2E/phase1b_rag/retriever.py:8",
       "parameter_name": "min_exact_match_length_ratio",
       "current_value": 0.8,
       "value_type": "float",
@@ -570,14 +465,14 @@
       "heuristic_rationale": "Tỷ lệ tương đồng độ dài chuỗi để xác nhận khớp hoàn toàn.",
       "tuning_direction": "Giữ trong dải 0.75 - 0.85.",
       "previous_value": 0.8,
-      "optimization_status": "Giữ nguyên - đã kiểm chứng trên dữ liệu",
-      "optimization_evidence": "Như min_exact_match_chars."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Giữ nguyên trong RAG chỉ-độ-giống: R2 quét max_findings_per_unit 1/2/3/10 ở θ = 0.40 cho cùng F2 CV (0.786); luật trùng khớp (>= 80 ký tự, độ dài chênh <= 20%, confidence 0.95) không đổi."
     },
     {
       "phase": "Phase 1B - RAG",
       "category": "rag_retrieval_scoring",
-      "component_function": "LocalRAGRetriever.analyze",
-      "file_location": "E2E/phase1b_rag/retriever.py:90",
+      "component_function": "retriever.analyze",
+      "file_location": "E2E/phase1b_rag/retriever.py:9",
       "parameter_name": "exact_match_confidence",
       "current_value": 0.95,
       "value_type": "float",
@@ -585,14 +480,14 @@
       "heuristic_rationale": "Độ tin cậy ấn định cho trường hợp trùng khớp hoàn toàn với mẫu lỗ hổng trong KB.",
       "tuning_direction": "Giữ 0.95 - 0.98.",
       "previous_value": 0.95,
-      "optimization_status": "Giữ nguyên - không ảnh hưởng quyết định nào trên dữ liệu",
-      "optimization_evidence": "Quét 0.6-1.0: 0 quyết định đổi (trùng khớp luôn được báo; w_rag sau fit ~0.06)."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Giữ nguyên trong RAG chỉ-độ-giống: R2 quét max_findings_per_unit 1/2/3/10 ở θ = 0.40 cho cùng F2 CV (0.786); luật trùng khớp (>= 80 ký tự, độ dài chênh <= 20%, confidence 0.95) không đổi."
     },
     {
       "phase": "Phase 1B - RAG",
       "category": "rag_retrieval_scoring",
-      "component_function": "LocalRAGRetriever.analyze",
-      "file_location": "E2E/phase1b_rag/retriever.py:23",
+      "component_function": "retriever.analyze",
+      "file_location": "E2E/phase1b_rag/retriever.py:12",
       "parameter_name": "max_findings_per_unit",
       "current_value": 10,
       "value_type": "int",
@@ -600,23 +495,8 @@
       "heuristic_rationale": "Giới hạn số lượng finding tối đa xuất ra cho 1 code unit để tránh spam finding.",
       "tuning_direction": "Có thể thử nghiệm 5 - 10.",
       "previous_value": 10,
-      "optimization_status": "Giữ nguyên - không ảnh hưởng quyết định nào trên dữ liệu",
-      "optimization_evidence": "Không ràng buộc: 5 -> 1 hàm đổi, 20 -> 0 hàm đổi."
-    },
-    {
-      "phase": "Phase 1B - RAG",
-      "category": "rag_retrieval_scoring",
-      "component_function": "rag_runner.run_rag",
-      "file_location": "E2E/phase1b_rag/rag_runner.py:25",
-      "parameter_name": "rag_context_top_k",
-      "current_value": 8,
-      "value_type": "int",
-      "formula_rule": "retriever.retrieve_context(code, top_k=8)",
-      "heuristic_rationale": "Số lượng ca mẫu gần nhất lấy từ KB để đưa sang Fixer làm ngữ cảnh tham khảo.",
-      "tuning_direction": "Tối ưu 5, 8 hoặc 10 để cân đối độ phong phú tri thức và token context limit.",
-      "previous_value": 8,
-      "optimization_status": "Giữ nguyên - đã kiểm chứng trên dữ liệu",
-      "optimization_evidence": "Proxy 'ca KB đúng SWC có trong phần tri thức của Fixer' (432 lỗi thật, leave-one-out): top_k 5/8/12 cùng hit 0.611."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Giữ nguyên trong RAG chỉ-độ-giống: R2 quét max_findings_per_unit 1/2/3/10 ở θ = 0.40 cho cùng F2 CV (0.786); luật trùng khớp (>= 80 ký tự, độ dài chênh <= 20%, confidence 0.95) không đổi."
     },
     {
       "phase": "Phase 1A - Static",
@@ -666,23 +546,8 @@
     {
       "phase": "Phase 4 - Fixer",
       "category": "fixer_rag_selection",
-      "component_function": "_build_rag_knowledge_section",
-      "file_location": "E2E/phase4_fixer/fixer.py:20",
-      "parameter_name": "fixer_swc_match_bonus",
-      "current_value": 2.0,
-      "value_type": "float",
-      "formula_rule": "priority = (2.0 + sim) if target_swc == c_swc else sim",
-      "heuristic_rationale": "Điểm thưởng ưu tiên ca mẫu RAG có cùng SWC với lỗi đang sửa trong thuật toán xếp hạng ca tham khảo.",
-      "tuning_direction": "Thử nghiệm trong khoảng 1.0 - 3.0.",
-      "previous_value": 2.0,
-      "optimization_status": "Giữ nguyên - đã kiểm chứng trên dữ liệu",
-      "optimization_evidence": "Mọi giá trị > 1 tương đương 'ưu tiên cùng SWC'. target_swc chỉ đúng ở 12/432 hàm (thiếu ở 260); bonus 0 so với 2: top-1 đúng SWC 0.444 so với 0.4375 (3 hàm) - không đáng đổi."
-    },
-    {
-      "phase": "Phase 4 - Fixer",
-      "category": "fixer_rag_selection",
-      "component_function": "_build_rag_knowledge_section",
-      "file_location": "E2E/phase4_fixer/fixer.py:19",
+      "component_function": "KnowledgeBase.cases_for_unit",
+      "file_location": "E2E/common/knowledge_base.py:18",
       "parameter_name": "fixer_rag_min_similarity",
       "current_value": 0.08,
       "value_type": "float",
@@ -690,14 +555,14 @@
       "heuristic_rationale": "Ngưỡng tương đồng cosine tối thiểu để ca mẫu RAG được chọn làm ví dụ sửa.",
       "tuning_direction": "Tinh chỉnh 0.05 - 0.12 để loại bỏ các ca rác có cosine quá thấp.",
       "previous_value": 0.08,
-      "optimization_status": "Giữ nguyên - không ảnh hưởng quyết định nào trên dữ liệu",
-      "optimization_evidence": "0.0 cho kết quả như 0.08 (không chặn ca nào); >= 0.15 làm giảm hit."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Ca KB cho Fixer nay được tra lúc sửa, theo TỪNG hàm (ca giống nhất của mỗi SWC của finding của hàm, rồi bù ca giống nhất toàn KB có sim >= 0.08, tối đa 3). Proxy R5 trên hàm lỗi thật: có ca đúng SWC 0.6394 (cũ 0.6384), số cặp mã lỗi/mã sửa được thấy 0.431 (cũ 0.2712). Thêm ca (k = 4) tăng hit nhưng làm dài prompt; giữ 3."
     },
     {
       "phase": "Phase 4 - Fixer",
       "category": "fixer_rag_selection",
-      "component_function": "_build_rag_knowledge_section",
-      "file_location": "E2E/phase4_fixer/fixer.py:14",
+      "component_function": "KnowledgeBase.cases_for_unit",
+      "file_location": "E2E/common/knowledge_base.py:17",
       "parameter_name": "fixer_rag_max_items",
       "current_value": 3,
       "value_type": "int",
@@ -705,12 +570,12 @@
       "heuristic_rationale": "Số lượng ca mẫu sửa lỗi thực tế tối đa được chọn từ KB đưa sang prompt Fixer.",
       "tuning_direction": "Thử nghiệm 2, 3 hoặc 4 ca mẫu.",
       "previous_value": 3,
-      "optimization_status": "Giữ nguyên - đã kiểm chứng trên dữ liệu",
-      "optimization_evidence": "4/5 ca nâng hit 0.611 -> 0.634/0.646 nhưng prompt dài hơn; ảnh hưởng tới chất lượng bản vá chưa đo được (cần chạy Fixer trên GPU)."
+      "optimization_status": "Giữ nguyên - kiểm chứng lại 22/11 trên thiết kế mới",
+      "optimization_evidence": "Ca KB cho Fixer nay được tra lúc sửa, theo TỪNG hàm (ca giống nhất của mỗi SWC của finding của hàm, rồi bù ca giống nhất toàn KB có sim >= 0.08, tối đa 3). Proxy R5 trên hàm lỗi thật: có ca đúng SWC 0.6394 (cũ 0.6384), số cặp mã lỗi/mã sửa được thấy 0.431 (cũ 0.2712). Thêm ca (k = 4) tăng hit nhưng làm dài prompt; giữ 3."
     }
   ],
   "optimization": {
-    "date": "2026-11-19",
+    "date": "2026-11-22 (lần đầu 2026-11-19)",
     "data": "final-dataset-v12-train.json (nhãn, split) + KB built/ (RAG leave-one-out) + điểm detector v13 GPU cho val+test; không dùng các file CSV labeled/labeled-v2/unlabeled. Chọn tham số trên 1,110 hàm thật (val+test, bỏ kaggle_ds2); chi phí vận hành đo trên 2,374 hợp đồng đầy đủ round1 (không nhãn).",
     "objective": "F2 của 'lỗ hổng thật tới được Fixer' (có finding confirmed trên hàm sửa được).",
     "method": "Bộ mô phỏng static -> RAG -> fuse_findings -> fuse_detection, kiểm chứng trùng 100% với code thật (static 3,610/3,610 mẫu, RAG 2,121/2,121, fuse_findings 65,410/65,410 cặp mẫu x bộ tham số). Fusion fit bằng hồi quy logistic; tau theo F2; tham số static/RAG quét từng cái với fusion fit lại trong từng fold; CV 5-fold x 3.",
@@ -727,7 +592,61 @@
       }
     },
     "code_change": "gpu_pipeline: hàm view/pure được vá khi detector gắn cờ (label Vulnerable). Mô phỏng in-sample: recall tới Fixer 0.664 -> 0.771 (riêng thay đổi này), cộng tham số mới: 0.819, FPR 0.252. Hợp đồng đầy đủ (round1): hàm vào Fixer 6.42 -> 10.06 / hợp đồng (detector gắn cờ nhiều getter view).",
-    "not_changed_code_issue": "Unit đã có finding local thì không sinh UNMAPPED: 126/432 lỗi thật (110 có detector >= 0.70) tới Fixer chỉ kèm finding sai loại (bạn chưa chọn sửa).",
-    "scripts": "data/results/heuristics_tuning/ (scripts/, out/, README.md)"
+    "scripts": "data/results/heuristics_tuning/ (scripts/, out/, README.md)",
+    "restructure_2026_11_22": {
+      "why": "Tái cấu trúc theo nguyên lý đơn nhiệm: RAG không dùng regex của static (hai kênh độc lập), Phase 1 tự phân loại hàm chỉ detector báo (1-NN theo ca KB), Advisor không bị kênh 'corroborated' tước quyền loại finding, Fixer tra ca KB theo từng hàm, Phase 5 chạy đủ kiểm tra trong vòng sửa.",
+      "cv_real_same_procedure": {
+        "old_design": {
+          "recall": 0.814,
+          "precision": 0.672,
+          "fpr": 0.2532,
+          "f1": 0.7362,
+          "f2": 0.781,
+          "useful_recall": 0.0648
+        },
+        "new_design": {
+          "recall": 0.8194,
+          "precision": 0.6743,
+          "fpr": 0.2522,
+          "f1": 0.7398,
+          "f2": 0.7856,
+          "useful_recall": 0.3241
+        }
+      },
+      "fusion": {
+        "theta": {
+          "intercept": -1.4861,
+          "p_detector": 3.6935,
+          "static_conf": 0.0,
+          "rag_conf": 0.4812,
+          "corroborated": 0.0774,
+          "severity_critical": -0.482,
+          "severity_high": -0.1185,
+          "severity_low": -0.7158
+        },
+        "tau_agent": 0.1848
+      },
+      "classification_1nn": {
+        "vuln_functions_with_classified_finding": 148,
+        "of_which_true_swc": 69,
+        "safe_functions_with_classified_finding": 50
+      },
+      "removed_parameters": [
+        "candidate_confidence_cap",
+        "fixer_swc_match_bonus",
+        "min_semantic_only_similarity",
+        "rag_context_top_k",
+        "rag_semantic_scale_alone",
+        "rag_semantic_scale_with_signal",
+        "rag_semantic_weight",
+        "rag_signal_weight",
+        "semantic_gate_min_similarity",
+        "vulnerable_confidence_threshold"
+      ],
+      "added_parameters": [
+        "rag_min_similarity"
+      ],
+      "scripts": "data/results/heuristics_tuning_v2/ (scripts/, out/, README.md)"
+    }
   }
 }

@@ -8,8 +8,10 @@ from E2E.config import (
     DEFAULT_COMPONENT_WEIGHTS, DEFAULT_DETECTOR_THRESHOLD, DEFAULT_FINAL_THRESHOLD, FUSION_CALIBRATION_PATH, RISK_ORDER,
 )
 
-# Slither cùng kênh bằng chứng với luật static: static + Slither cùng báo KHÔNG tính là hai kênh xác nhận nhau.
+# Kênh bằng chứng: Slither cùng kênh với luật static; RAG (độ giống ca đã biết) là kênh riêng, không dùng regex của static.
 _CHANNEL_BY_SOURCE = {"static": "static", "slither": "static", "rag": "rag"}
+# Hàm chỉ detector báo mà RAG không có lớp (kênh RAG lỗi): gán lớp "Other" của KB để vẫn được sửa.
+_FALLBACK_CLASS = {"swc": "SWC-100", "title": "Other", "severity": "Medium", "similarity": None}
 
 
 # Điểm của một kênh (score, không có thì vulnerability_probability).
@@ -35,11 +37,11 @@ def _first(evidence: list[dict], key: str, default=""):
     return next((item.get(key) for item in evidence if item.get(key)), default)
 
 
-# Gộp finding static + RAG theo (SWC, unit): mức độ / confidence cao nhất, nguồn, corroborated (>= 2 kênh).
+# Gộp finding static + RAG theo (SWC, unit): mức độ / confidence cao nhất, nguồn, corroborated (cả hai kênh độc lập).
 def merge_findings(static_result: dict, rag_result: dict) -> list[dict]:
     grouped = defaultdict(list)
     for finding in [*static_result.get("findings", []), *rag_result.get("findings", [])]:
-        grouped[(str(finding.get("swc") or "UNMAPPED"), str(finding.get("unit_id") or "contract"))].append(finding)
+        grouped[(str(finding.get("swc") or "SWC-100"), str(finding.get("unit_id") or "contract"))].append(finding)
     merged = []
     for (swc, unit_id), evidence in grouped.items():
         sources = sorted({str(item.get("source") or "unknown") for item in evidence})
@@ -72,22 +74,34 @@ def _apply_detector_lines(finding: dict, unit_result: dict, *, overwrite: bool) 
         finding["line"] = start_line
 
 
-# Finding "UNMAPPED:<unit>" cho unit detector gắn Vulnerable mà static/RAG không có finding nào (để vẫn được sửa).
-def detector_findings(unit_results: list[dict], local_units: set) -> list[dict]:
-    return [{
-        "finding_id": f"UNMAPPED:{item.get('unit_id') or 'source'}", "swc": "UNMAPPED", "unit_id": item.get("unit_id"),
-        "title": "Qwen2.5-14B neural vulnerability signal", "severity": "Unknown",
-        "confidence": round(float(item.get("vulnerability_probability") or 0.0), 6), "sources": ["llm_detector"],
-        "corroborated": False, "line": item.get("start_line"), "start_line": item.get("start_line"),
-        "end_line": item.get("end_line"), "line_scores": item.get("line_scores"),
-        "description": "The fine-tuned binary classifier crossed its vulnerability threshold. "
-                       "Static/RAG did not assign a supported SWC category to this unit.",
-        "remediation": "Perform targeted manual review and use the Advisor phase for root-cause analysis.",
-        "evidence": [item],
-    } for item in unit_results if item.get("label") == "Vulnerable" and item.get("unit_id") not in local_units]
+# Hàm detector gắn Vulnerable mà static/RAG không có finding: Phase 1 PHÂN LOẠI theo lớp của ca KB giống nhất (1B).
+def classified_detector_findings(unit_results: list[dict], local_units: set, rag_result: dict) -> list[dict]:
+    classes = {item.get("unit_id"): item for item in rag_result.get("classifications") or []}
+    findings = []
+    for item in unit_results:
+        if item.get("label") != "Vulnerable" or item.get("unit_id") in local_units:
+            continue
+        unit_id = item.get("unit_id")
+        found = classes.get(unit_id) or _FALLBACK_CLASS
+        similarity = found.get("similarity")
+        basis = f"the most similar vulnerable case in the reference database is a {found['swc']} case " \
+                f"(similarity {similarity:.2f})" if similarity is not None else "no RAG classification was available"
+        findings.append({
+            "finding_id": f"{found['swc']}:{unit_id or 'source'}", "swc": found["swc"], "unit_id": unit_id,
+            "title": found["title"], "severity": found["severity"],
+            "confidence": round(float(item.get("vulnerability_probability") or 0.0), 6), "sources": ["llm_detector"],
+            "corroborated": False, "line": item.get("start_line"), "start_line": item.get("start_line"),
+            "end_line": item.get("end_line"), "line_scores": item.get("line_scores"),
+            "classification": {"method": "nearest_known_case", "similarity": similarity,
+                               "nearest_case_id": found.get("nearest_case_id")},
+            "description": "The fine-tuned binary detector crossed its vulnerability threshold and static/RAG reported "
+                           f"no finding for this unit; Phase 1 classified it as {found['swc']} because {basis}.",
+            "evidence": [item],
+        })
+    return findings
 
 
-# [FUSION THEO TỪNG FINDING] p_final = logistic(intercept + w·x) (fusion_calibration.json); >= tau_agent -> confirmed.
+# [FUSION THEO TỪNG FINDING] p_final = logistic(intercept + w·x) (fusion_calibration.json) >= tau_agent -> confirmed.
 def fuse_findings(unit_results: list[dict], static_result: dict, rag_result: dict) -> tuple[list[dict], list[dict]]:
     calibration = json.loads(FUSION_CALIBRATION_PATH.read_text(encoding="utf-8"))
     weights = calibration["weights"]
@@ -125,7 +139,7 @@ def fuse_findings(unit_results: list[dict], static_result: dict, rag_result: dic
         if unit:
             _apply_detector_lines(finding, unit, overwrite=True)
         (confirmed if p_final >= float(calibration["tau_agent"]) else candidates).append(finding)
-    for finding in detector_findings(unit_results, {item.get("unit_id") for item in local}):
+    for finding in classified_detector_findings(unit_results, {item.get("unit_id") for item in local}, rag_result):
         finding["p_detector"] = finding["p_final"] = round(float(finding.get("confidence") or 0.0), 6)
         confirmed.append(finding)
     return confirmed, candidates
@@ -175,7 +189,8 @@ def fuse_detection(static_result: dict, rag_result: dict, llm_result: dict | Non
     else:
         verdict = "Safe" if complete else "Inconclusive"
     unit_results = detector.get("unit_results", [])
-    evidence = [*local, *detector_findings(unit_results, {finding.get("unit_id") for finding in local})]
+    evidence = [*local, *classified_detector_findings(unit_results, {finding.get("unit_id") for finding in local},
+                                                      rag_result)]
     unit_map = {item.get("unit_id"): item for item in unit_results if item.get("unit_id")}
     for finding in evidence:
         if finding.get("unit_id") in unit_map:

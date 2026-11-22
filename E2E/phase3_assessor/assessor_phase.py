@@ -3,8 +3,8 @@
 import concurrent.futures
 
 from E2E.common.findings import finding_key
+from E2E.common.knowledge_base import KnowledgeBase
 from E2E.config import MAX_LLM_ASSESSOR_CALLS
-from E2E.phase2_advisor.advisor import RepairKnowledgeBase
 from E2E.phase3_assessor.assessor import AssessorAgent, compute_cvss_31_base_score, cvss_to_level
 
 # Vector CVSS mặc định theo SWC (điểm luôn TÍNH từ vector) + lý giải.
@@ -56,7 +56,7 @@ def get_cvss_defaults(swc: str, severity: str = "Medium") -> dict:
 # [HÀM CHÍNH PHASE 3] LLM (4 luồng) cho <= MAX_LLM_ASSESSOR_CALLS finding, còn lại CVSS mặc định; CVSS giảm dần = ưu tiên.
 def _generate_assessor_section(findings: list[dict], code: str = "", *, use_llm: bool = False,
                                advisor_suggestions: list[dict] | None = None,
-                               knowledge_base: RepairKnowledgeBase | None = None) -> dict:
+                               knowledge_base: KnowledgeBase | None = None) -> dict:
     suggestions = {item.get("finding_id"): item for item in advisor_suggestions or [] if item.get("finding_id")}
     agent = AssessorAgent(knowledge_base=knowledge_base) if use_llm else None
 

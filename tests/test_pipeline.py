@@ -14,7 +14,7 @@ from E2E.phase1a_static.static_runner import run_static
 from E2E.phase1b_rag.rag_runner import run_rag
 from E2E.phase4_fixer.patching import apply_unit_patches
 from E2E.phase5_verifier.behavior_verifier import verify_patch_behavior
-from E2E.phase5_verifier.final_verification import build_verification_channels
+from E2E.phase5_verifier.verifier import build_verification_channels
 from E2E.phase6_reporter.report import (
     DEFAULT_RECOMMENDATIONS,
     apply_verification_to_report,
@@ -60,7 +60,7 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(outcomes[0]["status"], "applied")
 
 
-# Kiểm tra các kênh phát hiện (static, RAG), fusion và helper tri thức RAG trên contract demo.
+# Kiểm tra các kênh phát hiện (static, RAG), fusion và ca KB cho Fixer trên contract demo.
 class DetectorTests(unittest.TestCase):
     # Đọc VulnerableBank.sol và SafeBank.sol trong demo_contracts/.
     @classmethod
@@ -76,12 +76,22 @@ class DetectorTests(unittest.TestCase):
         self.assertFalse(any(item["swc"] == "SWC-104" for item in vulnerable["findings"]))
         self.assertEqual(safe["findings"], [])
 
-    # RAG: finding đầu tiên của VulnerableBank là SWC-107; SafeBank không có finding.
-    def test_rag_reentrancy_and_safe_control(self) -> None:
-        vulnerable = run_rag(self.vulnerable)
-        safe = run_rag(self.safe)
-        self.assertEqual(vulnerable["findings"][0]["swc"], "SWC-107")
+    # RAG chỉ dựa trên độ giống ca đã biết: hàm chép từ một ca SWC-107 trong KB -> finding SWC-107; contract demo
+    # (không giống ca nào >= 0.40) -> không finding, nhưng withdraw vẫn được phân loại SWC-107 theo ca gần nhất.
+    def test_rag_reports_known_cases_and_classifies_units(self) -> None:
+        from E2E.common.knowledge_base import default_knowledge_base
+
+        kb = default_knowledge_base()
+        known = next(item["vulnerable_code"] for item in kb.items if item.get("swc") == "SWC-107"
+                     and 300 <= len(item.get("vulnerable_code") or "") <= 1500
+                     and item["vulnerable_code"].lstrip().startswith("function"))
+        copied = run_rag("pragma solidity ^0.8.0;\ncontract Copy {\n" + known + "\n}\n")
+        self.assertIn("SWC-107", {item["swc"] for item in copied["findings"]})
+        self.assertTrue(all(item["confidence"] >= 0.40 for item in copied["findings"]))
+        vulnerable, safe = run_rag(self.vulnerable), run_rag(self.safe)
         self.assertEqual(safe["findings"], [])
+        classes = {item["unit_id"]: item["swc"] for item in vulnerable["classifications"]}
+        self.assertEqual(classes["VulnerableBank.withdraw"], "SWC-107")
 
     # Fusion fail-closed: mọi kênh lỗi -> Inconclusive; thiếu detector -> Inconclusive; đủ kênh và an toàn -> Safe.
     def test_fusion_does_not_fail_open(self) -> None:
@@ -111,11 +121,14 @@ class DetectorTests(unittest.TestCase):
         }
         positive = fuse_detection(
             {"status": "ok", "score": 0.0, "verdict": "Safe", "findings": []},
-            {"status": "ok", "score": 0.0, "verdict": "Safe", "findings": []},
+            {"status": "ok", "score": 0.0, "verdict": "Safe", "findings": [], "classifications": [
+                {"unit_id": "SafeBank.withdraw", "swc": "SWC-107", "title": "Reentrancy", "severity": "Critical",
+                 "similarity": 0.31}]},
             llm_only_positive,
         )
         self.assertEqual(positive["verdict"], "Vulnerable")
-        self.assertEqual(positive["findings"][0]["swc"], "UNMAPPED")
+        self.assertEqual((positive["findings"][0]["swc"], positive["findings"][0]["sources"]),
+                         ("SWC-107", ["llm_detector"]))
 
     # Detector offline: trọng số chia 50/50 cho static/RAG và sàn bằng chứng vẫn hoạt động.
     def test_adaptive_fusion_when_detector_offline(self) -> None:
@@ -177,45 +190,26 @@ class DetectorTests(unittest.TestCase):
         self.assertGreaterEqual(result["score"], 0.50)
         self.assertEqual(result["configured_weights"]["rag"], 0.40)
 
-    # _build_rag_knowledge_section ưu tiên đúng ca cùng SWC và định dạng đúng.
-    def test_rag_knowledge_section_builder(self) -> None:
-        """Kiểm tra helper _build_rag_knowledge_section định dạng và ưu tiên đúng case."""
+    # Ca KB cho Fixer được tra theo hàm: ca giống nhất của SWC của finding đứng đầu, rồi các ca giống nhất toàn KB.
+    def test_fixer_cases_are_retrieved_for_the_unit(self) -> None:
+        from E2E.common.knowledge_base import default_knowledge_base
         from E2E.phase4_fixer.fixer import _build_rag_knowledge_section
 
         self.assertEqual(_build_rag_knowledge_section([]), "")
-
-        rag_ctx = [
-            {
-                "swc": "SWC-115",
-                "title": "tx.origin",
-                "similarity": 0.45,
-                "root_cause": "tx.origin used for auth",
-                "remediation": "use msg.sender",
-                "vulnerable_code": "require(tx.origin == owner);",
-                "fixed_code": "require(msg.sender == owner);",
-            },
-            {
-                "swc": "SWC-107",
-                "title": "Reentrancy",
-                "similarity": 0.82,
-                "root_cause": "State updated after call",
-                "remediation": "Apply CEI pattern",
-                "vulnerable_code": "msg.sender.call{value: bal}(); bal = 0;",
-                "fixed_code": "bal = 0; msg.sender.call{value: bal}();",
-            },
-        ]
-
-        section = _build_rag_knowledge_section(rag_ctx, target_swc="SWC-107", max_items=2)
+        withdraw = next(unit for unit in parse_code_units(self.vulnerable) if unit.name == "withdraw")
+        cases = default_knowledge_base().cases_for_unit(withdraw.code, {"SWC-115"})
+        self.assertEqual(len(cases), 3)
+        self.assertEqual(cases[0]["swc"], "SWC-115")
+        self.assertTrue(all(case["similarity"] >= 0.08 for case in cases[1:]))
+        section = _build_rag_knowledge_section(cases)
         self.assertIn("RAG Retrieved Knowledge", section)
-        self.assertIn("SWC-107", section)
-        self.assertIn("SWC-115", section)
-        self.assertIn("Apply CEI pattern", section)
+        self.assertIn("[SWC-115]", section)
 
 
 # Kiểm tra tích hợp Phase 5 + Phase 6: feedback, hồi quy hành vi, báo cáo, ma trận tool.
 class IntegrationTests(unittest.TestCase):
-    # build_verification_channels ghi rõ lý do thất bại của từng kênh static / RAG / detector trên bản vá.
-    def test_verification_channels_contain_failed_static_rag_and_llm_reasons(self) -> None:
+    # build_verification_channels ghi rõ lý do thất bại của kênh static / detector trên bản vá (Phase 5 không chạy RAG).
+    def test_verification_channels_contain_failed_static_and_llm_reasons(self) -> None:
         static_result = {
             "status": "ok",
             "verdict": "Vulnerable",
@@ -228,17 +222,6 @@ class IntegrationTests(unittest.TestCase):
                 }
             ],
         }
-        rag_result = {
-            "status": "ok",
-            "verdict": "Vulnerable",
-            "findings": [
-                {
-                    "swc": "SWC-107",
-                    "unit_id": "C.withdraw",
-                    "remediation": "Apply checks-effects-interactions.",
-                }
-            ],
-        }
         detector = {
             "status": "ok",
             "verdict": "Vulnerable",
@@ -247,13 +230,12 @@ class IntegrationTests(unittest.TestCase):
         channels = build_verification_channels(
             {"compile": {"status": "passed"}},
             static_result=static_result,
-            rag_result=rag_result,
             detector_fixed=detector,
         )
-        self.assertFalse(any(channels[name]["passed"] for name in ("static", "rag", "llm")))
+        self.assertFalse(any(channels[name]["passed"] for name in ("static", "llm")))
+        self.assertNotIn("rag", channels)
         self.assertTrue(channels["compile"]["passed"])
         self.assertEqual(channels["static"]["findings"][0]["swc"], "SWC-107")
-        self.assertIn("checks-effects-interactions", channels["rag"]["findings"][0]["remediation"])
         self.assertEqual(channels["llm"]["reason"], "The neural detector still flags: C.withdraw (0.910).")
 
     # Bản vá làm mất hành vi -> verify_patch_behavior failed và báo cáo ghi "must not be deployed" dù model nói đã sửa.
@@ -536,15 +518,19 @@ class IntegrationTests(unittest.TestCase):
                 }
             },
         }
+        remote["phases"]["verifier"]["final"] = {
+            "tool_verification": tool_result,
+            "behavioral_verification": {"status": "passed", "findings": [], "checks": []},
+            "fixed_static": {"status": "ok", "verdict": "Safe", "findings": [], "introduced_findings": []},
+        }
         with tempfile.TemporaryDirectory() as temp_dir:
-            with patch("E2E.phase5_verifier.final_verification.verify_security_tool_matrix", return_value=tool_result):
-                manifest = run_pipeline(
-                    code,
-                    file_name="VulnerableBank.sol",
-                    run_id=run_id,
-                    runs_dir=temp_dir,
-                    remote_result=remote,
-                )
+            manifest = run_pipeline(
+                code,
+                file_name="VulnerableBank.sol",
+                run_id=run_id,
+                runs_dir=temp_dir,
+                remote_result=remote,
+            )
             self.assertEqual(manifest["status"], "complete")
             self.assertEqual(manifest["detection"]["verdict"], "Vulnerable")
             self.assertTrue(Path(manifest["reports"]["pdf"]).exists())
@@ -563,13 +549,12 @@ class IntegrationTests(unittest.TestCase):
             "verdict": "Vulnerable",
         }
         with tempfile.TemporaryDirectory() as temp_dir:
-            with patch("E2E.phase5_verifier.final_verification.verify_security_tool_matrix", return_value=tool_result):
-                disagreement = run_pipeline(
-                    code,
-                    file_name="VulnerableBank.sol",
-                    run_id=disagreement_run_id,
-                    runs_dir=temp_dir,
-                    remote_result=remote,
+            disagreement = run_pipeline(
+                code,
+                file_name="VulnerableBank.sol",
+                run_id=disagreement_run_id,
+                runs_dir=temp_dir,
+                remote_result=remote,
             )
             self.assertEqual(
                 disagreement["verification"]["overall_verdict"],
@@ -602,13 +587,12 @@ class IntegrationTests(unittest.TestCase):
             "verifications": [],
         }
         with tempfile.TemporaryDirectory() as temp_dir:
-            with patch("E2E.phase5_verifier.final_verification.verify_security_tool_matrix", return_value=tool_result):
-                rejected = run_pipeline(
-                    code,
-                    file_name="VulnerableBank.sol",
-                    run_id=rejected_run_id,
-                    runs_dir=temp_dir,
-                    remote_result=remote,
+            rejected = run_pipeline(
+                code,
+                file_name="VulnerableBank.sol",
+                run_id=rejected_run_id,
+                runs_dir=temp_dir,
+                remote_result=remote,
             )
             self.assertEqual(
                 rejected["verification"]["overall_verdict"],

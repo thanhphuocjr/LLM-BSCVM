@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 
 from E2E.common.gpu_client import ServerGPUClient
-from E2E.phase2_advisor.advisor import RepairKnowledgeBase
+from E2E.common.knowledge_base import KnowledgeBase, default_knowledge_base
 
 ASSESSOR_SYSTEM_INSTRUCTION = (
     "You are a smart-contract security risk analyst. For a single confirmed "
@@ -76,10 +76,10 @@ class RiskAssessment:
 
 # Agent Assessor: LLM chọn các metric CVSS v3.1 theo ngữ cảnh smart contract.
 class AssessorAgent:
-    # Gắn client LLM và KB (lấy risk_guidance theo SWC; dùng chung KB với Advisor nếu được truyền vào).
-    def __init__(self, llm: ServerGPUClient | None = None, knowledge_base: RepairKnowledgeBase | None = None) -> None:
+    # Gắn client LLM và KB dùng chung (lấy risk_guidance theo SWC).
+    def __init__(self, llm: ServerGPUClient | None = None, knowledge_base: KnowledgeBase | None = None) -> None:
         self.llm = llm or ServerGPUClient()
-        self.knowledge_base = knowledge_base or RepairKnowledgeBase()
+        self.knowledge_base = knowledge_base or default_knowledge_base()
 
     # Prompt: lỗ hổng (+ root cause / impact của Advisor), hướng dẫn KB, mã contract (<= 10k ký tự), schema JSON.
     @staticmethod
@@ -114,7 +114,7 @@ class AssessorAgent:
     # [HÀM CHÍNH PHASE 3 - một lỗ hổng] LLM chọn 8 metric -> compute_cvss_31_base_score -> mức rủi ro; LLM lỗi -> None.
     def assess_one(self, code: str, item: dict) -> RiskAssessment | None:
         swc = item.get("swc") or "Unknown"
-        guidance = self.knowledge_base.retrieve(swc).get("risk_guidance")
+        guidance = self.knowledge_base.risk_guidance(swc)
         try:
             data = self.llm.generate_json(self._build_prompt(code, item, guidance), ASSESSOR_SYSTEM_INSTRUCTION)
         except Exception:

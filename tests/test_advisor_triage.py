@@ -1,6 +1,6 @@
-"""Phase 2 Advisor triage (recall-first): three verdicts, the dismissal check (a quoted guard must
-exist, corroborated findings are kept), UNMAPPED classification, the prompt, and which Advisor
-suggestions the Fixer uses."""
+"""Phase 2 Advisor triage: three verdicts, the dismissal check (a quoted guard must exist; the Advisor
+also decides on findings that static and RAG both report), the prompt (Phase 1 evidence, including the
+Phase 1 classification of detector-only findings), and which Advisor suggestions the Fixer uses."""
 
 from __future__ import annotations
 
@@ -35,10 +35,10 @@ def _finding(**extra) -> dict:
     }
 
 
-# Finding UNMAPPED (chỉ detector báo) của hàm withdraw.
-def _unmapped() -> dict:
-    return _finding(finding_id="UNMAPPED:Bank.withdraw", swc="UNMAPPED", title="Qwen2.5-14B neural vulnerability signal",
-                    sources=["llm_detector"], evidence=[])
+# Finding chỉ detector báo, đã được Phase 1 phân loại SWC-107 theo ca KB giống nhất.
+def _classified() -> dict:
+    return _finding(sources=["llm_detector"], evidence=[],
+                    classification={"method": "nearest_known_case", "similarity": 0.62, "nearest_case_id": "k1"})
 
 
 # Chạy _generate_advisor_section với một AdvisorAgent giả luôn trả `suggestion`.
@@ -50,7 +50,7 @@ def _run(findings: list, suggestion: RepairSuggestion) -> dict:
             pass
 
         # Trả cùng một kết luận cho mọi finding.
-        def advise_one(self, code, finding, rag_context=None):
+        def advise_one(self, code, finding):
             return suggestion
 
     with patch("E2E.phase2_advisor.advisor_phase.AdvisorAgent", FakeAgent):
@@ -68,7 +68,7 @@ def _advise(finding: dict, answer) -> RepairSuggestion:
     # KB rỗng.
     class EmptyKB:
         # Không có tri thức nào.
-        def retrieve(self, swc, limit=3, code=None):
+        def repair_knowledge(self, swc, code=None, limit=3):
             return {}
 
     return AdvisorAgent(llm=FakeLLM(), knowledge_base=EmptyKB()).advise_one(SOURCE, finding)
@@ -94,11 +94,12 @@ class DismissalCheckTests(unittest.TestCase):
         self.assertEqual(result["false_positive_reasons"], {"SWC-107:Bank.withdraw": "Balance checked."})
         self.assertEqual(result["suggestions"], [])
 
-    # Static + RAG cùng báo (corroborated) -> một kết luận false positive không loại được finding.
-    def test_corroborated_finding_is_never_dismissed(self) -> None:
-        result = _run([_finding(corroborated=True)], RepairSuggestion(verdict="false_positive", root_cause="No reentrancy."))
-        self.assertEqual(result["false_positives"], [])
-        self.assertIn("static rules and RAG", result["suggestions"][0]["kept_because"])
+    # Static + RAG cùng báo (corroborated) không tước quyền Advisor: kết luận false positive vẫn loại được finding.
+    def test_corroborated_finding_can_be_dismissed_by_the_advisor(self) -> None:
+        result = _run([_finding(corroborated=True, sources=["rag", "static"])],
+                      RepairSuggestion(verdict="false_positive", root_cause="No reentrancy."))
+        self.assertEqual(result["false_positives"], ["SWC-107:Bank.withdraw"])
+        self.assertEqual(result["suggestions"], [])
 
     # Uncertain -> giữ lại với root cause + fix_strategy của LLM.
     def test_uncertain_finding_is_kept_with_the_llm_strategy(self) -> None:
@@ -108,10 +109,11 @@ class DismissalCheckTests(unittest.TestCase):
         self.assertEqual(suggestion["advisor_verdict"], "uncertain")
         self.assertEqual(suggestion["repair_steps"], ["Apply CEI."])
 
-    # Finding UNMAPPED được gán lớp lỗi -> suggestion mang advisor_swc.
-    def test_unmapped_class_is_carried_by_the_suggestion(self) -> None:
-        result = _run([_unmapped()], RepairSuggestion(verdict="confirmed", vulnerability_class="SWC-107"))
-        self.assertEqual(result["suggestions"][0]["advisor_swc"], "SWC-107")
+    # Advisor không phân loại lại: suggestion giữ đúng SWC Phase 1 gán.
+    def test_classified_finding_keeps_the_phase1_class(self) -> None:
+        result = _run([_classified()], RepairSuggestion(verdict="confirmed", root_cause="State updated after call."))
+        self.assertEqual(result["suggestions"][0]["swc"], "SWC-107")
+        self.assertNotIn("advisor_swc", result["suggestions"][0])
 
     # So guard_quote với mã: bỏ qua khoảng trắng, dấu `, dấu lược "..."; mảnh không có trong mã -> False.
     def test_quote_matching_tolerates_spacing_and_ellipsis(self) -> None:
@@ -128,12 +130,6 @@ class AdviseOneParsingTests(unittest.TestCase):
         self.assertEqual(_advise(_finding(), {"verdict": "False_Positive"}).verdict, "false_positive")
         self.assertEqual(_advise(_finding(), {"verdict": "False Positive"}).verdict, "uncertain")
         self.assertEqual(_advise(_finding(), {"root_cause": "x"}).verdict, "uncertain")
-
-    # vulnerability_class chỉ đọc cho finding UNMAPPED; "SWC-107 Reentrancy" -> "SWC-107"; lớp ngoài danh sách -> "".
-    def test_vulnerability_class_is_read_for_unmapped_only(self) -> None:
-        self.assertEqual(_advise(_unmapped(), {"vulnerability_class": "SWC-107 Reentrancy"}).vulnerability_class, "SWC-107")
-        self.assertEqual(_advise(_unmapped(), {"vulnerability_class": "SWC-999"}).vulnerability_class, "")
-        self.assertEqual(_advise(_finding(), {"vulnerability_class": "SWC-107"}).vulnerability_class, "")
 
     # LLM trả JSON không phải object -> error (advisor_phase sẽ dùng gợi ý từ KB).
     def test_non_object_answer_is_an_error(self) -> None:
@@ -152,14 +148,25 @@ class AdvisorPromptTests(unittest.TestCase):
         self.assertNotIn("0.97", prompt)
         self.assertNotIn("may be a false positive", prompt)
 
-    # Finding UNMAPPED: prompt yêu cầu vulnerability_class và có gợi ý ca tương tự của RAG.
-    def test_unmapped_prompt_asks_for_a_class_with_rag_hints(self) -> None:
-        prompt = AdvisorAgent(llm=object(), knowledge_base=object())._build_prompt(SOURCE, _unmapped(), "", rag_context=[
-            {"swc": "SWC-107", "title": "Reentrancy", "similarity": "0.81", "description": "State updated after call."}])
-        self.assertIn('"vulnerability_class"', prompt)
-        self.assertIn("SWC-135 Business Logic Flaw", prompt)
-        self.assertIn("SWC-107 Reentrancy (similarity 0.81): State updated after call.", prompt)
-        self.assertNotIn("Qwen2.5-14B neural vulnerability signal", prompt)
+    # Finding chỉ detector báo: prompt thẩm định đúng lớp Phase 1 gán (nêu nguồn phân loại), không bắt Advisor phân loại.
+    def test_classified_prompt_judges_the_phase1_class(self) -> None:
+        prompt = AdvisorAgent(llm=object(), knowledge_base=object())._build_prompt(SOURCE, _classified(), "")
+        self.assertIn("Finding: Reentrancy (SWC-107)", prompt)
+        self.assertIn("assigned in Phase 1 from the most similar known vulnerable case", prompt)
+        self.assertIn("(code similarity 0.62)", prompt)
+        self.assertNotIn("vulnerability_class", prompt)
+
+
+# KB giả cho Fixer: ghi lại SWC được hỏi, trả một ca cố định.
+class _CaseKB:
+    # Chưa có lần tra nào.
+    def __init__(self) -> None:
+        self.asked = []
+
+    # Ghi (mã, SWC) được tra, trả một ca reentrancy.
+    def cases_for_unit(self, code, swcs, limit=3, min_similarity=0.08):
+        self.asked.append((code, set(swcs)))
+        return [{"swc": "SWC-107", "title": "Reentrancy", "similarity": 0.5, "root_cause": "Call before update."}]
 
 
 # Fixer chỉ dùng chẩn đoán LLM của chính hàm (confirmed / uncertain), không dùng gợi ý KB hay "disputed".
@@ -170,9 +177,17 @@ class FixerUsesAdvisorTests(unittest.TestCase):
         prompt = _build_fixer_prompt(unit, [_finding()], [
             {"advisor_verdict": "uncertain", "fix_strategy": "Update the balance before the call."},
             {"advisor_verdict": "disputed", "fix_strategy": "Knowledge-base text."},
-        ], SOURCE, "", "")
+        ], SOURCE, "", _CaseKB())
         self.assertIn("Fix Strategy: Update the balance before the call.", prompt)
         self.assertNotIn("Knowledge-base text.", prompt)
+
+    # Ca KB của Fixer được tra lúc sửa, theo mã của CHÍNH hàm đang sửa và SWC của các finding của hàm đó.
+    def test_fixer_retrieves_cases_for_the_unit_being_fixed(self) -> None:
+        unit = next(unit for unit in parse_code_units(SOURCE) if unit.name == "withdraw")
+        kb = _CaseKB()
+        prompt = _build_fixer_prompt(unit, [_finding()], [], SOURCE, "", kb)
+        self.assertEqual(kb.asked, [(unit.code, {"SWC-107"})])
+        self.assertIn("- [SWC-107] Reentrancy (similarity: 0.50)", prompt)
 
 
 if __name__ == "__main__":

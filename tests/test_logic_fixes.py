@@ -1,6 +1,6 @@
-"""Regression tests for the pipeline logic fixes (fusion fail-closed, corroboration,
-RAG exact match, repair-loop carry-over, compile baseline, behaviour guard, CVSS, prompt
-context, LLM JSON salvage, Phase 5 behaviour check)."""
+"""Regression tests for the pipeline logic fixes (fusion fail-closed, corroboration, Phase 1
+classification, RAG exact match, repair-loop carry-over and full verification feedback, compile
+baseline, behaviour check, CVSS, prompt context, LLM JSON salvage, Phase 5 behaviour check)."""
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ from E2E.phase2_advisor.advisor_phase import _generate_advisor_section
 from E2E.phase3_assessor.assessor import compute_cvss_31_base_score
 from E2E.phase3_assessor.assessor_phase import _generate_assessor_section, get_cvss_defaults
 from E2E.phase4_fixer import fixer
-from E2E.phase4_fixer.behavior_guard import validate_observable_behavior
-from E2E.phase5_verifier import candidate_check
+from E2E.phase5_verifier import tool_matrix, verifier
+from E2E.phase5_verifier.behavior_verifier import validate_observable_behavior
 from E2E.phase5_verifier.tool_matrix import _evaluate_tool_result, _policy_verdict
 from E2E.pipeline import gpu_pipeline
 
@@ -169,12 +169,23 @@ class CorroborationTests(unittest.TestCase):
 
 # Fusion theo từng finding (fuse_findings).
 class FuseFindingsTests(unittest.TestCase):
-    # Hàm chỉ detector báo lỗi vẫn thành finding UNMAPPED để được sửa.
-    def test_detector_only_unit_reaches_repair_agents(self) -> None:
+    # Hàm chỉ detector báo lỗi được Phase 1 PHÂN LOẠI theo ca KB giống nhất (lớp từ RAG) để được sửa.
+    def test_detector_only_unit_is_classified_in_phase1(self) -> None:
         units = [{"unit_id": "A.f", "label": "Vulnerable", "vulnerability_probability": 0.9, "start_line": 3}]
-        confirmed, _ = fuse_findings(units, {"findings": []}, {"findings": []})
-        self.assertEqual([item["unit_id"] for item in confirmed], ["A.f"])
-        self.assertEqual(confirmed[0]["swc"], "UNMAPPED")
+        rag = {"findings": [], "classifications": [{"unit_id": "A.f", "swc": "SWC-107", "title": "Reentrancy",
+                                                    "severity": "Critical", "similarity": 0.52}]}
+        confirmed, _ = fuse_findings(units, {"findings": []}, rag)
+        self.assertEqual([(item["swc"], item["unit_id"], item["finding_id"]) for item in confirmed],
+                         [("SWC-107", "A.f", "SWC-107:A.f")])
+        self.assertEqual(confirmed[0]["classification"]["method"], "nearest_known_case")
+        self.assertEqual(confirmed[0]["sources"], ["llm_detector"])
+
+    # Kênh RAG lỗi (không có lớp) -> vẫn có finding (lớp "Other") để hàm detector báo không bị bỏ sót.
+    def test_detector_only_unit_without_rag_class_still_reaches_repair(self) -> None:
+        units = [{"unit_id": "A.f", "label": "Vulnerable", "vulnerability_probability": 0.9, "start_line": 3}]
+        confirmed, _ = fuse_findings(units, {"findings": []}, {"status": "error", "findings": []})
+        self.assertEqual([(item["swc"], item["unit_id"]) for item in confirmed], [("SWC-100", "A.f")])
+        self.assertIsNone(confirmed[0]["classification"]["similarity"])
 
     # tau_agent của fusion_calibration.json phải cho finding YẾU NHẤT (Low, không corroborated) trên unit có detector
     # >= 0.70 đi qua: unit đã có finding local thì không sinh UNMAPPED, nên bị chặn ở đây là mất luôn tín hiệu detector.
@@ -208,7 +219,7 @@ class RagExactMatchTests(unittest.TestCase):
         self.assertTrue(_is_exact_code_match(FIXED_WITHDRAW, FIXED_WITHDRAW))
 
 
-# Guard hành vi của Phase 4.
+# Kiểm tra hành vi dự phòng (cú pháp) của Phase 5, dùng khi không so được AST.
 class BehaviourGuardTests(unittest.TestCase):
     # Đổi tên biến cục bộ / thay transfer bằng dạng an toàn tương đương -> chấp nhận.
     def test_accepts_local_rename_and_safe_transfer(self) -> None:
@@ -287,7 +298,7 @@ class CvssAndAgentsTests(unittest.TestCase):
                 pass
 
             # Trả kết luận false positive cho mọi finding.
-            def advise_one(self, code, finding, rag_context=None):
+            def advise_one(self, code, finding):
                 return RepairSuggestion(verdict="false_positive", guard_quote="onlyOwner",
                                         root_cause="setOwner is guarded by onlyOwner.")
 
@@ -301,7 +312,7 @@ class CvssAndAgentsTests(unittest.TestCase):
 
     # Kết luận Phase 5 khi không có bản vá: Advisor loại hết -> không cần vá; chỉ còn finding cấp contract -> chưa kết luận.
     def test_verdict_when_no_patch_was_needed_or_possible(self) -> None:
-        from E2E.phase5_verifier.final_verification import decide_overall_verdict, skipped_verification
+        from E2E.phase5_verifier.verifier import decide_overall_verdict, skipped_verification
 
         tool_result, behaviour = skipped_verification()
 
@@ -313,7 +324,7 @@ class CvssAndAgentsTests(unittest.TestCase):
             }}
             return decide_overall_verdict(
                 remote=remote, fused={"verdict": "Vulnerable"}, code="c", fixed_code="c", patch_applied=False,
-                tool_result=tool_result, behavioral_result=behaviour, fixed_static=None, fixed_rag=None,
+                tool_result=tool_result, behavioral_result=behaviour, fixed_static=None,
             )
 
         pragma = {"finding_id": "SWC-103:contract", "swc": "SWC-103"}
@@ -364,42 +375,30 @@ class FindingSignatureTests(unittest.TestCase):
         self.assertEqual(_finding_signature(before), _finding_signature(after))
 
 
-# Kiểm tra compile so với bản gốc (candidate_check.evaluate_compilation).
+# Kiểm tra compile so với bản gốc (tool_matrix._compile_with_baseline, đường compile DUY NHẤT của Phase 5).
 class CompileBaselineTests(unittest.TestCase):
-    # Không có solc -> skipped, không phải failed.
+    # Không có solc -> unavailable -> vòng sửa coi là skipped, không phải failed.
     def test_missing_compiler_is_skipped_not_failed(self) -> None:
-        skipped = {"passed": None, "status": "skipped", "error": "solc compiler not found"}
-        with patch.object(
-            candidate_check,
-            "check_compilation_with_baseline",
-            return_value={"baseline": skipped, "fixed": skipped, "baseline_failed": False},
-        ):
-            result = candidate_check.evaluate_compilation("a", "b")
-        self.assertEqual(result["state"], "skipped")
-        self.assertFalse(result["failed"])
+        result = tool_matrix._compile_with_baseline(None, "solc not installed", "a", "b", "C.sol", None)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(verifier._COMPILE_STATE[result["status"]], "skipped")
 
-    # Bản gốc vốn không compile -> not_applicable, không đổ lỗi bản vá.
+    # Bản gốc vốn không compile (cùng lỗi) -> baseline_failed -> not_applicable, không đổ lỗi bản vá.
     def test_original_that_cannot_compile_does_not_blame_the_patch(self) -> None:
-        error = {"passed": False, "status": "failed", "error": 'ParserError: Source "x.sol" not found'}
-        with patch.object(
-            candidate_check,
-            "check_compilation_with_baseline",
-            return_value={"baseline": error, "fixed": dict(error), "baseline_failed": True},
-        ):
-            result = candidate_check.evaluate_compilation("a", "b")
-        self.assertEqual(result["state"], "not_applicable")
-        self.assertFalse(result["failed"])
+        error = {"status": "failed", "stderr": 'ParserError: Source "x.sol" not found'}
+        with patch.object(tool_matrix, "_compile_source", side_effect=lambda *args: dict(error)):
+            result = tool_matrix._compile_with_baseline(object(), "r", "a", "b", "C.sol", None)
+        self.assertEqual(result["status"], "baseline_failed")
+        self.assertEqual(verifier._COMPILE_STATE[result["status"]], "not_applicable")
 
     # Bản vá sinh lỗi compile MỚI -> failed.
     def test_new_compiler_error_is_a_failure(self) -> None:
-        baseline = {"passed": False, "error": 'ParserError: Source "x.sol" not found'}
-        fixed = {"passed": False, "error": baseline["error"] + "\nTypeError: Wrong argument count"}
-        with patch.object(
-            candidate_check,
-            "check_compilation_with_baseline",
-            return_value={"baseline": baseline, "fixed": fixed, "baseline_failed": True},
-        ):
-            self.assertTrue(candidate_check.evaluate_compilation("a", "b")["failed"])
+        baseline = {"status": "failed", "stderr": 'ParserError: Source "x.sol" not found'}
+        fixed = {"status": "failed", "stderr": baseline["stderr"] + "\nTypeError: Wrong argument count"}
+        with patch.object(tool_matrix, "_compile_source", side_effect=[fixed, baseline]):
+            result = tool_matrix._compile_with_baseline(object(), "r", "a", "b", "C.sol", None)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(verifier._COMPILE_STATE[result["status"]], "failed")
 
 
 # Các hàm hỗ trợ Fixer / vòng sửa.
@@ -418,7 +417,7 @@ class FixerSupportTests(unittest.TestCase):
         error = ("Error: Identifier not found or not unique.\n  --> /var/folders/x/T/tmpab.sol:14:56:\n   |\n"
                  "14 |     function mint(address to, uint256 amount) external onlyOwner {\n"
                  "   |                                                        ^^^^^^^^^")
-        feedback = candidate_check._compiler_feedback(error)
+        feedback = verifier._compiler_feedback(error)
         self.assertIn("external onlyOwner {", feedback)
         self.assertIn("--> Contract.sol:14:56:", feedback)
         self.assertNotIn("/var/folders", feedback)
@@ -427,8 +426,8 @@ class FixerSupportTests(unittest.TestCase):
     def test_compiler_errors_are_mapped_to_units(self) -> None:
         new_style = "Error: Invalid token.\n  --> /tmp/x.sol:11:35:\n"
         old_style = "/tmp/x.sol:17:9: Error: Undeclared identifier."
-        self.assertEqual(candidate_check.units_with_compiler_errors(BANK, new_style), {"Bank.withdraw"})
-        self.assertEqual(candidate_check.units_with_compiler_errors(BANK, old_style), {"Bank.withdrawAll"})
+        self.assertEqual(verifier.units_with_compiler_errors(BANK, new_style), {"Bank.withdraw"})
+        self.assertEqual(verifier.units_with_compiler_errors(BANK, old_style), {"Bank.withdrawAll"})
 
 
 # Ngữ cảnh contract trong prompt Advisor/Fixer (phase0_parsing/contract_context.py).
@@ -545,10 +544,10 @@ class LockedEtherTests(unittest.TestCase):
 
 # Chạy thật gpu_pipeline với server GPU GIẢ (detector giả + Fixer giả) để kiểm tra vòng sửa.
 class ServerGpuRepairLoopTests(unittest.TestCase):
-    """End-to-end run of the GPU runner against a fake server."""
+    """End-to-end run of the GPU runner against a fake server (real solc / Slither / AST checks in Phase 5)."""
 
     # The RAG channel is stubbed out so these tests exercise the repair loop itself.
-    EMPTY_RAG = {"status": "ok", "findings": [], "retrieved_context": []}
+    EMPTY_RAG = {"status": "ok", "findings": [], "classifications": []}
 
     # Dựng request.json cho một contract (mặc định Bank; RAG để trống).
     def _request(self, code: str = BANK) -> dict:
@@ -582,7 +581,6 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
                 patch.object(fixer, "generate_via_server", side_effect=generate), \
                 patch.object(gpu_pipeline, "_generate_advisor_section", side_effect=deterministic_advisor), \
                 patch.object(gpu_pipeline, "_generate_assessor_section", side_effect=deterministic_assessor), \
-                patch.object(candidate_check, "run_rag", return_value=dict(self.EMPTY_RAG)), \
                 patch("builtins.print"):
             request = self._request(code)
             return gpu_pipeline.run_server_gpu_pipeline(request)
@@ -634,6 +632,33 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
         applied = {item["unit_id"] for item in result["phases"]["fixer"]["patch_outcomes"] if item["status"] == "applied"}
         self.assertEqual(applied, {"Bank.withdraw", "Bank.withdrawAll"})
         self.assertEqual(result["phases"]["detector"]["fixed"]["verdict"], "Safe")
+
+    # Phase 5 chạy ĐỦ kiểm tra ngay trong vòng sửa: bản vá làm mất lời gọi chuyển ETH bị kiểm tra hành vi đánh rớt ở
+    # lần 1, lỗi đó quay lại thành feedback cho Fixer, lần 2 sửa đúng -> PASS (trước đây chỉ bị phát hiện sau vòng sửa).
+    def test_behavior_regression_is_fed_back_inside_the_loop(self) -> None:
+        prompts = []
+
+        # Fixer giả: lần đầu vá withdrawAll bằng cách xoá lời gọi gửi ETH, lần sau vá đúng.
+        def generate(prompt, **kwargs):
+            prompts.append(prompt)
+            if "Target vulnerable function: `withdrawAll`" in prompt:
+                body = FIXED_WITHDRAW_ALL if "Behavior check failed" in prompt \
+                    else "function withdrawAll() external {\n        balances[msg.sender] = 0;\n    }"
+            else:
+                body = FIXED_WITHDRAW
+            return json.dumps({"replacement": body})
+
+        result = self._run(generate)
+        verifier_phase = result["phases"]["verifier"]
+        first = verifier_phase["attempts"][0]
+        self.assertEqual(first["behavioral_verification"]["status"], "failed")
+        self.assertIn("Bank.withdrawAll", first["failing_units"])
+        self.assertIn("Behavior check failed in Bank.withdrawAll", first["feedback"])
+        self.assertEqual(verifier_phase["overall_verdict"], "PASS")
+        self.assertEqual(verifier_phase["attempts_count"], 2)
+        final = verifier_phase["final"]
+        self.assertEqual(final["behavioral_verification"]["status"], "passed")
+        self.assertIn(final["tool_verification"]["compile"]["status"], {"passed", "unavailable"})
 
     # Detector không gọi được -> hàm ghi status error (không bịa xác suất).
     def test_unreachable_detector_is_reported_as_error(self) -> None:

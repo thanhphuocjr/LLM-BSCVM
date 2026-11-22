@@ -14,7 +14,7 @@ DEFAULT_SERVER_GPU_URL = "http://100.122.153.35:6868"
 DEFAULT_TEMPERATURE = 0.2
 # Các khoá Advisor/Assessor đọc từ JSON của model; dùng để "vớt" giá trị khi JSON bị hỏng.
 _SALVAGE_KEYS = (
-    "verdict", "guard_quote", "vulnerability_class", "root_cause", "attack_scenario", "impact", "fix_strategy",
+    "verdict", "guard_quote", "root_cause", "attack_scenario", "impact", "fix_strategy",
     "attack_vector", "attack_complexity", "privileges_required", "user_interaction",
     "scope", "confidentiality", "integrity", "availability", "justification",
 )

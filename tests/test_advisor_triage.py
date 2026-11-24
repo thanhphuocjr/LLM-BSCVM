@@ -164,7 +164,7 @@ class _CaseKB:
         self.asked = []
 
     # Ghi (mã, SWC) được tra, trả một ca reentrancy.
-    def cases_for_unit(self, code, swcs, limit=3, min_similarity=0.08):
+    def cases_for_unit(self, code, swcs, limit=2, min_similarity=0.08):
         self.asked.append((code, set(swcs)))
         return [{"swc": "SWC-107", "title": "Reentrancy", "similarity": 0.5, "root_cause": "Call before update."}]
 

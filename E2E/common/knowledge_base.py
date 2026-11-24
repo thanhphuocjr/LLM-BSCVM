@@ -14,7 +14,7 @@ from E2E.common.swc import normalize_swc_id
 from E2E.config import KNOWLEDGE_BASE_DIR
 
 # Fixer: số ca KB đưa vào prompt cho một hàm, và độ giống tối thiểu của ca "bù" (ca không cùng SWC với finding).
-FIXER_CASE_LIMIT = 3
+FIXER_CASE_LIMIT = 2
 FIXER_CASE_MIN_SIMILARITY = 0.08
 _CACHE_SIZE = 256
 

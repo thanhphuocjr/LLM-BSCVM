@@ -198,7 +198,7 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(_build_rag_knowledge_section([]), "")
         withdraw = next(unit for unit in parse_code_units(self.vulnerable) if unit.name == "withdraw")
         cases = default_knowledge_base().cases_for_unit(withdraw.code, {"SWC-115"})
-        self.assertEqual(len(cases), 3)
+        self.assertEqual(len(cases), 2)
         self.assertEqual(cases[0]["swc"], "SWC-115")
         self.assertTrue(all(case["similarity"] >= 0.08 for case in cases[1:]))
         section = _build_rag_knowledge_section(cases)

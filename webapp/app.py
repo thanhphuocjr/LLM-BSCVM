@@ -134,7 +134,7 @@ def get_example_contracts() -> List[Dict[str, Any]]:
 
 
 # [ENDPOINT CHÍNH] POST /api/audit/submit: kiểm tra đầu vào, tạo run_id + thư mục run, lưu file .sol, rồi chạy
-# lệnh CLI `python -m E2E.run <file> --run-id ... --max-fix-attempts 3` trong một subprocess ở luồng nền;
+# lệnh CLI `python -m E2E.run <file> --run-id ... --max-fix-attempts 2` trong một subprocess ở luồng nền;
 # stdout được ghi vào execution.log. Trả về run_id ngay để giao diện theo dõi.
 # Mục đích: web app KHÔNG có logic audit riêng - nó tái sử dụng đúng CLI orchestrator.
 @app.post("/api/audit/submit")
@@ -152,7 +152,7 @@ def submit_audit(req: AuditRequest) -> Dict[str, Any]:
     input_file = run_dir / file_name
     input_file.write_text(req.code, encoding="utf-8")
 
-    cmd = [sys.executable, "-u", "-m", "E2E.run", str(input_file), "--run-id", run_id, "--max-fix-attempts", "3"]
+    cmd = [sys.executable, "-u", "-m", "E2E.run", str(input_file), "--run-id", run_id, "--max-fix-attempts", "2"]
     log_file = run_dir / "execution.log"
 
     with TASK_LOCK:

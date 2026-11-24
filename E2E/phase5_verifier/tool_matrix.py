@@ -21,7 +21,7 @@ SLITHER_COVERAGE = {"access_control", "arithmetic", "denial_of_service", "reentr
                     "tx_origin", "unchecked_low_level_calls"}
 
 
-# Slither trên bản GỐC (có nhớ): vòng sửa kiểm chứng tối đa 3 bản vá của cùng một contract.
+# Slither trên bản GỐC (có nhớ): vòng sửa kiểm chứng tối đa 2 bản vá của cùng một contract.
 _original_slither = lru_cache(maxsize=8)(_run_native_slither)
 
 

@@ -27,7 +27,8 @@ PIPELINE_VERSION = "1.0.0"
 DEFAULT_FINAL_THRESHOLD = 0.50
 DEFAULT_DETECTOR_THRESHOLD = 0.700
 DEFAULT_COMPONENT_WEIGHTS = {"llm_detector": 0.65, "rag": 0.15, "static": 0.20}
-MAX_FIX_ATTEMPTS = 3
+# Số lần sửa tối đa của vòng Fixer -> Verifier.
+MAX_FIX_ATTEMPTS = 2
 # Số lời gọi LLM tối đa cho một contract (phần còn lại dùng mặc định từ KB / SWC).
 MAX_LLM_ADVISOR_CALLS = 40
 MAX_LLM_ASSESSOR_CALLS = 5

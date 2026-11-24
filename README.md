@@ -45,7 +45,7 @@ RAG/
 │
 ├── webapp/                app.py (FastAPI) + static/ (giao diện)
 ├── demo_contracts/        VulnerableBank, SafeBank, AccessControl (web app "Mẫu", CLI, test)
-├── tests/                 105 unit/integration test (gồm hồi quy static + fusion trên 3 contract SmartBugs-Wild)
+├── tests/                 104 unit/integration test (gồm hồi quy static + fusion trên 3 contract SmartBugs-Wild)
 ├── data/                  (local) MỌI dataset + kết quả chạy — xem data/README.md
 ├── models/                (local) qwen25-v13-14b-detector-final/ — adapter LoRA + threshold_config.json
 └── docs/                  (local) bài báo LLM-BSCVM (PDF)
@@ -67,7 +67,7 @@ Phase 1C  detector Qwen v13 (P(vulnerable)/hàm)        phase1c_detector/detecto
 Phase 2   Advisor: thẩm định, nguyên nhân, hướng sửa   phase2_advisor/
 Phase 3   Assessor: CVSS v3.1, thứ tự ưu tiên          phase3_assessor/
 Phase 4   Fixer: vá từng hàm, tra ca KB của hàm đó     phase4_fixer/fixer.py
-Phase 5   kiểm chứng MỖI bản vá trong vòng sửa (≤ 3 lần): compile + Slither + so sánh AST + static chạy lại
+Phase 5   kiểm chứng MỖI bản vá trong vòng sửa (≤ 2 lần): compile + Slither + so sánh AST + static chạy lại
           + detector chấm lại -> feedback cho lần sau; kết luận cuối lấy từ bản vá tốt nhất (verifier.py)
 Phase 6   báo cáo Markdown / HTML / PDF                phase6_reporter/report.py
 KB        common/knowledge_base.py: nạp registry + ca lỗi + TF-IDF MỘT lần, dùng cho 1B, 2, 3, 4
@@ -131,14 +131,14 @@ SERVER_IP=100.122.153.35 ./scripts/gpu_server.sh status
 .venv/bin/python -m E2E.run demo_contracts/VulnerableBank.sol
 ```
 
-Tham số: `--run-id`, `--detector-threshold`, `--max-fix-attempts 1..3`, `--solidity-root`.
+Tham số: `--run-id`, `--detector-threshold`, `--max-fix-attempts 1..2`, `--solidity-root`.
 
 ---
 
 ## 6. Đánh giá và kiểm thử
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest discover -s tests -t .   # 105 test
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest discover -s tests -t .   # 104 test
 ```
 
 Kết quả các lần chạy thực nghiệm (vòng 1, vòng 2, benchmark 9 công cụ) đã lưu trong `data/results/` (xem `data/README.md`).
@@ -162,10 +162,8 @@ Kết quả detector v13 trên test split (`data/results/detector_v13_training/t
 - Detector là phân loại nhị phân, không tự gán SWC. Nhãn SWC đến từ static/RAG; hàm chỉ detector báo được Phase 1
   gán lớp của ca lỗi giống nhất trong KB (1-NN). Lớp này đúng ở khoảng 51% số hàm như vậy trên v12 val+test
   (iAudit 59%, DAppSCAN 29%), xấp xỉ việc luôn đoán lớp đông nhất; Advisor thẩm định đúng lớp đó và có thể loại nó.
-- Trọng số fusion (`phase1_fusion/fusion_calibration.json`) được fit lại ngày 22/11 bằng hồi quy logistic trên 1,110
-  hàm thật của v12 val+test, ngưỡng `tau_agent` = 0.1848 chọn theo F2 (ưu tiên recall). Detector vẫn là tín hiệu mạnh
-  nhất; finding Critical chỉ do static báo cần p_detector >= 0.13 mới qua ngưỡng. Các tham số còn lại đã được kiểm
-  chứng (`E2E/tunable_heuristics.json`, cách làm ở `data/results/heuristics_tuning/` và `heuristics_tuning_v2/`).
+- Trọng số fusion và ngưỡng `tau_agent` = 0.45 (`phase1_fusion/fusion_calibration.json`) đặt tay, chưa fit trên tập
+  hiệu chuẩn.
 - RAG chỉ báo khi hàm giống một ca lỗi đã biết (cosine >= 0.40). Với dự án không có trong KB (DAppSCAN) kênh này
   hầu như im lặng; độ chính xác cao trên iAudit một phần do KB chứa hàm cùng dự án.
 - Advisor được quyền loại cả finding mà static và RAG cùng báo; chỉ guard được trích mà không có trong mã mới bị bác.

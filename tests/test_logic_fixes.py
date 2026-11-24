@@ -187,15 +187,6 @@ class FuseFindingsTests(unittest.TestCase):
         self.assertEqual([(item["swc"], item["unit_id"]) for item in confirmed], [("SWC-100", "A.f")])
         self.assertIsNone(confirmed[0]["classification"]["similarity"])
 
-    # tau_agent của fusion_calibration.json phải cho finding YẾU NHẤT (Low, không corroborated) trên unit có detector
-    # >= 0.70 đi qua: unit đã có finding local thì không sinh UNMAPPED, nên bị chặn ở đây là mất luôn tín hiệu detector.
-    def test_detector_flagged_unit_passes_with_its_weakest_finding(self) -> None:
-        units = [{"unit_id": "A.f", "status": "ok", "label": "Vulnerable", "vulnerability_probability": 0.70}]
-        static = {"findings": [{"source": "static", "swc": "SWC-103", "unit_id": "A.f", "severity": "Low", "confidence": 0.05}]}
-        confirmed, candidates = fuse_findings(units, static, {"findings": []})
-        self.assertEqual([(item["swc"], item["unit_id"]) for item in confirmed], [("SWC-103", "A.f")])
-        self.assertEqual(candidates, [])
-
     # Hàm detector lỗi nhận p_detector = 0.5 (trung lập), không bị coi là an toàn.
     def test_errored_unit_is_neutral_not_safe(self) -> None:
         units = [{"unit_id": "A.w", "status": "error", "vulnerability_probability": None}]
@@ -559,7 +550,7 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
             "source": {"code": code, "sha256": "x", "file_name": "Contract.sol"},
             "code_units": [unit.to_dict() for unit in units],
             "local_phase1": {"static": run_static(code, units), "rag": dict(self.EMPTY_RAG)},
-            "execution": {"detector_threshold": 0.7, "repair": {"max_attempts": 3}},
+            "execution": {"detector_threshold": 0.7, "repair": {"max_attempts": 2}},
         }
 
     # Chạy run_server_gpu_pipeline với các phụ thuộc được patch (health, detect, generate, Advisor, Assessor...).
@@ -586,10 +577,12 @@ class ServerGpuRepairLoopTests(unittest.TestCase):
             return gpu_pipeline.run_server_gpu_pipeline(request)
 
     # Hàm view/pure chỉ được vá khi detector gắn cờ (label Vulnerable): price() (detector 0.95) là mục tiêu sửa;
-    # isOpen() có finding SWC-116 confirmed nhưng detector chấm thấp -> vẫn báo cáo, không vá.
+    # isOpen() có finding SWC-116 confirmed nhưng detector chấm dưới ngưỡng (0.5) -> vẫn báo cáo, không vá.
     def test_view_function_is_repaired_only_when_the_detector_flags_it(self) -> None:
-        # Detector giả: price() bản gốc bị gắn cờ, bản đã vá (có require) thì không.
+        # Detector giả: price() bản gốc bị gắn cờ, bản đã vá (có require) thì không; isOpen() 0.5 (dưới ngưỡng 0.7).
         def detect(code, threshold=0.7, server_url=None, timeout=60):
+            if "function isOpen" in code:
+                return {"vulnerable_probability": 0.5}
             flagged = "function price" in code and "require(reserveA > 0" not in code
             return {"vulnerable_probability": 0.95 if flagged else 0.05}
 

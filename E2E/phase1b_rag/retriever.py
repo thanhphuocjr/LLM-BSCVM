@@ -7,7 +7,7 @@ from E2E.common.swc import swc_severity
 MIN_EXACT_MATCH_CHARS = 80
 MIN_EXACT_MATCH_LENGTH_RATIO = 0.8
 EXACT_MATCH_CONFIDENCE = 0.95
-# Độ giống tối thiểu để báo một SWC (chọn bằng CV 22/11, data/results/heuristics_tuning_v2/).
+# Độ giống tối thiểu để báo một SWC.
 MIN_SIMILARITY = 0.40
 MAX_FINDINGS_PER_UNIT = 10
 

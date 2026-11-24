@@ -202,7 +202,7 @@ def main() -> None:
                         help="Vulnerability probability threshold. Default is auto from threshold_config.json "
                              f"({DEFAULT_DETECTOR_THRESHOLD}).")
     parser.add_argument("--max-fix-attempts", type=int, default=MAX_FIX_ATTEMPTS,
-                        help="Maximum repair attempts (1-3) of the Fixer -> Verifier loop.")
+                        help="Maximum repair attempts (1-2) of the Fixer -> Verifier loop.")
     parser.add_argument("--solidity-root", type=Path,
                         help="Root containing imported .sol files; defaults to the input file directory.")
     args = parser.parse_args()

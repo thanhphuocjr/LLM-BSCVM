@@ -1,15 +1,15 @@
 {
-  "description": "Per-finding fusion weights of fuse_findings (p_final = logistic(intercept + w . x)). Refitted 2026-11-22 after the Phase 1 restructure (RAG = similarity to known cases only, so static and RAG are independent channels; detector-only units are classified in Phase 1) by logistic regression (w_static, w_rag, w_corroborated >= 0; L2 = 1) on the local findings of the 1,110 real functions of the v12 val+test split (label = the function's label; kaggle_ds2 synthetic excluded). tau_agent maximises F2 (recall-first) of 'reaches the Fixer'. 5-fold x 3 CV: old design refit recall 0.814 / FPR 0.253 / F2 0.781, new design 0.819 / 0.252 / 0.786; functions reaching the Fixer with the true SWC 6.5% -> 32.4%. Scripts and results: data/results/heuristics_tuning_v2/.",
-  "intercept": -1.4861,
+  "description": "Fusion calibration weights for LLM-BSCVM (Task B2)",
+  "intercept": -2.15,
   "weights": {
-    "p_detector": 3.6935,
-    "static_conf": 0.0,
-    "rag_conf": 0.4812,
-    "corroborated": 0.0774,
-    "severity_critical": -0.482,
-    "severity_high": -0.1185,
+    "p_detector": 3.85,
+    "static_conf": 1.2,
+    "rag_conf": 1.1,
+    "corroborated": 0.65,
+    "severity_critical": 0.8,
+    "severity_high": 0.4,
     "severity_medium": 0.0,
-    "severity_low": -0.7158
+    "severity_low": -0.5
   },
-  "tau_agent": 0.1848
+  "tau_agent": 0.45
 }

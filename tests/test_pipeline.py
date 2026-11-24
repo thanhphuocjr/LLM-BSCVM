@@ -740,8 +740,8 @@ class IntegrationTests(unittest.TestCase):
                 "detector": {"confirmed_findings": [reentrancy], "dismissed_findings": [pragma]},
                 "advisor": {"suggestions": [], "false_positives": ["SWC-102:contract"]},
                 "verifier": {
-                    "attempts_count": 3,
-                    "max_attempts": 3,
+                    "attempts_count": 2,
+                    "max_attempts": 2,
                     "verifications": [{"finding_id": "SWC-107:Bank.withdraw", "status": "FLAGGED"}],
                 },
                 "fixer": {"fixed_code": "contract Bank { }"},
@@ -757,8 +757,8 @@ class IntegrationTests(unittest.TestCase):
                 "status": "complete",
                 "overall_verdict": "Patch accepted by Slither",
                 "detector_disagreement": True,
-                "attempts_count": 3,
-                "max_attempts": 3,
+                "attempts_count": 2,
+                "max_attempts": 2,
                 "fixed_detection": {"threshold": 0.7},
                 "fixed_unit_results": [{"unit_id": "Bank.withdraw", "vulnerability_probability": 0.8962}],
             },
@@ -768,7 +768,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("p=0.8962 >= threshold 0.70", status)
         self.assertIn("Final verification: Patch accepted", report_data["executive_summary"])
         md = render_markdown(report_data)
-        self.assertIn("- **Fix attempts:** 3/3 attempt(s)", md)
+        self.assertIn("- **Fix attempts:** 2/2 attempt(s)", md)
         self.assertIn("### 4.5 Findings Dismissed by the Advisor", md)
         self.assertNotIn("FLAGGED", md)
 

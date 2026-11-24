@@ -42,9 +42,6 @@ data/
     │   └── ham_sua_lan_2_ket_qua.csv (+ _blind: bỏ cột nhận xét của giám khảo vòng 1)
     ├── round2_regress/             VÒNG 2, nhóm 18 hàm mà bản vá vòng 1 sinh lỗi mới (có self-check)
     ├── solodit_9tools/             kết quả benchmark 9 công cụ (details / summary CSV, report.md)
-    ├── heuristics_tuning/          tối ưu 47 tham số đặt tay (19/11): scripts/, out/, bao_cao/ (PDF)
-    ├── heuristics_tuning_v2/       tái cấu trúc Phase 1 (22/11): RAG chỉ-độ-giống, phân loại 1-NN, fit lại fusion
-    │                               (scripts r1-r7, out/, README.md)
     └── audit_runs/<run_id>/        mỗi lần audit từ web app / CLI (web app đọc lịch sử từ đây)
 ```
 

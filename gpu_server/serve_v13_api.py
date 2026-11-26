@@ -3,14 +3,16 @@
 serve_v13_api.py
 ══════════════════════════════════════════════════════════════════════════════
 Unified AI Inference Server (FastAPI) for LLM-BSCVM (Version 13).
-Deploy chuyên dụng trên GPU 0 (NVIDIA RTX 4070 Ti SUPER 16GB).
+Deploy chuyên dụng trên GPU 0 (NVIDIA RTX 4070 Ti SUPER 16GB), hoặc trên Kaggle T4 qua
+gpu_server/kaggle_kernel.py (điều khiển từ máy local bằng scripts/kaggle_server.py).
 
 Kiến trúc "All-in-One":
   - Dùng chung 1 instance mô hình Qwen2.5-Coder-14B-Instruct trong VRAM (~8.5GB).
   - POST /api/v1/detect   (Phase 1C, chấm lại bản vá ở Phase 5): LoRA v13 + score head + line_head,
     phân loại nhị phân, xác suất theo ngưỡng tau = 0.700.
   - POST /api/v1/generate (Phase 2 Advisor, 3 Assessor, 4 Fixer): tắt adapter, dùng model Instruct gốc.
-  - GET  /api/v1/health   trạng thái server, GPU, VRAM.
+  - GET  /api/v1/health   trạng thái server, GPU, VRAM, dtype tính toán.
+  - POST /api/v1/shutdown chỉ bật khi SERVER_GPU_ALLOW_SHUTDOWN=1 (Kaggle): tắt server để trả quota GPU.
 Client phía máy local: E2E/common/gpu_client.py.
 
 Cổng mặc định: 6868
@@ -24,7 +26,9 @@ import bisect
 import contextlib
 import json
 import logging
+import math
 import os
+import signal
 import threading
 import time
 from pathlib import Path
@@ -57,6 +61,11 @@ if not DEFAULT_ADAPTER_DIR.exists():
 DEFAULT_BASE_MODEL = "Qwen/Qwen2.5-Coder-14B-Instruct"
 DEFAULT_THRESHOLD = 0.700
 MAX_LEN = 1024
+# dtype tính toán: bf16 = giống lúc train và trên server 176; fp16 = cho GPU không có bf16 gốc (Kaggle/Colab T4).
+COMPUTE_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
+DEFAULT_DTYPE = os.environ.get("SERVER_GPU_DTYPE", "bf16").strip() or "bf16"
+# Chia model ra mọi GPU nhìn thấy (Kaggle T4 x2: 1 T4 15 GB thiếu VRAM cho prompt ~4.000 token); 176 chỉ thấy GPU 0.
+DEFAULT_MULTI_GPU = os.environ.get("SERVER_GPU_MULTI_GPU", "").strip() == "1"
 
 INSTRUCTION_PROMPT = (
     "Analyze the following Solidity smart contract code for security vulnerabilities. "
@@ -118,6 +127,7 @@ app.add_middleware(
 # health check requires the header `X-API-Key`.
 API_KEY = os.environ.get("SERVER_GPU_API_KEY", "").strip()
 PUBLIC_PATHS = {"/", "/health", "/api/v1/health"}
+ALLOW_SHUTDOWN = os.environ.get("SERVER_GPU_ALLOW_SHUTDOWN", "").strip() == "1"
 
 
 # Middleware: nếu đặt SERVER_GPU_API_KEY thì mọi endpoint (trừ "/" và health) bắt buộc header X-API-Key đúng -> sai thì 401.
@@ -146,21 +156,34 @@ class ModelContainer:
         self.base_model_name = DEFAULT_BASE_MODEL
         self.adapter_dir = DEFAULT_ADAPTER_DIR
         self.best_threshold = DEFAULT_THRESHOLD
+        self.dtype_name = DEFAULT_DTYPE
+        self.gpu_count = 1
         self.is_ready = False
 
     # Nạp model khi server khởi động: đọc ngưỡng từ threshold_config.json -> tokenizer -> backbone 4-bit NF4 -> gắn LoRA
     # -> đọc score_head từ adapter_model.safetensors (KHÔNG có thì từ chối khởi động, tránh head ngẫu nhiên)
     # -> line_head.pt nếu có -> is_ready=True.
-    def load(self, base_model_name: str = DEFAULT_BASE_MODEL, adapter_dir: Path = DEFAULT_ADAPTER_DIR):
+    def load(self, base_model_name: str = DEFAULT_BASE_MODEL, adapter_dir: Path = DEFAULT_ADAPTER_DIR,
+             dtype_name: str = DEFAULT_DTYPE, multi_gpu: bool = DEFAULT_MULTI_GPU):
         start_t = time.time()
         self.base_model_name = base_model_name
         self.adapter_dir = Path(adapter_dir)
+        if dtype_name not in COMPUTE_DTYPES:
+            raise ValueError(f"dtype không hợp lệ: {dtype_name} (chọn một trong {sorted(COMPUTE_DTYPES)})")
+        self.dtype_name = dtype_name
+        compute_dtype = COMPUTE_DTYPES[dtype_name]
+        visible_gpus = torch.cuda.device_count() if "cuda" in self.device else 0
+        self.gpu_count = visible_gpus if multi_gpu and visible_gpus > 1 else 1
+        # "balanced" chia đều các lớp giữa các GPU (cùng phép tính, chỉ khác nơi đặt); 1 GPU thì giữ như cũ.
+        device_map = None if "cuda" not in self.device else "balanced" if self.gpu_count > 1 else {"": 0}
 
         logger.info("════════════════════════════════════════════════════════════════════")
-        logger.info("  KHỞI TẠO MÔ HÌNH V13 TRÊN GPU 0")
+        logger.info("  KHỞI TẠO MÔ HÌNH V13")
         logger.info(f"  Target Device : {self.device}")
         logger.info(f"  Base Model    : {self.base_model_name}")
         logger.info(f"  Adapter Dir   : {self.adapter_dir}")
+        logger.info(f"  Compute dtype : {dtype_name}")
+        logger.info(f"  GPUs used     : {self.gpu_count}")
         logger.info("════════════════════════════════════════════════════════════════════")
 
         # 1. Đọc threshold config nếu có
@@ -191,15 +214,15 @@ class ModelContainer:
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_compute_dtype=compute_dtype,
             )
 
         logger.info(f"==> [2/3] Đang nạp backbone từ {self.base_model_name}...")
         base = AutoModelForCausalLM.from_pretrained(
             self.base_model_name,
             quantization_config=quant_config,
-            torch_dtype=torch.bfloat16 if "cuda" in self.device else torch.float32,
-            device_map={"": 0} if "cuda" in self.device else None,
+            torch_dtype=compute_dtype if "cuda" in self.device else torch.float32,
+            device_map=device_map,
             trust_remote_code=True,
         )
 
@@ -277,18 +300,22 @@ def root():
 def health_check():
     vram_used = 0.0
     vram_total = 0.0
+    gpu_device = "CPU"
     if torch.cuda.is_available():
-        vram_used = torch.cuda.memory_allocated(0) / (1024 * 1024)
-        vram_total = torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)
+        gpus = range(CONTAINER.gpu_count)
+        vram_used = sum(torch.cuda.memory_allocated(i) for i in gpus) / (1024 * 1024)
+        vram_total = sum(torch.cuda.get_device_properties(i).total_memory for i in gpus) / (1024 * 1024)
+        gpu_device = torch.cuda.get_device_name(0) + (f" x{CONTAINER.gpu_count}" if CONTAINER.gpu_count > 1 else "")
 
     return {
         "status": "ready" if CONTAINER.is_ready else "initializing",
-        "gpu_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
+        "gpu_device": gpu_device,
         "vram_used_mb": round(vram_used, 1),
         "vram_total_mb": round(vram_total, 1),
         "model_name": "qwen25-v13-14b-detector-final",
         "base_model": CONTAINER.base_model_name,
         "best_threshold": CONTAINER.best_threshold,
+        "dtype": CONTAINER.dtype_name,
         "uptime_seconds": round(time.time() - SERVER_START_TIME, 1),
     }
 
@@ -323,18 +350,23 @@ def detect_vulnerability(req: DetectRequest):
 
         # Single unpadded sequence: the pooled token is the last one, as in training.
         last_token_idx = inputs["input_ids"].shape[-1] - 1
-        last_hidden = hidden_states[0, last_token_idx].unsqueeze(0)
+        # Nhiều GPU: hidden state cuối nằm ở GPU cuối, đưa về GPU của các head (1 GPU: không đổi gì).
+        last_hidden = hidden_states[0, last_token_idx].unsqueeze(0).to(CONTAINER.device)
         logits = CONTAINER.score_head(last_hidden.float())
         probs = torch.softmax(logits, dim=-1)[0]
         prob_vuln = float(probs[1].item())
         prob_safe = float(probs[0].item())
+        if not math.isfinite(prob_vuln):
+            # NaN (tràn số fp16 trên T4) so với ngưỡng luôn False -> âm thầm thành "Safe"; báo lỗi để detector ra Inconclusive.
+            raise HTTPException(status_code=500, detail=f"Detector trả điểm không hợp lệ ({prob_vuln}) với dtype "
+                                f"{CONTAINER.dtype_name}; hãy khởi động lại server với --dtype bf16.")
 
         # Line scores: map each token back to its source line through the tokenizer
         # offsets (same alignment as the line labels used in training).
         line_scores = None
         if CONTAINER.line_head is not None:
             try:
-                token_probs = torch.sigmoid(CONTAINER.line_head(hidden_states.float()).squeeze(-1))[0].tolist()
+                token_probs = torch.sigmoid(CONTAINER.line_head(hidden_states.to(CONTAINER.device).float()).squeeze(-1))[0].tolist()
                 prefix_len = len(INSTRUCTION_PROMPT)
                 line_starts = [0]
                 for index, char in enumerate(code):
@@ -432,7 +464,17 @@ def generate_text(req: ChatRequest):
     )
 
 
-# Điểm vào: đọc tham số (host, port 6868, base model, adapter), nạp model rồi chạy uvicorn.
+# POST /api/v1/shutdown: chỉ có khi SERVER_GPU_ALLOW_SHUTDOWN=1 và có API key (Kaggle) -> trả lời rồi tự tắt sau 1 giây.
+@app.post("/api/v1/shutdown")
+def shutdown_server():
+    if not (ALLOW_SHUTDOWN and API_KEY):
+        raise HTTPException(status_code=404, detail="Not Found")
+    logger.info("Nhận lệnh shutdown từ client, server sẽ dừng sau 1 giây.")
+    threading.Timer(1.0, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+    return {"status": "shutting_down"}
+
+
+# Điểm vào: đọc tham số (host, port 6868, base model, adapter, dtype), nạp model rồi chạy uvicorn.
 def main():
     parser = argparse.ArgumentParser(description="Start v13 Unified AI Inference Server")
     parser.add_argument(
@@ -442,11 +484,16 @@ def main():
     )
     parser.add_argument("--port", type=int, default=6868, help="Port (mặc định 6868)")
     parser.add_argument("--adapter-dir", default=str(DEFAULT_ADAPTER_DIR), help="Đường dẫn adapter")
-    parser.add_argument("--base-model", default=DEFAULT_BASE_MODEL, help="Tên base model HF")
+    parser.add_argument("--base-model", default=DEFAULT_BASE_MODEL, help="Tên base model HF hoặc thư mục local")
+    parser.add_argument("--dtype", default=DEFAULT_DTYPE, choices=sorted(COMPUTE_DTYPES),
+                        help="dtype tính toán (mặc định bf16 = giống lúc train; fp16 cho T4)")
+    parser.add_argument("--multi-gpu", action="store_true", default=DEFAULT_MULTI_GPU,
+                        help="chia model ra mọi GPU nhìn thấy (Kaggle T4 x2)")
     args = parser.parse_args()
 
     # Nạp model
-    CONTAINER.load(base_model_name=args.base_model, adapter_dir=Path(args.adapter_dir))
+    CONTAINER.load(base_model_name=args.base_model, adapter_dir=Path(args.adapter_dir), dtype_name=args.dtype,
+                   multi_gpu=args.multi_gpu)
 
     # Chạy uvicorn
     import uvicorn

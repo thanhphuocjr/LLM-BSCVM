@@ -38,11 +38,19 @@ def get_server_url(server_url: str | None = None) -> str:
     return os.environ.get("SERVER_GPU_URL", DEFAULT_SERVER_GPU_URL).rstrip("/")
 
 
+# Timeout (giây) cho detect/generate: SERVER_GPU_TIMEOUT trong .env (vd. 300 cho Kaggle T4) > mặc định của hàm.
+def _server_timeout(default: int) -> int:
+    load_env_file()
+    return int(os.environ.get("SERVER_GPU_TIMEOUT") or default)
+
+
 # Gọi một endpoint của GPU server (GET khi payload=None, ngược lại POST JSON) và parse JSON trả về.
 def _request_json(url: str, payload: dict | None = None, timeout: int = 60) -> dict:
     load_env_file()
     api_key = os.environ.get("SERVER_GPU_API_KEY", "").strip()
-    headers = {"Content-Type": "application/json", **({"X-API-Key": api_key} if api_key else {})}
+    # ngrok-skip-browser-warning: bỏ trang cảnh báo của ngrok free khi server chạy trên Kaggle (server khác bỏ qua).
+    headers = {"Content-Type": "application/json", "ngrok-skip-browser-warning": "1",
+               **({"X-API-Key": api_key} if api_key else {})}
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers), timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
@@ -59,15 +67,17 @@ def check_server_health(server_url: str | None = None, timeout: int = 3) -> dict
 
 # [Phase 1C / 5] Gửi mã một hàm tới /api/v1/detect -> P(vulnerable) (gửi code gốc, giống lúc train).
 def detect_via_server(code: str, threshold: float = DEFAULT_DETECTOR_THRESHOLD, server_url: str | None = None,
-                      timeout: int = 60) -> dict:
-    return _request_json(f"{get_server_url(server_url)}/api/v1/detect", {"code": code, "threshold": threshold}, timeout)
+                      timeout: int | None = None) -> dict:
+    return _request_json(f"{get_server_url(server_url)}/api/v1/detect", {"code": code, "threshold": threshold},
+                         _server_timeout(60) if timeout is None else timeout)
 
 
 # [Phase 2/3/4] Gửi prompt tới /api/v1/generate (model instruct, tắt LoRA) và trả về câu trả lời.
 def generate_via_server(prompt: str, system_prompt: str = "", temperature: float = DEFAULT_TEMPERATURE,
-                        max_tokens: int = 1500, server_url: str | None = None, timeout: int = 120) -> str:
+                        max_tokens: int = 1500, server_url: str | None = None, timeout: int | None = None) -> str:
     payload = {"prompt": prompt, "system_prompt": system_prompt, "temperature": temperature, "max_tokens": max_tokens}
-    response = _request_json(f"{get_server_url(server_url)}/api/v1/generate", payload, timeout)
+    response = _request_json(f"{get_server_url(server_url)}/api/v1/generate", payload,
+                             _server_timeout(120) if timeout is None else timeout)
     return str(response.get("response", "")).strip()
 
 
@@ -100,8 +110,8 @@ def extract_json(text: str) -> Any:
 
 # Client LLM của Advisor và Assessor: generate_via_server + extract_json, lỗi mạng -> ConnectionError rõ ràng.
 class ServerGPUClient:
-    # Đọc URL server, temperature (SERVER_GPU_TEMPERATURE, mặc định 0.2) và timeout.
-    def __init__(self, timeout: int = 120) -> None:
+    # Đọc URL server, temperature (SERVER_GPU_TEMPERATURE, mặc định 0.2) và timeout (None = SERVER_GPU_TIMEOUT/120).
+    def __init__(self, timeout: int | None = None) -> None:
         self.base_url = get_server_url()
         self.temperature = float(os.environ.get("SERVER_GPU_TEMPERATURE") or DEFAULT_TEMPERATURE)
         self.timeout = timeout

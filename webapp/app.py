@@ -102,7 +102,7 @@ class AuditRequest(BaseModel):
 @app.get("/api/system/status")
 def get_system_status() -> Dict[str, Any]:
     """Returns whether the GPU server is ready."""
-    health = check_server_health(timeout=1)
+    health = check_server_health(timeout=3)  # 3 giây: đủ cho server Kaggle đi qua ngrok
     return {
         "server_gpu_online": health.get("status") == "ready",
         "server_gpu_info": {"status": health.get("status"), "gpu_device": health.get("gpu_device")},

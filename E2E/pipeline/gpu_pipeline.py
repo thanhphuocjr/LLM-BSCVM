@@ -145,7 +145,8 @@ def run_server_gpu_pipeline(request: dict, *, server_url: str | None = None) -> 
     health = check_server_health(server_url)
     if health.get("status") != "ready":
         raise ConnectionError(f"GPU Server tại {server_url} chưa sẵn sàng (trạng thái: {health.get('status')}). "
-                              "Hãy khởi động server: ./scripts/gpu_server.sh start")
+                              "Hãy khởi động server: ./scripts/gpu_server.sh start (server 176) hoặc "
+                              ".venv/bin/python scripts/kaggle_server.py start (Kaggle)")
 
     log(f"[PHASE 1C] Running Neural Detector v13 on GPU server ({len(units)} code unit(s))...")
     detector_started = time.perf_counter()

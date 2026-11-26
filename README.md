@@ -95,7 +95,7 @@ Ngữ nghĩa kết quả:
 ```bash
 python3.12 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-cp .env.example .env            # điền SERVER_GPU_URL
+cp .env.example .env            # điền SERVER_GPU_URL (server 176) hoặc chạy scripts/kaggle_server.py setup (Kaggle)
 ```
 
 Công cụ ngoài: `solc-select` (+ các bản solc cần dùng) và `slither-analyzer`.
@@ -122,6 +122,28 @@ Công cụ ngoài: `solc-select` (+ các bản solc cần dùng) và `slither-an
 ./scripts/gpu_server.sh deploy                 # đẩy gpu_server/ + dataset v12 lên server, rồi stop + start
 SERVER_IP=100.122.153.35 ./scripts/gpu_server.sh status
 ```
+
+**GPU server trên Kaggle (thay server 176)**: cùng `serve_v13_api.py`, chạy trên 2 GPU T4 của Kaggle
+(`gpu_server/kaggle_kernel.py`, chia model ra 2 GPU vì 1 T4 hết VRAM với prompt ~4.000 token); máy local gọi qua
+tunnel bằng `SERVER_GPU_URL` + `SERVER_GPU_API_KEY` trong `.env`. Điều khiển hoàn toàn từ máy local:
+
+```bash
+.venv/bin/python scripts/kaggle_server.py upload                 # 1 lần: adapter v13 -> dataset Kaggle riêng tư
+.venv/bin/python scripts/kaggle_server.py start --cloudflare     # không cần tài khoản: tự ghi URL mới vào .env
+.venv/bin/python scripts/kaggle_server.py setup                  # hoặc ngrok (domain cố định): 1 lần setup ...
+.venv/bin/python scripts/kaggle_server.py start                  # ... rồi start (--hours 3, --dtype fp16|bf16)
+.venv/bin/python scripts/kaggle_server.py status | check | url | logs --follow | stop | quota
+.venv/bin/python scripts/kaggle_server.py selftest && .venv/bin/python scripts/kaggle_server.py result
+```
+
+Khởi động ~6-8 phút sau khi Kaggle cấp GPU (cài thư viện 1', tải Qwen 2', nạp model 2,5'), nhưng Kaggle có lúc xếp hàng GPU (QUEUED) gần 1 giờ: hôm demo nên start sớm >= 1 giờ với `--hours` đủ dài; nếu `start --cloudflare` đã thoát trước khi có URL thì chạy `url`. `status` báo `ready` là dùng được, `stop` tắt
+ngay để ngừng tính quota (30 giờ GPU/tuần), không thì server tự tắt sau `--hours`.
+Đo ngày 2026-11-25 (fp16, 2 x T4): detector cùng nhãn với server 176 trên 6/6 hàm tham chiếu
+(`gpu_server/reference_scores.json`, lệch điểm <= 0,04; bf16 <= 0,022); pipeline đầy đủ cho cùng verdict, số finding
+và kết luận kiểm chứng như 176 với VulnerableBank (71 giây, 176: 22 giây), AccessControl (191 giây, 176: 66 giây), SafeBank.
+T4 không có bf16 gốc nên mặc định trên Kaggle là fp16 (prompt 3.900 token: 15 giây, bf16: 49 giây).
+Cloudflare quick tunnel cắt request quá ~100 giây và đổi URL mỗi lần start; ngrok không có giới hạn đó.
+Kernel serve trên Kaggle là riêng tư và chứa API key (+ ngrok authtoken): không chuyển sang công khai.
 
 **Web app** — `./scripts/run_webapp.sh` → http://127.0.0.1:8080 (`HOST=0.0.0.0` để mở LAN, `RELOAD=1` khi dev)
 

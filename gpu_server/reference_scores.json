@@ -1,0 +1,42 @@
+{
+  "source": "server 176 (RTX 4070 Ti SUPER, bf16), audit runs 2026-11-20",
+  "threshold": 0.7,
+  "cases": [
+    {
+      "unit_id": "VulnerableBank.deposit",
+      "run_id": "20261120-120425-VulnerableBank-86505517",
+      "score_176": 0.6759,
+      "code": "function deposit() external payable {\n        balances[msg.sender] += msg.value;\n    }"
+    },
+    {
+      "unit_id": "VulnerableBank.withdraw",
+      "run_id": "20261120-120425-VulnerableBank-86505517",
+      "score_176": 0.8853,
+      "code": "function withdraw() external {\n        uint256 amount = balances[msg.sender];\n        require(amount > 0, \"No balance\");\n\n        (bool success, ) = msg.sender.call{value: amount}(\"\");\n        require(success, \"Transfer failed\");\n\n        balances[msg.sender] = 0;\n    }"
+    },
+    {
+      "unit_id": "SafeBank.withdraw",
+      "run_id": "20261120-120454-SafeBank-8f4124e1",
+      "score_176": 0.3879,
+      "code": "function withdraw() external nonReentrant {\n        uint256 amount = balances[msg.sender];\n        require(amount > 0, \"No balance\");\n        balances[msg.sender] = 0;\n\n        (bool success, ) = msg.sender.call{value: amount}(\"\");\n        require(success, \"Transfer failed\");\n    }"
+    },
+    {
+      "unit_id": "VulnerableToken.constructor",
+      "run_id": "20261120-120459-AccessControl-05cf7333",
+      "score_176": 0.9774,
+      "code": "constructor() {\n        owner = msg.sender;\n    }"
+    },
+    {
+      "unit_id": "VulnerableToken.mint",
+      "run_id": "20261120-120459-AccessControl-05cf7333",
+      "score_176": 0.8397,
+      "code": "function mint(address to, uint256 amount) external {\n        // Vulnerability:\n        // Không kiểm tra quyền của người gọi\n        balances[to] += amount;\n        totalSupply += amount;\n    }"
+    },
+    {
+      "unit_id": "VulnerableToken.transfer",
+      "run_id": "20261120-120459-AccessControl-05cf7333",
+      "score_176": 0.8591,
+      "code": "function transfer(address to, uint256 amount) external {\n        require(balances[msg.sender] >= amount, \"Insufficient balance\");\n\n        balances[msg.sender] -= amount;\n        balances[to] += amount;\n    }"
+    }
+  ]
+}
